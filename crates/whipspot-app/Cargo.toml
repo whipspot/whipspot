@@ -1,0 +1,51 @@
+[package]
+name = "whipspot-app"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+whipspot-ui = { path = "../whipspot-ui" }
+whipspot-spotify = { path = "../whipspot-spotify" }
+whipspot-credentials = { path = "../whipspot-credentials" }
+whipspot-audio-out = { path = "../whipspot-audio-out" }
+whipspot-net = { path = "../whipspot-net" }
+whipspot-skin-fs = { path = "../whipspot-skin-fs" }
+whipspot-skin-winamp = { path = "../whipspot-skin-winamp" }
+whipspot-skin-wmp = { path = "../whipspot-skin-wmp" }
+whipspot-local = { path = "../whipspot-local" }
+whipspot-ytmusic = { path = "../whipspot-ytmusic" }
+# luneui by tag (D45), with the app's own winit, wgpu and pollster (the toolkit re-exports none).
+lune-ui = { git = "https://github.com/lune-rs/luneui-rs", tag = "v0.7.0" }
+winit = "0.30"
+wgpu = "30"
+pollster = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+# The OS folder picker (D12): the host's only use, behind `host::pick_folder`.
+rfd = "=0.17.2"
+anyhow = "1"
+# The Connect speaker (D9, D10): the computer name for the device name, and the stable device id.
+gethostname = "1"
+getrandom = "0.3"
+
+# One FFI call (platform_windows.rs, D5); the package is already in the lock through wasapi.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }
+
+[dev-dependencies]
+whipspot-testkit = { path = "../whipspot-testkit" }
+whipspot-skin-winamp = { path = "../whipspot-skin-winamp", features = ["demo"] }
+# Reads the demo's golden screenshots (already in the lock through luneui's dump writer).
+png = "0.18"
+
+# The workspace table plus one exception (D5): `forbid` cannot be relaxed per module, so this
+# crate denies `unsafe_code` and `platform_windows` alone allows it. Keep the rest in step with
+# `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"

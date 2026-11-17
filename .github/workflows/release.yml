@@ -1,0 +1,67 @@
+# Builds the release binaries on a version tag (v*) and attaches them to a draft GitHub Release.
+# Unsigned: no Apple Developer ID or notarisation, no Windows code signing (see README, Install).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build and package Whipspot.app (universal)
+        run: bash scripts/package-macos.sh --arch universal
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: dist/*.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p whipspot-app
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path crates/whipspot-app/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force dist/whipspot | Out-Null
+          Copy-Item target/release/whipspot-app.exe dist/whipspot/whipspot.exe
+          Copy-Item LICENSE dist/whipspot/LICENSE.txt
+          Compress-Archive -Path dist/whipspot/* -DestinationPath "dist/whipspot-$version-windows-x64.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: dist/*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*.zip
+          --repo "$GITHUB_REPOSITORY" --draft --prerelease --generate-notes
+          --title "Whipspot $GITHUB_REF_NAME"

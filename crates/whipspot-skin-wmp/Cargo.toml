@@ -1,0 +1,17 @@
+[package]
+name = "whipspot-skin-wmp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+whipspot-skin-kit = { path = "../whipspot-skin-kit", features = ["png", "jpeg"] }
+
+[dev-dependencies]
+whipspot-skin-kit = { path = "../whipspot-skin-kit", features = ["png", "jpeg", "synth"] }
+whipspot-testkit = { path = "../whipspot-testkit" }
+
+[lints]
+workspace = true

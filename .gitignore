@@ -1,0 +1,17 @@
+# local agent/config state - never commit
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
+# secrets - keep the example, ignore the rest
+.env*
+!.env.example
+# build output, OS noise
+/target
+.DS_Store
+# skins are the user's (legal: no Winamp assets), raw audio captures
+*.wsz
+*.wmz
+/skins/
+*.pcm
+*.f32
+/dist

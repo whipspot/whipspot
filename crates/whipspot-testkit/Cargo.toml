@@ -1,0 +1,20 @@
+[package]
+name = "whipspot-testkit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+
+[dev-dependencies]
+# Decodes the fixtures of audio_files in its self-test (the version the local adapter uses).
+symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "pcm", "wav"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# The workspace table plus one exception (Q24): forbid cannot be relaxed per file, so this crate
+# denies unsafe_code and tests/no_alloc.rs alone allows it (a counting global allocator). Keep
+# the rest in step with [workspace.lints].
+[lints.rust]
+unsafe_code = "deny"

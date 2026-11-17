@@ -1,0 +1,17 @@
+[package]
+name = "whipspot-audio-out"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+cpal = "0.16"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.27"
+audio_thread_priority = "0.38"
+
+[lints]
+workspace = true

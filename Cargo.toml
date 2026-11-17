@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+# librespot decodes/encodes audio; unoptimised builds stutter.
+opt-level = 1
+
+[patch.crates-io]
+# cpal 0.16.0 (macOS CoreAudio backend) has UB: `let data_size = 0u32;` is
+# immutable but written through `NonNull::from(&data_size)` by CoreAudio. With
+# opt-level >= 1 (the [profile.dev] above) the compiler folds it to 0, so
+# `reserve_exact(0)` leaves a dangling buffer and `spike play` segfaults in
+# `Device::supported_configs`. Vendored copy has the out-params made `mut`;
+# see vendor/cpal/WHIPSPOT-PATCH.md. Upstream fixed the crash sites in cpal
+# 0.17.0; remove this patch when vendor/cpal is replaced by cpal >= 0.17 (H11, the
+# user's call).
+cpal = { path = "vendor/cpal" }
+# lofty 0.25.4 inflates a compressed ID3v2 frame without bound (a zlib bomb in any
+# indexed audio file exhausts memory); the patch skips compressed frames. See
+# vendor/lofty/WHIPSPOT-PATCH.md (MD167).
+lofty = { path = "vendor/lofty" }

@@ -1,0 +1,36 @@
+[package]
+name = "whipspot-ytmusic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+# The decoder for the DASH audio (AAC-LC in fragmented MP4): its own copy, as whipspot-local has.
+# No other codec or container: YouTube's audio is read as AAC only (D8 of the youtube-music task).
+symphonia = { version = "=0.6.1", default-features = false, features = ["aac", "isomp4"] }
+# The adapter's own network client, as whipspot-spotify has (D2). Blocking: the `Http` trait is
+# synchronous and async callers go through `spawn_blocking`.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "blocking"] }
+sha2 = "0.10"
+# SAPISIDHASH, the signature of an InnerTube request made with a login cookie.
+sha1 = "0.10"
+# Random names for the cookie files of a run (the same crate whipspot-spotify uses).
+getrandom = "0.3"
+# Checks yt-dlp's detached signature over its checksum list (D5). No bzip2 (a C build): the
+# signature and key are plain packets.
+pgp = { version = "0.21.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+whipspot-testkit = { path = "../whipspot-testkit" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# Makes the throwaway signing key of the signature tests (the same rand 0.8 that pgp uses).
+rand = "0.8"
+tempfile = "3"
+
+[lints]
+workspace = true

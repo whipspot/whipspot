@@ -1,0 +1,13 @@
+#!/bin/bash
+# Opt-in pre-commit hook (D15): the secret scan on the staged changes, then the format check.
+# Nothing installs it. To turn it on for this clone:   git config core.hooksPath scripts/hooks
+# To turn it off:                                       git config --unset core.hooksPath
+# Fails closed: without gitleaks the commit is refused (check-secrets.sh exits 2 and says how to
+# install it). Bypass for one commit only with git's own --no-verify.
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)" || exit 2
+cd "$ROOT"
+
+bash scripts/check-secrets.sh
+cargo fmt --all -- --check

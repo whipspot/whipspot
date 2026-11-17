@@ -1,0 +1,16 @@
+[package]
+name = "whipspot-skin-fs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+
+[dev-dependencies]
+whipspot-testkit = { path = "../whipspot-testkit" }
+tempfile = "3"
+
+[lints]
+workspace = true

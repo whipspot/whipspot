@@ -1,0 +1,42 @@
+[package]
+name = "whipspot-spotify"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+librespot-core = { version = "=0.8.0", default-features = false }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["native-tls"] }
+librespot-oauth = { version = "=0.8.0", default-features = false }
+librespot-connect = { version = "=0.8.0", default-features = false }
+librespot-metadata = { version = "=0.8.0", default-features = false }
+anyhow = "1"
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false }
+getrandom = "0.3"
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+url = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[dev-dependencies]
+whipspot-testkit = { path = "../whipspot-testkit" }
+# Paused time for the Connect supervisor's backoff tests.
+tokio = { version = "1", features = ["test-util"] }
+
+[build-dependencies]
+# librespot-core 0.8.0's build script does not compile against a fresh dependency resolution
+# (two incompatible vergen-lib versions): https://github.com/librespot-org/librespot/issues/1760
+# Fixed on librespot's `dev` branch by PR #1683 but unreleased. Do not remove this pin until a
+# librespot release contains #1683. An unused build-dependency is enough: it forces the
+# resolution of the whole graph to vergen 9.0.6.
+vergen = "=9.0.6"
+
+[lints]
+workspace = true

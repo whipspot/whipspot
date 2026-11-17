@@ -1,0 +1,21 @@
+[package]
+name = "whipspot-skin-winamp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+whipspot-skin-kit = { path = "../whipspot-skin-kit" }
+
+[features]
+# A legible synthetic skin built in code, for the demo's panel dumps (D12). Not in the product build.
+demo = ["whipspot-skin-kit/synth"]
+
+[dev-dependencies]
+whipspot-skin-kit = { path = "../whipspot-skin-kit", features = ["synth"] }
+whipspot-testkit = { path = "../whipspot-testkit" }
+
+[lints]
+workspace = true
