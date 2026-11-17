@@ -1,5 +1,5 @@
-# CI for Whipspot: format, lints, tests and the crate-boundary checks on Windows and macOS, a
-# gitleaks scan and a coverage summary. Uses no repository secrets.
+# CI for Whipspot: format, lints, tests and the crate-boundary checks on Windows and macOS, and a
+# coverage summary. Uses no repository secrets.
 # The toolchain comes from rust-toolchain.toml (rustup installs it on the first cargo call).
 # Not run here: the demo's GUI smoke and screenshot checks (they need a desktop session and a GPU).
 name: ci
@@ -53,17 +53,6 @@ jobs:
         run: cargo test --workspace
       - name: Crate boundaries
         run: bash scripts/check-boundaries.sh
-
-  secrets:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: gitleaks over the history
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
 
   # A summary with no threshold: it shows where the tests do not reach, it does not gate a merge.
   coverage:

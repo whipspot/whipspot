@@ -239,7 +239,9 @@ fn a_24_192_flac_reaches_the_output_bit_exact() {
 #[test]
 fn a_16_bit_wav_reports_pcm_16_lossless() {
     let music = Scratch::new("music");
-    let src = signal(4410, 2, 16);
+    // Longer than the engine's 250 ms ring, so the decoder is still mid-file (and the label still
+    // set) when it is read below; a file that fits the ring can end before the read.
+    let src = signal(44_100, 2, 16);
     std::fs::write(music.0.join("cd.wav"), wav(44_100, 16, 2, &src)).unwrap();
     let mut r = rig(&music.0, 44_100);
     let uri = r.uri("cd");
@@ -249,7 +251,10 @@ fn a_16_bit_wav_reports_pcm_16_lossless() {
         Some("PCM 16-bit 44.1 kHz")
     );
     let out = r.collect(4410);
-    assert_eq!(first_difference(&out, &expected(&src, 16)), None);
+    assert_eq!(
+        first_difference(&out, &expected(&src, 16)[..out.len()]),
+        None
+    );
     let d = r.engine.monitor().diagnostics();
     assert_eq!(d.source.codec.as_deref(), Some("PCM"));
     assert_eq!(d.source.bit_depth, Some(16));
