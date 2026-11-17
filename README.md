@@ -56,15 +56,11 @@ Your logins are kept in your system's password store, never in plain files.
 
 ## Skins
 
-<img src=".github/readme/skin.png" width="280" align="right" alt="A skin with player, equalizer and playlist">
-
 Whipspot comes with no skins. Drop your own `.wsz` or `.wmz` files into `~/.whipspot/skins` and pick one in **Settings → Skins**.
 
 Find skins at the [Winamp Skin Museum](https://skins.webamp.org/) or the [WMP Skins Archive](https://wmpskinsarchive.neocities.org/).
 
 Press `Ctrl+Shift+N` to go back to the normal look.
-
-<br clear="right">
 
 ## Build from source
 
