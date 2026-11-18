@@ -38,6 +38,11 @@ getrandom = "0.3"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }
 
+# The OS's own mouse-button state for the skin panels (platform_macos.rs); safe calls only. The
+# package is already in the lock through luneui and rfd (0.3.2).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent"] }
+
 [dev-dependencies]
 whipspot-testkit = { path = "../whipspot-testkit" }
 whipspot-skin-winamp = { path = "../whipspot-skin-winamp", features = ["demo"] }

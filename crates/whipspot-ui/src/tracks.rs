@@ -28,6 +28,7 @@ use crate::grid::{Covers, eq_bars};
 use crate::icons::{Icon, icon};
 use crate::library::{LOAD_FAILED, Slot};
 use crate::likes::{LikeBook, heart};
+use crate::link::{self, Face, Place};
 use crate::now_playing::format_time;
 use crate::theme::{Labels, Look};
 
@@ -158,10 +159,16 @@ pub struct PaneResult {
 }
 
 /// Which columns a page's table has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Form {
     /// Album pages: every row is one album, so the Album column and the artist line go.
     pub album_page: bool,
+    /// An album page whose rows have their own artists (an explored album): the column where a
+    /// mixed list has the album is the Artist column, one link per artist.
+    pub artist_col: bool,
+    /// A mixed list under an artist's name (the Popular rows): the artist line under each title
+    /// goes, the title is centred in the row.
+    pub bare: bool,
 }
 
 /// Where the columns sit, logical px.
@@ -187,11 +194,27 @@ pub struct Cols {
 
 /// The columns of a table spanning `lx..right`. A `mixed` list (every row its own album) has the
 /// cover thumb and, when the table is wide enough, the Album column; an album page has neither.
+#[cfg(test)]
 pub fn columns(lx: f32, right: f32, mixed: bool) -> Cols {
+    build(lx, right, mixed, mixed && right - lx >= ALBUM_MIN_W)
+}
+
+/// The columns of a table spanning `lx..right` for `form` (see [`Form`]).
+pub fn columns_for(lx: f32, right: f32, form: Form) -> Cols {
+    let wide = right - lx >= ALBUM_MIN_W;
+    build(
+        lx,
+        right,
+        !form.album_page,
+        (!form.album_page || form.artist_col) && wide,
+    )
+}
+
+/// The columns with the second text column (`album`) on or off.
+fn build(lx: f32, right: f32, mixed: bool, album: bool) -> Cols {
     let title = lx + 56.0;
     let end = right - 108.0;
     let span = (end - title).max(0.0);
-    let album = mixed && right - lx >= ALBUM_MIN_W;
     let (title_w, album_x, album_w) = if album {
         let tw = span * 0.58;
         (tw - 12.0, Some(title + tw), span - tw)
@@ -291,8 +314,8 @@ impl TrackTable {
             let strip = Rect::new(area.x, area.bottom() - strip_h, area.w, strip_h);
             result.retry = failed_strip(ui, strip);
         }
-        let cols = columns(area.x, area.right(), !form.album_page);
-        header(ui.painter(), k, &cols, area);
+        let cols = columns_for(area.x, area.right(), form);
+        header(ui.painter(), k, &cols, area, form);
         if visible.is_empty() {
             // Loaded rows, none of them matching: more pages may still bring some.
             let rest = Rect::new(area.x, list_top, area.w, list_h);
@@ -362,7 +385,7 @@ impl TrackTable {
                     }
                     tools = mark.hovered.then_some((e.grip, dragging));
                 }
-                draw_row(ui.painter(), k, &cols, area, ctx, track, (mark, thumb));
+                draw_row(ui, k, &cols, area, ctx, track, (mark, thumb, form));
                 if let Some((grip, dragging)) = tools {
                     let my = ctx.rect.y + 2.0 + ROW_H / 2.0;
                     if grip {
@@ -460,6 +483,10 @@ impl TrackTable {
                     if hearts.is_some() && (pos.0 - cols.like).abs() <= HEART_HIT / 2.0 {
                         continue;
                     }
+                    // A press on an artist or album link is the link's too.
+                    if link::over(*pos) {
+                        continue;
+                    }
                     // Nor is a press on the edit controls: the grip and the remove button.
                     if let Some(e) = edit
                         && ((e.grip && pos.0 < area.x + GRIP_ZONE)
@@ -508,20 +535,25 @@ impl TrackTable {
 
 /// The header band at the top of `area`: the column labels, the clock over the durations and a
 /// rule under them.
-fn header(p: &mut P<'_>, k: &Look, cols: &Cols, area: Rect) {
+fn header(p: &mut P<'_>, k: &Look, cols: &Cols, area: Rect, form: Form) {
+    let (second, second_caps) = if form.artist_col {
+        ("Artist", "ARTIST")
+    } else {
+        ("Album", "ALBUM")
+    };
     let ink = k.ink;
     let y = area.y;
     if k.decor().labels == Labels::Tracked {
         caps(p, "#", 9.5, ink.faint, cols.num - 3.0, y + 2.0, 1.6);
         caps(p, "TITLE", 9.5, ink.faint, cols.title, y + 2.0, 1.6);
         if let Some(x) = cols.album {
-            caps(p, "ALBUM", 9.5, ink.faint, x, y + 2.0, 1.6);
+            caps(p, second_caps, 9.5, ink.faint, x, y + 2.0, 1.6);
         }
     } else {
         text_c(p, "#", 12.5, ink.faint, false, cols.num, y);
         text(p, "Title", 12.5, ink.faint, false, cols.title, y, 0.0);
         if let Some(x) = cols.album {
-            text(p, "Album", 12.5, ink.faint, false, x, y, 0.0);
+            text(p, second, 12.5, ink.faint, false, x, y, 0.0);
         }
     }
     icon(
@@ -544,14 +576,15 @@ fn header(p: &mut P<'_>, k: &Look, cols: &Cols, area: Rect) {
 /// under it and the "Next" tag after it when `mark.next`), the album and the time. The like heart
 /// is drawn by the caller; `mark.dragging` draws the whole row faint.
 fn draw_row(
-    p: &mut P<'_>,
+    ui: &mut Ui<'_>,
     k: &Look,
     cols: &Cols,
     area: Rect,
     ctx: &RowCtx,
     track: &Track,
-    (mark, thumb): (RowMark, Option<Art>),
+    (mark, thumb, form): (RowMark, Option<Art>, Form),
 ) {
+    let p = ui.painter();
     let ink = k.ink;
     let d = k.decor();
     let playing = mark.playing;
@@ -615,26 +648,32 @@ fn draw_row(
     } else {
         cols.title_w
     };
-    let title_y = if cols.thumb { my - 18.0 } else { my - 10.0 };
+    let two_lines = cols.thumb && !form.bare;
+    let title_y = if two_lines { my - 18.0 } else { my - 10.0 };
     if cols.thumb {
         let r = Rect::new(cols.title, my - THUMB / 2.0, THUMB, THUMB);
+        crate::draw::page_box(crate::draw::BoxKind::Control, r);
         let radius = k.radii().thumb * THUMB / 56.0;
         cover(p, k, r, radius, thumb, NoArt::Thumb);
     }
     let name_w = text(p, &track.name, 15.0, tc, medium, cols.text, title_y, tw);
-    if cols.thumb {
-        let artist = &track.artist;
-        text(
-            p,
-            artist,
-            13.0,
-            ink.muted,
-            false,
-            cols.text,
-            my + 2.0,
-            cols.title_w,
-        );
+    if two_lines {
+        let face = Face {
+            size: 13.0,
+            medium: false,
+            color: ink.muted,
+            shadow: false,
+        };
+        let at = Place {
+            x: cols.text,
+            y: my + 2.0,
+            centre: false,
+            max_w: cols.title_w,
+        };
+        let key = ("row-artist", ctx.key.0);
+        link::line(ui, key, k, &track.artist, &track.artists, face, at);
     }
+    let p = ui.painter();
     if mark.next {
         let h = TAG_SIZE + 2.0 * TAG_PAD.1;
         let r = Rect::new(cols.text + name_w + TAG_GAP, title_y + 1.0, tag_w, h);
@@ -652,8 +691,28 @@ fn draw_row(
     }
     if let Some(x) = cols.album {
         let aw = cols.album_w - 12.0;
-        text(p, &track.album, 13.5, ink.muted, false, x, my - 9.0, aw);
+        let face = Face {
+            size: 13.5,
+            medium: false,
+            color: ink.muted,
+            shadow: false,
+        };
+        let at = Place {
+            x,
+            y: my - 9.0,
+            centre: false,
+            max_w: aw,
+        };
+        if form.artist_col {
+            let key = ("row-artists", ctx.key.0);
+            link::line(ui, key, k, &track.artist, &track.artists, face, at);
+        } else {
+            let key = ("row-album", ctx.key.0);
+            let refs = track.album_ref.as_slice();
+            link::line(ui, key, k, &track.album, refs, face, at);
+        }
     }
+    let p = ui.painter();
     let time = format_time(track.duration_ms);
     if d.mono_numbers {
         let w = mono_width(p, &time, 12.5);

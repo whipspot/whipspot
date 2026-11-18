@@ -68,6 +68,8 @@ fn track(title: &str) -> Track {
         duration_ms: 180_000,
         images: vec![],
         year: None,
+        album_ref: None,
+        artists: vec![],
     }
 }
 

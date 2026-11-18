@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use whipspot_core::engine::{Engine, EngineConfig};
 use whipspot_core::events::UiEvent;
 use whipspot_core::folders::MusicFolders;
-use whipspot_core::provider::{Library, Provider, ProviderContext, Track};
+use whipspot_core::provider::{AlbumKind, Library, Provider, ProviderContext, ReleaseGroup, Track};
 use whipspot_local::{
     FAVOURITES_FILE, INDEX_FILE, LocalConfig, LocalProvider, UNKNOWN_ALBUM, UNKNOWN_ARTIST,
     is_track_uri, read_tags_from_bytes,
@@ -189,6 +189,140 @@ async fn the_music_tree_reads_as_a_library() {
 
     assert!(lib.album_tracks("album:0000000000000000", 0).await.is_err());
     assert!(lib.playlist_items("../mix.m3u", 0).await.is_err());
+}
+
+/// Writes a tagged FLAC `name` in the rig's music folder.
+fn write_flac(rig: &Rig, name: &str, tags: &[(&str, &str)]) {
+    let bytes = flac(44_100, 16, 2, &signal(4_410, 2, 16), tags, None);
+    std::fs::write(rig.music.path().join(name), bytes).unwrap();
+}
+
+#[tokio::test]
+async fn artists_and_albums_open_by_uri() {
+    let rig = Rig::new();
+    // A guest track: the album is Other Artist's, the track names Other Artist and (in another
+    // case, after the tag's own `;`) the fixture artist.
+    write_flac(
+        &rig,
+        "guest.flac",
+        &[
+            ("TITLE", "Guest Song"),
+            ("ARTIST", "Other Artist; fixture artist"),
+            ("ALBUMARTIST", "Other Artist"),
+            ("ALBUM", "Guest Album"),
+            ("DATE", "2005"),
+        ],
+    );
+    // A slash inside a name is not a separator.
+    write_flac(
+        &rig,
+        "band.flac",
+        &[
+            ("TITLE", "Thunder"),
+            ("ARTIST", "AC/DC"),
+            ("ALBUM", "Back"),
+            ("DATE", "1980"),
+        ],
+    );
+    let p = rig.scanned();
+    let lib = p.library().unwrap();
+    assert!(p.info().caps.explore && !p.info().caps.save_albums);
+
+    let all = all_tracks(lib).await;
+    let first = all.iter().find(|t| t.name == "First Song").unwrap();
+    assert_eq!(first.artists.len(), 1);
+    assert_eq!(first.artists[0].name, "Fixture Artist");
+    assert!(first.artists[0].uri.starts_with("local:artist:"));
+    let album_ref = first.album_ref.as_ref().expect("an album ref");
+    assert_eq!(album_ref.name, ALBUM_TITLE);
+    assert!(album_ref.uri.starts_with("local:album:"));
+    let detail = lib.album(&album_ref.uri).await.unwrap();
+    assert_eq!(detail.album.uri, album_ref.uri);
+    assert_eq!(detail.album.kind, AlbumKind::Album);
+    assert_eq!(detail.album.artists, first.artists);
+    assert_eq!(detail.tracks.items.len(), 3);
+
+    let loose = all.iter().find(|t| t.name == "loose").unwrap();
+    assert!(
+        loose.artists.is_empty() && loose.album_ref.is_none(),
+        "an untagged file has no links"
+    );
+    let thunder = all.iter().find(|t| t.name == "Thunder").unwrap();
+    assert_eq!(names_of(&thunder.artists), ["AC/DC"]);
+
+    let guest = all.iter().find(|t| t.name == "Guest Song").unwrap();
+    assert_eq!(names_of(&guest.artists), ["Other Artist", "fixture artist"]);
+    assert_eq!(
+        guest.artists[1].uri, first.artists[0].uri,
+        "the same artist in another case is one artist"
+    );
+
+    // The fixture artist's page: its own album, and the guest album as "appears on".
+    let page = lib.artist(&first.artists[0].uri).await.unwrap();
+    assert_eq!(page.artist.name, "Fixture Artist");
+    assert!(page.popular.is_empty());
+    assert!(
+        !page.artist.images.is_empty(),
+        "the cover of its newest album"
+    );
+    let kinds: Vec<(&str, AlbumKind)> = page
+        .releases
+        .items
+        .iter()
+        .map(|a| (a.name.as_str(), a.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (ALBUM_TITLE, AlbumKind::Album),
+            ("Guest Album", AlbumKind::AppearsOn)
+        ]
+    );
+    let own = lib
+        .artist_releases(&first.artists[0].uri, ReleaseGroup::Albums, 0)
+        .await
+        .unwrap();
+    assert_eq!(own.items.len(), 1);
+    let singles = lib
+        .artist_releases(&first.artists[0].uri, ReleaseGroup::Singles, 0)
+        .await
+        .unwrap();
+    assert!(singles.items.is_empty());
+
+    // Anything that is not a uri this provider made is an error.
+    for bad in [
+        "local:artist:0000000000000000",
+        "local:artist:../x",
+        "local:album:0000000000000000",
+        "local:track:0000000000000000",
+        "spotify:artist:abc",
+    ] {
+        assert!(lib.artist(bad).await.is_err(), "{bad}");
+        assert!(lib.album(bad).await.is_err(), "{bad}");
+    }
+
+    // Ids survive a rescan and a restart that only reads the index.
+    let before = (first.artists[0].uri.clone(), album_ref.uri.clone());
+    p.rescan();
+    assert!(p.wait_idle(Duration::from_secs(20)));
+    let again = all_tracks(p.library().unwrap()).await;
+    let f = again.iter().find(|t| t.name == "First Song").unwrap();
+    assert_eq!(
+        (f.artists[0].uri.clone(), f.album_ref.clone().unwrap().uri),
+        before
+    );
+    drop(p);
+    let restarted = LocalProvider::from_index(rig.config(), ctx());
+    let from_index = all_tracks(restarted.library().unwrap()).await;
+    let f = from_index.iter().find(|t| t.name == "First Song").unwrap();
+    assert_eq!(
+        (f.artists[0].uri.clone(), f.album_ref.clone().unwrap().uri),
+        before
+    );
+}
+
+fn names_of(refs: &[whipspot_core::provider::EntityRef]) -> Vec<&str> {
+    refs.iter().map(|r| r.name.as_str()).collect()
 }
 
 #[tokio::test]

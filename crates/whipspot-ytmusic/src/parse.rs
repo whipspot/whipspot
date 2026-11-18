@@ -14,7 +14,10 @@
 //!   own (serde_json itself refuses input nested deeper than 128).
 
 use serde_json::Value;
-use whipspot_core::provider::{Album, ImageRef, MAX_IMAGES, Playlist, Readable, Track};
+use whipspot_core::provider::{
+    Album, AlbumKind, EntityRef, ImageRef, MAX_ARTISTS, MAX_IMAGES, MAX_POPULAR, Playlist,
+    Readable, ReleaseGroup, Track,
+};
 use whipspot_core::text::display_text;
 
 use crate::ids;
@@ -72,6 +75,50 @@ pub struct AlbumHeader {
     pub artist: String,
     pub year: Option<u16>,
     pub images: Vec<ImageRef>,
+    /// The artists as links, at most [`MAX_ARTISTS`].
+    pub artists: Vec<EntityRef>,
+    pub kind: AlbumKind,
+    /// The album's own URI. The page does not name its own browse id: the caller that asked for
+    /// it sets this.
+    pub uri: String,
+    /// The audio playlist a save targets (`OLAK5uy_..`); `None` if the page names none.
+    pub audio_playlist_id: Option<String>,
+    /// Whether the account has saved the album, when the page says.
+    pub saved: Option<bool>,
+}
+
+impl AlbumHeader {
+    /// The album as a link, once its URI is known.
+    pub fn album_ref(&self) -> Option<EntityRef> {
+        (!self.uri.is_empty() && !self.title.is_empty()).then(|| EntityRef {
+            uri: self.uri.clone(),
+            name: self.title.clone(),
+        })
+    }
+}
+
+/// Where the rest of an artist's releases of one group is listed (a "More" link).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct More {
+    pub browse_id: String,
+    pub params: String,
+}
+
+/// The releases an artist page shows in one carousel, and where the full list is.
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseShelf {
+    pub items: Vec<Album>,
+    pub more: Option<More>,
+}
+
+/// An artist page: the header, the popular songs and the two release carousels.
+#[derive(Debug, Clone)]
+pub struct ArtistParse {
+    pub name: String,
+    pub images: Vec<ImageRef>,
+    pub popular: Vec<Track>,
+    pub albums: ReleaseShelf,
+    pub singles: ReleaseShelf,
 }
 
 // ---- navigation ---------------------------------------------------------------------------
@@ -316,6 +363,57 @@ fn is_type_label(text: &str) -> bool {
     )
 }
 
+/// The link of an artist run: only a `UC` id on an artist page (or on no stated page type).
+fn artist_ref(run: &Value, name: &str) -> Option<EntityRef> {
+    if !matches!(
+        get_str(run, PAGE_TYPE),
+        None | Some("MUSIC_PAGE_TYPE_ARTIST")
+    ) || name.is_empty()
+    {
+        return None;
+    }
+    let uri = ids::artist_uri(get_str(run, "navigationEndpoint.browseEndpoint.browseId")?)?;
+    Some(EntityRef {
+        uri,
+        name: name.to_owned(),
+    })
+}
+
+/// The link of an album run: only an `MPRE` id on an album page (or on no stated page type).
+fn album_ref(run: &Value, name: &str) -> Option<EntityRef> {
+    if !matches!(
+        get_str(run, PAGE_TYPE),
+        None | Some("MUSIC_PAGE_TYPE_ALBUM")
+    ) || name.is_empty()
+    {
+        return None;
+    }
+    let uri = ids::album_uri(get_str(run, "navigationEndpoint.browseEndpoint.browseId")?)?;
+    Some(EntityRef {
+        uri,
+        name: name.to_owned(),
+    })
+}
+
+/// Adds `r` unless it is `None`, a repeat, or past [`MAX_ARTISTS`].
+fn push_ref(into: &mut Vec<EntityRef>, r: Option<EntityRef>) {
+    if let Some(r) = r
+        && into.len() < MAX_ARTISTS
+        && !into.iter().any(|x| x.uri == r.uri)
+    {
+        into.push(r);
+    }
+}
+
+fn kind_of_label(text: &str) -> AlbumKind {
+    match text.trim() {
+        "Album" => AlbumKind::Album,
+        "Single" | "EP" => AlbumKind::Single,
+        "Compilation" => AlbumKind::Compilation,
+        _ => AlbumKind::Unknown,
+    }
+}
+
 fn plain_year(text: &str) -> Option<u16> {
     let t = text.trim();
     (t.len() == 4 && t.bytes().all(|b| b.is_ascii_digit()))
@@ -391,7 +489,9 @@ fn dedup_join(names: Vec<String>) -> String {
 #[derive(Default)]
 struct Details {
     artists: Vec<String>,
+    artist_refs: Vec<EntityRef>,
     album: Option<String>,
+    album_ref: Option<EntityRef>,
     duration_ms: Option<u64>,
 }
 
@@ -407,10 +507,16 @@ fn row_details(row: &Value) -> Details {
                 continue;
             };
             match linked_run_kind(run) {
-                Some(RunKind::Artist) => d.artists.push(clean(text)),
+                Some(RunKind::Artist) => {
+                    let name = clean(text);
+                    push_ref(&mut d.artist_refs, artist_ref(run, &name));
+                    d.artists.push(name);
+                }
                 Some(RunKind::Album) => {
                     if d.album.is_none() {
-                        d.album = Some(clean(text));
+                        let name = clean(text);
+                        d.album_ref = album_ref(run, &name);
+                        d.album = Some(name);
                     }
                 }
                 Some(RunKind::Other) => {}
@@ -472,14 +578,18 @@ fn parse_track_row(item: &Value, album: Option<&AlbumHeader>) -> Option<TrackRow
     let duration_ms = fixed_duration_ms(row).or(details.duration_ms).unwrap_or(0);
 
     let mut artist = dedup_join(details.artists);
+    let mut artists = details.artist_refs;
+    let mut album_ref = details.album_ref;
     let mut images = images_at(row, "thumbnail.musicThumbnailRenderer.thumbnail.thumbnails");
     let mut album_name = details.album.unwrap_or_default();
     let mut year = None;
     if let Some(h) = album {
         album_name = h.title.clone();
+        album_ref = h.album_ref();
         year = h.year;
         if artist.is_empty() {
             artist = h.artist.clone();
+            artists = h.artists.clone();
         }
         if images.is_empty() {
             images = h.images.clone();
@@ -494,6 +604,8 @@ fn parse_track_row(item: &Value, album: Option<&AlbumHeader>) -> Option<TrackRow
             duration_ms,
             images,
             year,
+            album_ref,
+            artists,
         },
         like: row_like(row),
     })
@@ -524,6 +636,7 @@ pub fn album_header(resp: &Value) -> Option<AlbumHeader> {
         .unwrap_or_default();
 
     let mut artists: Vec<String> = Vec::new();
+    let mut refs: Vec<EntityRef> = Vec::new();
     let mut loose: Vec<String> = Vec::new();
     for run in get_array(header, "straplineTextOne.runs")
         .unwrap_or(&[])
@@ -534,7 +647,11 @@ pub fn album_header(resp: &Value) -> Option<AlbumHeader> {
             continue;
         };
         match linked_run_kind(run) {
-            Some(RunKind::Artist) => artists.push(clean(text)),
+            Some(RunKind::Artist) => {
+                let name = clean(text);
+                push_ref(&mut refs, artist_ref(run, &name));
+                artists.push(name);
+            }
             Some(_) => {}
             None if !is_separator(text) => loose.push(clean(text)),
             None => {}
@@ -552,7 +669,9 @@ pub fn album_header(resp: &Value) -> Option<AlbumHeader> {
                 continue;
             };
             if linked_run_kind(run) == Some(RunKind::Artist) {
-                artists.push(clean(text));
+                let name = clean(text);
+                push_ref(&mut refs, artist_ref(run, &name));
+                artists.push(name);
             }
         }
     }
@@ -563,12 +682,65 @@ pub fn album_header(resp: &Value) -> Option<AlbumHeader> {
         header,
         "thumbnail.musicThumbnailRenderer.thumbnail.thumbnails",
     );
+    let kind = subtitle
+        .first()
+        .and_then(|r| r.get("text").and_then(Value::as_str))
+        .map_or(AlbumKind::Unknown, kind_of_label);
+    let (audio_playlist_id, saved) = header_actions(header);
     Some(AlbumHeader {
         title,
         artist: dedup_join(artists),
         year,
         images,
+        artists: refs,
+        kind,
+        uri: String::new(),
+        audio_playlist_id,
+        saved,
     })
+}
+
+/// The audio playlist a save targets and whether the album is saved, from the header's buttons:
+/// the save toggle's own target first, else the play button's playlist. A playlist id that is
+/// not an album's audio playlist (`OLAK5uy_..`) is never taken.
+fn header_actions(header: &Value) -> (Option<String>, Option<bool>) {
+    let (mut from_toggle, mut from_play, mut saved) = (None, None, None);
+    for path in [
+        "buttons",
+        "menu.menuRenderer.topLevelButtons",
+        "menu.menuRenderer.items",
+    ] {
+        for b in get_array(header, path).unwrap_or(&[]).iter().take(16) {
+            let play = ["watchEndpoint", "watchPlaylistEndpoint"]
+                .iter()
+                .find_map(|k| {
+                    get_str(
+                        b,
+                        &format!("musicPlayButtonRenderer.playNavigationEndpoint.{k}.playlistId"),
+                    )
+                });
+            if let Some(id) = play.and_then(ids::audio_playlist_id) {
+                from_play.get_or_insert_with(|| id.to_owned());
+            }
+            if let Some(like) = get(
+                b,
+                "toggleButtonRenderer.defaultServiceEndpoint.likeEndpoint",
+            ) {
+                if let Some(id) =
+                    get_str(like, "target.playlistId").and_then(ids::audio_playlist_id)
+                {
+                    from_toggle.get_or_insert_with(|| id.to_owned());
+                }
+                // The endpoint names what a press does: LIKE saves, INDIFFERENT removes.
+                match get_str(like, "status") {
+                    Some("LIKE") => _ = saved.get_or_insert(false),
+                    Some("INDIFFERENT") => _ = saved.get_or_insert(true),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (from_toggle.or(from_play), saved)
 }
 
 /// A page of search results (songs). An answer with no results is an empty page.
@@ -672,20 +844,25 @@ fn parse_album(item: &Value) -> Option<Album> {
         .filter(|n| !n.is_empty())?;
 
     let mut artists: Vec<String> = Vec::new();
+    let mut refs: Vec<EntityRef> = Vec::new();
     let mut loose: Vec<String> = Vec::new();
     let mut year = None;
+    let subtitle = get_array(d, "subtitle.runs").unwrap_or(&[]);
+    let kind = subtitle
+        .first()
+        .and_then(|r| r.get("text").and_then(Value::as_str))
+        .map_or(AlbumKind::Unknown, kind_of_label);
     // The first run is the type ("Album", "Single", "EP"), then separated artists and the year.
-    for run in get_array(d, "subtitle.runs")
-        .unwrap_or(&[])
-        .iter()
-        .skip(1)
-        .take(16)
-    {
+    for run in subtitle.iter().skip(1).take(16) {
         let Some(text) = run.get("text").and_then(Value::as_str) else {
             continue;
         };
         match linked_run_kind(run) {
-            Some(RunKind::Artist) => artists.push(clean(text)),
+            Some(RunKind::Artist) => {
+                let name = clean(text);
+                push_ref(&mut refs, artist_ref(run, &name));
+                artists.push(name);
+            }
             Some(_) => {}
             None => {
                 if let Some(y) = plain_year(text) {
@@ -700,6 +877,7 @@ fn parse_album(item: &Value) -> Option<Album> {
         artists = loose;
     }
     Some(Album {
+        uri: id.clone(),
         id,
         name,
         artist: dedup_join(artists),
@@ -709,7 +887,141 @@ fn parse_album(item: &Value) -> Option<Album> {
             "thumbnailRenderer.musicThumbnailRenderer.thumbnail.thumbnails",
         ),
         year,
+        artists: refs,
+        kind,
     })
+}
+
+/// One release of an artist page's carousel or "More" grid. The kind is the group's (an album
+/// of the Albums group may say "Compilation"); an item that names no artist is the page's own.
+fn parse_release(item: &Value, group: ReleaseGroup, owner: &EntityRef) -> Option<Album> {
+    let mut a = parse_album(item)?;
+    a.kind = match group {
+        ReleaseGroup::Singles => AlbumKind::Single,
+        _ if a.kind == AlbumKind::Compilation => AlbumKind::Compilation,
+        _ => AlbumKind::Album,
+    };
+    if a.artists.is_empty() {
+        a.artists = vec![owner.clone()];
+        a.artist = owner.name.clone();
+    }
+    Some(a)
+}
+
+/// Where a carousel's "More" link leads: an `MPAD` browse id and its params, nothing else.
+fn more_endpoint(carousel: &Value) -> Option<More> {
+    let head = "header.musicCarouselShelfBasicHeaderRenderer";
+    let ep = get(
+        carousel,
+        &format!("{head}.title.runs.0.navigationEndpoint.browseEndpoint"),
+    )
+    .or_else(|| {
+        get(
+            carousel,
+            &format!("{head}.moreContentButton.buttonRenderer.navigationEndpoint.browseEndpoint"),
+        )
+    })?;
+    let browse_id =
+        get_str(ep, "browseId").filter(|b| b.starts_with("MPAD") && ids::valid_id(b))?;
+    let params = get_str(ep, "params").filter(|p| token_ok(p))?;
+    Some(More {
+        browse_id: browse_id.to_owned(),
+        params: params.to_owned(),
+    })
+}
+
+/// An artist page: `owner` is the artist asked for (its URI), whose name the header gives.
+/// `None` when the answer has no header with a name.
+pub fn artist_page(resp: &Value, uri: &str) -> Option<ArtistParse> {
+    let header = get(resp, "header.musicImmersiveHeaderRenderer")
+        .or_else(|| get(resp, "header.musicVisualHeaderRenderer"))?;
+    let name = get_str(header, "title.runs.0.text")
+        .map(clean)
+        .filter(|n| !n.is_empty())?;
+    let mut images = images_at(
+        header,
+        "thumbnail.musicThumbnailRenderer.thumbnail.thumbnails",
+    );
+    if images.is_empty() {
+        images = images_at(
+            header,
+            "foregroundThumbnail.musicThumbnailRenderer.thumbnail.thumbnails",
+        );
+    }
+    let owner = EntityRef {
+        uri: uri.to_owned(),
+        name: name.clone(),
+    };
+    let mut out = ArtistParse {
+        name,
+        images,
+        popular: Vec::new(),
+        albums: ReleaseShelf::default(),
+        singles: ReleaseShelf::default(),
+    };
+    let sections = get_array(
+        resp,
+        &format!("{SINGLE_COLUMN_TAB}.0.tabRenderer.content.sectionListRenderer.contents"),
+    )
+    .unwrap_or(&[]);
+    let (mut songs_seen, mut albums_seen, mut singles_seen) = (false, false, false);
+    for section in sections.iter().take(32) {
+        if let Some(shelf) = section.get("musicShelfRenderer") {
+            if songs_seen {
+                continue;
+            }
+            songs_seen = true;
+            for item in get_array(shelf, "contents")
+                .unwrap_or(&[])
+                .iter()
+                .take(MAX_ITEMS)
+            {
+                if out.popular.len() >= MAX_POPULAR {
+                    break;
+                }
+                let Some(mut t) = parse_track_row(item, None).map(|r| r.track) else {
+                    continue;
+                };
+                // A song of the artist's own page may leave the artist out of its columns.
+                if t.artists.is_empty() {
+                    t.artists = vec![owner.clone()];
+                    if t.artist.is_empty() {
+                        t.artist = owner.name.clone();
+                    }
+                }
+                out.popular.push(t);
+            }
+        } else if let Some(carousel) = section.get("musicCarouselShelfRenderer") {
+            let title = get_str(
+                carousel,
+                "header.musicCarouselShelfBasicHeaderRenderer.title.runs.0.text",
+            )
+            .map(|t| t.trim().to_lowercase());
+            let (group, seen, target) = match title.as_deref() {
+                Some("albums") => (ReleaseGroup::Albums, &mut albums_seen, &mut out.albums),
+                Some("singles & eps" | "singles and eps" | "singles") => {
+                    (ReleaseGroup::Singles, &mut singles_seen, &mut out.singles)
+                }
+                _ => continue,
+            };
+            if *seen {
+                continue;
+            }
+            *seen = true;
+            let items = get_array(carousel, "contents").unwrap_or(&[]);
+            let (albums, _, _) = collect(items, |_| false, |i| parse_release(i, group, &owner));
+            *target = ReleaseShelf {
+                items: albums,
+                more: more_endpoint(carousel),
+            };
+        }
+    }
+    Some(out)
+}
+
+/// A grid page of an artist's releases of `group` (the "More" page or its continuation).
+pub fn releases_page(resp: &Value, group: ReleaseGroup, owner: &EntityRef) -> Option<Page<Album>> {
+    grid_page(resp, |i| parse_release(i, group, owner))
 }
 
 /// A grid page of the library. An answer with a `contents` but no grid is an empty library.

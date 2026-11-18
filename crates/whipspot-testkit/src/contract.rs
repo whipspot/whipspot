@@ -22,9 +22,10 @@ use whipspot_core::{
     folders::{FolderError, MusicFolders},
     lyrics::{Lyrics, LyricsError, LyricsQuery, LyricsSource, MAX_LYRIC_CHARS, MAX_LYRIC_LINES},
     provider::{
-        AuthFlow, AuthStepStatus, ImageRef, LibErrorKind, Library, LibraryError, LoginInput,
-        MAX_IMAGES, Provider, ProviderInfo, ProviderRegistry, Readable, RegisterError,
-        RemoteCommand, model::LoginState, registry::is_valid_id,
+        Album, AlbumKind, AuthFlow, AuthStepStatus, EntityRef, ImageRef, LibErrorKind, Library,
+        LibraryError, LoginInput, MAX_ARTISTS, MAX_IMAGES, MAX_POPULAR, Provider, ProviderInfo,
+        ProviderRegistry, Readable, RegisterError, ReleaseGroup, RemoteCommand, Track,
+        model::LoginState, registry::is_valid_id,
     },
     secret::Secret,
     skin::{
@@ -341,6 +342,8 @@ pub async fn run_remote_contract(p: Arc<dyn Provider>) {
 /// | `library.*` | logged out: `playlists`, `liked_tracks`, `playlist_items`, `albums`, `album_tracks`, `search` are errors with a fixed text (the same twice); a provider with no login steps (none, or only switches) is always ready, so each call there is Ok or an error with a fixed text |
 /// | `library.check_changes` | returns within 5 s |
 /// | `library.liked`, `set_liked`, `can_change_likes` | `caps.likes` off: the first two are errors and the last is false; on: `liked` is an error or one answer per uri |
+/// | `caps` | `explore` needs `library`; `save_albums` needs `likes` |
+/// | `library.artist`, `album`, `artist_releases` | an empty, a malformed, a foreign-scheme and a wrong-kind uri is an error with a fixed text, never a panic (with `explore` off the default is that error) |
 ///
 /// Playback and the logged-in library are in [`run_provider_playback_contract`] and
 /// [`run_provider_session_contract`], run on providers that can do them without a device or a
@@ -374,6 +377,14 @@ pub async fn run_provider_contract(p: Arc<dyn Provider>) {
     assert!(
         !info.caps.search || info.caps.library,
         "provider contract: caps.search needs caps.library"
+    );
+    assert!(
+        !info.caps.explore || info.caps.library,
+        "provider contract: caps.explore needs caps.library"
+    );
+    assert!(
+        !info.caps.save_albums || info.caps.likes,
+        "provider contract: caps.save_albums needs caps.likes"
     );
     let mut step_ids: Vec<&str> = Vec::new();
     for step in &info.auth_steps {
@@ -520,6 +531,26 @@ pub async fn run_provider_contract(p: Arc<dyn Provider>) {
             lib.playlists(0).await.err(),
             "provider contract: a library error is the same twice"
         );
+        for round in 1..=2 {
+            for bad in bad_entity_uris(info.id) {
+                for (name, error) in [
+                    ("artist", lib.artist(&bad).await.err()),
+                    ("album", lib.album(&bad).await.err()),
+                    (
+                        "artist_releases",
+                        lib.artist_releases(&bad, ReleaseGroup::All, 0).await.err(),
+                    ),
+                ] {
+                    let Some(error) = error else {
+                        panic!("provider contract: {name}({bad:?}) is an error (call {round})");
+                    };
+                    assert_fixed_text(
+                        &error.message,
+                        &format!("provider contract: {name}({bad:?})"),
+                    );
+                }
+            }
+        }
         let uris = vec!["x:track:1".to_owned(), String::new(), "y".to_owned()];
         if info.caps.likes {
             if let Ok(answer) = lib.liked(&uris).await {
@@ -544,6 +575,24 @@ pub async fn run_provider_contract(p: Arc<dyn Provider>) {
             );
         }
     }
+}
+
+/// Uris no provider may open as an artist or an album: empty, no scheme, another provider's
+/// scheme, the provider's scheme with a missing or hostile id, and the wrong kind of entity.
+fn bad_entity_uris(id: &str) -> Vec<String> {
+    vec![
+        String::new(),
+        "no-such-id".to_owned(),
+        "zz-other:artist:1".to_owned(),
+        "zz-other:album:1".to_owned(),
+        format!("{id}:artist:"),
+        format!("{id}:album:"),
+        format!("{id}:artist:no-such-artist"),
+        format!("{id}:album:no-such-album"),
+        format!("{id}:artist:../../x"),
+        format!("{id}:track:1"),
+        format!("{id}:artist:{}", "9".repeat(5000)),
+    ]
 }
 
 /// Playback cases on a provider that can load tracks without a device or a login (the fake, the
@@ -651,6 +700,8 @@ where
 /// | `library.playlists`, `albums`, `liked_tracks` | the walk ends, ids and uris are unique, images <= `MAX_IMAGES`, `total` (when given) covers what was read |
 /// | `library.playlist_items`, `album_tracks` | a readable playlist and an album list named tracks (an unreadable playlist is `NotReadable`); an unknown id is an error |
 /// | `library.search` | an existing track name finds it; a nonsense query finds nothing |
+/// | `library.artist`, `album`, `artist_releases` | with `caps.explore`: every artist and album ref of the walked tracks and albums (at most `MAX_ARTISTS` per item, at least one of each seen) resolves through the registry to this provider and opens: `artist(uri).artist.uri == uri`, popular <= `MAX_POPULAR`, images <= `MAX_IMAGES`, releases walk unique by uri, each group's kinds match (Albums: album or compilation, Singles: single, AppearsOn: appears-on); `album(uri).album.uri == uri` and lists tracks; a bad uri is an error |
+/// | `library.liked`, `set_liked` | with `caps.save_albums`: an album uri answers one bool and, when `can_change_likes`, set then read back, both ways |
 /// | `library.liked` | one answer per uri; an unsaved uri is `false` |
 /// | `library.set_liked` | when `can_change_likes`: set then read back, both ways; otherwise an error |
 /// | `auth.logout` | every step; then `status` is logged out and the library is an error again (skipped with no auth steps) |
@@ -731,7 +782,7 @@ pub async fn run_provider_session_contract(
 
     let lib = p.library();
     if let Some(lib) = lib {
-        session_library(&info, lib).await;
+        session_library(&p, &info, lib).await;
     }
 
     for step in &info.auth_steps {
@@ -753,7 +804,7 @@ pub async fn run_provider_session_contract(
 }
 
 /// The logged-in library cases of [`run_provider_session_contract`].
-async fn session_library(info: &ProviderInfo, lib: &dyn Library) {
+async fn session_library(p: &Arc<dyn Provider>, info: &ProviderInfo, lib: &dyn Library) {
     let playlists = walk("playlists", |o| async move {
         lib.playlists(o).await.map(|p| (p.items, p.next_offset))
     })
@@ -867,6 +918,15 @@ async fn session_library(info: &ProviderInfo, lib: &dyn Library) {
         "session contract: a nonsense search finds nothing"
     );
 
+    if info.caps.explore {
+        let seen: Vec<&Track> = liked_tracks
+            .iter()
+            .chain(tracks.iter())
+            .chain(album_tracks.iter())
+            .collect();
+        session_explore(p, info, lib, &seen, &albums).await;
+    }
+
     if info.caps.likes {
         let known = liked_tracks[0].uri.clone();
         let probe = "session:track:not-saved".to_owned();
@@ -910,6 +970,186 @@ async fn session_library(info: &ProviderInfo, lib: &dyn Library) {
                 lib.set_liked(&probe, true).await.is_err(),
                 "session contract: set_liked without can_change_likes is an error"
             );
+        }
+    }
+}
+
+/// The explore cases of [`run_provider_session_contract`] (`caps.explore`).
+async fn session_explore(
+    p: &Arc<dyn Provider>,
+    info: &ProviderInfo,
+    lib: &dyn Library,
+    tracks: &[&Track],
+    albums: &[Album],
+) {
+    let mut registry = ProviderRegistry::new();
+    registry
+        .register(p.clone())
+        .unwrap_or_else(|e| panic!("session contract: explore: registers: {e}"));
+    let resolves = |uri: &str, what: &str| {
+        assert_eq!(
+            registry.resolve_uri(uri).map(|q| q.info().id),
+            Some(info.id),
+            "session contract: {what} {uri:?} resolves to the provider that made it"
+        );
+    };
+
+    // The refs seen, unique by uri.
+    let mut artists: Vec<EntityRef> = Vec::new();
+    let mut album_refs: Vec<EntityRef> = Vec::new();
+    let add = |into: &mut Vec<EntityRef>, r: &EntityRef| {
+        if !r.uri.is_empty() && !into.iter().any(|x| x.uri == r.uri) {
+            into.push(r.clone());
+        }
+    };
+    for t in tracks {
+        assert!(
+            t.artists.len() <= MAX_ARTISTS,
+            "session contract: a track names at most MAX_ARTISTS artists"
+        );
+        t.artists.iter().for_each(|r| add(&mut artists, r));
+        if let Some(r) = &t.album_ref {
+            add(&mut album_refs, r);
+        }
+    }
+    for a in albums {
+        assert!(
+            a.artists.len() <= MAX_ARTISTS,
+            "session contract: an album names at most MAX_ARTISTS artists"
+        );
+        a.artists.iter().for_each(|r| add(&mut artists, r));
+        add(
+            &mut album_refs,
+            &EntityRef {
+                uri: a.uri.clone(),
+                name: a.name.clone(),
+            },
+        );
+    }
+    assert!(
+        !artists.is_empty() && !album_refs.is_empty(),
+        "session contract: with caps.explore the walked items carry artist and album refs"
+    );
+    artists.truncate(12);
+    album_refs.truncate(12);
+
+    let unique_albums = |items: &[Album], what: &str| {
+        let mut uris: Vec<&str> = items.iter().map(|a| a.uri.as_str()).collect();
+        assert!(
+            uris.iter().all(|u| !u.is_empty()),
+            "session contract: {what}: every release has a uri"
+        );
+        uris.sort_unstable();
+        let n = uris.len();
+        uris.dedup();
+        assert_eq!(uris.len(), n, "session contract: {what} are unique by uri");
+        assert!(
+            items.iter().all(|a| a.images.len() <= MAX_IMAGES),
+            "session contract: {what}: at most MAX_IMAGES images"
+        );
+    };
+
+    for r in &artists {
+        resolves(&r.uri, "an artist ref");
+        let page = lib
+            .artist(&r.uri)
+            .await
+            .unwrap_or_else(|e| panic!("session contract: artist({:?}): {e}", r.uri));
+        assert_eq!(
+            page.artist.uri, r.uri,
+            "session contract: artist(uri).artist.uri is the uri"
+        );
+        assert!(
+            !page.artist.name.is_empty() && page.artist.images.len() <= MAX_IMAGES,
+            "session contract: an artist has a name and at most MAX_IMAGES images"
+        );
+        assert!(
+            page.popular.len() <= MAX_POPULAR,
+            "session contract: popular tracks are at most MAX_POPULAR"
+        );
+        unique_albums(&page.releases.items, "the first page of releases");
+
+        let all = walk("artist_releases all", |o| async move {
+            lib.artist_releases(&r.uri, ReleaseGroup::All, o)
+                .await
+                .map(|p| (p.items, p.next_offset))
+        })
+        .await;
+        unique_albums(&all, "all releases");
+        for (group, ok) in [
+            (
+                ReleaseGroup::Albums,
+                &[AlbumKind::Album, AlbumKind::Compilation][..],
+            ),
+            (ReleaseGroup::Singles, &[AlbumKind::Single][..]),
+            (ReleaseGroup::AppearsOn, &[AlbumKind::AppearsOn][..]),
+        ] {
+            let items = walk("artist_releases group", |o| async move {
+                lib.artist_releases(&r.uri, group, o)
+                    .await
+                    .map(|p| (p.items, p.next_offset))
+            })
+            .await;
+            unique_albums(&items, "a release group");
+            assert!(
+                items.iter().all(|a| ok.contains(&a.kind)),
+                "session contract: the releases of {group:?} have a matching kind"
+            );
+        }
+    }
+
+    for r in &album_refs {
+        resolves(&r.uri, "an album ref");
+        let detail = lib
+            .album(&r.uri)
+            .await
+            .unwrap_or_else(|e| panic!("session contract: album({:?}): {e}", r.uri));
+        assert_eq!(
+            detail.album.uri, r.uri,
+            "session contract: album(uri).album.uri is the uri"
+        );
+        assert!(
+            detail.album.images.len() <= MAX_IMAGES && !detail.tracks.items.is_empty(),
+            "session contract: an opened album has at most MAX_IMAGES images and lists tracks"
+        );
+    }
+
+    for bad in bad_entity_uris(info.id) {
+        assert!(
+            lib.artist(&bad).await.is_err()
+                && lib.album(&bad).await.is_err()
+                && lib
+                    .artist_releases(&bad, ReleaseGroup::All, 0)
+                    .await
+                    .is_err(),
+            "session contract: a bad uri ({bad:?}) is an error"
+        );
+    }
+    // An artist uri is no album and an album uri no artist.
+    assert!(
+        lib.album(&artists[0].uri).await.is_err() && lib.artist(&album_refs[0].uri).await.is_err(),
+        "session contract: an artist uri is not an album, an album uri is not an artist"
+    );
+
+    if info.caps.save_albums {
+        let uri = album_refs[0].uri.clone();
+        let one = lib.liked(std::slice::from_ref(&uri)).await;
+        assert!(
+            one.as_ref().is_ok_and(|v| v.len() == 1),
+            "session contract: liked answers once for an album uri"
+        );
+        if lib.can_change_likes() {
+            let was = one.unwrap()[0];
+            for want in [!was, was] {
+                lib.set_liked(&uri, want)
+                    .await
+                    .unwrap_or_else(|e| panic!("session contract: save album {want}: {e}"));
+                assert_eq!(
+                    lib.liked(std::slice::from_ref(&uri)).await.ok(),
+                    Some(vec![want]),
+                    "session contract: saving an album ({want}) reads back"
+                );
+            }
         }
     }
 }

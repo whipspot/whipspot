@@ -6,8 +6,8 @@ use std::time::Instant;
 use crate::engine::{BAND_COUNT, OutputDevice, OutputMode, ReplayGainMode};
 use crate::lyrics::Lyrics;
 use crate::provider::{
-    AlbumPage, LibraryError, LoginInput, PlaylistPage, ProviderAuthStatus, ProviderInfo, Track,
-    TrackPage,
+    AlbumDetail, AlbumPage, ArtistPage, LibraryError, LoginInput, PlaylistPage, ProviderAuthStatus,
+    ProviderInfo, ReleaseGroup, Track, TrackPage,
 };
 
 /// Identifies one library or prefill request; the matching notice carries it back.
@@ -148,12 +148,41 @@ impl PlayerState {
 /// What a library request asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibraryQuery {
-    Playlists { offset: u32 },
-    Liked { offset: u32 },
-    PlaylistItems { id: String, offset: u32 },
-    Albums { offset: u32 },
-    AlbumTracks { id: String, offset: u32 },
-    Search { query: String, offset: u32 },
+    Playlists {
+        offset: u32,
+    },
+    Liked {
+        offset: u32,
+    },
+    PlaylistItems {
+        id: String,
+        offset: u32,
+    },
+    Albums {
+        offset: u32,
+    },
+    AlbumTracks {
+        id: String,
+        offset: u32,
+    },
+    Search {
+        query: String,
+        offset: u32,
+    },
+    /// Open an artist by URI (`Library::artist`).
+    Artist {
+        uri: String,
+    },
+    /// Open an album by URI (`Library::album`).
+    Album {
+        uri: String,
+    },
+    /// One page of an artist's releases (`Library::artist_releases`).
+    ArtistReleases {
+        uri: String,
+        group: ReleaseGroup,
+        offset: u32,
+    },
 }
 
 /// One page of a library answer.
@@ -162,6 +191,8 @@ pub enum LibraryPage {
     Playlists(PlaylistPage),
     Tracks(TrackPage),
     Albums(AlbumPage),
+    Artist(ArtistPage),
+    AlbumDetail(AlbumDetail),
 }
 
 /// Everything a front-end can ask of the player. Not `Debug` on purpose: `Login` carries

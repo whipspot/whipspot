@@ -25,9 +25,10 @@ use crate::events::UiEvent;
 pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 pub use error::{AuthFailure, LibErrorKind, LibraryError, PlaybackError};
 pub use model::{
-    Album, AlbumPage, AuthStepInfo, AuthStepStatus, Capabilities, ImageRef, InputSpec, LoginInput,
-    MAX_IMAGES, Playlist, PlaylistPage, ProviderAuthStatus, ProviderGlyph, ProviderInfo, Readable,
-    StepHint, Track, TrackPage,
+    Album, AlbumDetail, AlbumKind, AlbumPage, Artist, ArtistPage, AuthStepInfo, AuthStepStatus,
+    Capabilities, EntityRef, ImageRef, InputSpec, LoginInput, MAX_ARTISTS, MAX_IMAGES, MAX_POPULAR,
+    Playlist, PlaylistPage, ProviderAuthStatus, ProviderGlyph, ProviderInfo, Readable,
+    ReleaseGroup, StepHint, Track, TrackPage,
 };
 pub use registry::{ProviderRegistry, RegisterError};
 
@@ -186,6 +187,28 @@ pub trait Library: Send + Sync {
     fn can_change_likes(&self) -> bool {
         false
     }
+    /// Open an artist by its URI: header, popular tracks and the first page of releases. Only
+    /// when `caps.explore`. A URI the provider did not make is an error, never a panic.
+    fn artist<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<ArtistPage, LibraryError>> {
+        let _ = uri;
+        Box::pin(async { Err(explore_unsupported()) })
+    }
+    /// Open an album by its URI: the album and its first page of tracks. Only when
+    /// `caps.explore`.
+    fn album<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<AlbumDetail, LibraryError>> {
+        let _ = uri;
+        Box::pin(async { Err(explore_unsupported()) })
+    }
+    /// One page of an artist's releases of `group`, from `offset`. Only when `caps.explore`.
+    fn artist_releases<'a>(
+        &'a self,
+        uri: &'a str,
+        group: ReleaseGroup,
+        offset: u32,
+    ) -> BoxFuture<'a, Result<AlbumPage, LibraryError>> {
+        let _ = (uri, group, offset);
+        Box::pin(async { Err(explore_unsupported()) })
+    }
     /// Look whether the library changed since the last look and, if it did, send
     /// [`crate::events::UiEvent::LibraryChanged`] yourself. A hint: it may do nothing, and a
     /// failure is the provider's to swallow. The default returns at once.
@@ -196,6 +219,13 @@ pub trait Library: Send + Sync {
 
 fn likes_unsupported() -> LibraryError {
     LibraryError::new(LibErrorKind::InvalidArgument, "likes are not supported")
+}
+
+fn explore_unsupported() -> LibraryError {
+    LibraryError::new(
+        LibErrorKind::InvalidArgument,
+        "artists and albums cannot be opened here",
+    )
 }
 
 #[cfg(test)]

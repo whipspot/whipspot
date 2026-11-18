@@ -8,7 +8,10 @@
 //! The account:
 //! - 2 playlists, `PLAYLIST_ONE` and `PLAYLIST_TWO`, each with 3 tracks (and a "New playlist"
 //!   button that comes first in the grid, as in the real answer);
-//! - 1 album, `ALBUM`, with 3 tracks;
+//! - 1 saved album, `ALBUM`, with 3 tracks;
+//! - 5 releases in all (`RELEASES`), each an album page, 3 artists with artist pages (the second
+//!   has a "More" grid for its albums), and an album saved or not through its audio playlist
+//!   (`like/like` with `target.playlistId`); one release names no audio playlist;
 //! - 3 liked tracks (`like/like` and `like/removelike` change them);
 //! - a search that matches the title of any of the 10 songs.
 
@@ -161,7 +164,97 @@ const PLAYLISTS: [(&str, &str, [&str; 3]); 2] = [
         ["trackAAAA04", "trackAAAA05", "trackAAAA06"],
     ),
 ];
-const ALBUM_TRACKS: [&str; 3] = ["trackAAAA07", "trackAAAA08", "trackAAAA09"];
+/// An album or single that has a page.
+pub struct Release {
+    pub id: &'static str,
+    pub title: &'static str,
+    /// "Album" or "Single", as the type run says.
+    pub label: &'static str,
+    pub year: &'static str,
+    /// The audio playlist a save targets; `None`: the page names none.
+    pub audio_playlist: Option<&'static str>,
+}
+
+pub const RELEASES: [Release; 5] = [
+    Release {
+        id: ALBUM,
+        title: "Fake Album",
+        label: "Album",
+        year: "2019",
+        audio_playlist: Some("OLAK5uy_fakealbum01"),
+    },
+    Release {
+        id: "MPREb_other000001",
+        title: "First Record",
+        label: "Album",
+        year: "2020",
+        audio_playlist: Some("OLAK5uy_other000001"),
+    },
+    Release {
+        id: "MPREb_other000002",
+        title: "Second Record",
+        label: "Album",
+        year: "2021",
+        audio_playlist: Some("OLAK5uy_other000002"),
+    },
+    Release {
+        id: "MPREb_other000003",
+        title: "Third Record",
+        label: "Album",
+        year: "2022",
+        audio_playlist: None,
+    },
+    Release {
+        id: "MPREb_other000004",
+        title: "Fourth Record",
+        label: "Single",
+        year: "2023",
+        audio_playlist: Some("OLAK5uy_other000004"),
+    },
+];
+
+pub const ARTISTS: [(&str, &str); 3] = [AR_A, AR_B, AR_ALB];
+
+pub fn release(id: &str) -> Option<&'static Release> {
+    RELEASES.iter().find(|r| r.id == id)
+}
+
+/// The artists of the songs on a release, in order, once each.
+fn release_artists(id: &str) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&str, &str)> = Vec::new();
+    for s in SONGS.iter().filter(|s| s.album.is_some_and(|a| a.1 == id)) {
+        for a in s.artists {
+            if !out.contains(a) {
+                out.push(*a);
+            }
+        }
+    }
+    out
+}
+
+/// The releases an artist has songs on.
+fn artist_releases(uc: &str) -> Vec<&'static Release> {
+    RELEASES
+        .iter()
+        .filter(|r| release_artists(r.id).iter().any(|a| a.1 == uc))
+        .collect()
+}
+
+pub fn artist_uri(uc: &str) -> String {
+    format!("ytmusic:artist:{uc}")
+}
+
+/// What the carousel of albums shows of an artist that has more than this many.
+const CAROUSEL_SHOWS: usize = 2;
+
+/// An artist's release in a carousel or a grid: the type, then the year; no artist (the page's own).
+fn release_item(r: &Release) -> Value {
+    json!({"musicTwoRowItemRenderer": {
+        "title": {"runs": [{"text": r.title, "navigationEndpoint": {"browseEndpoint": {"browseId": r.id}}}]},
+        "subtitle": {"runs": [{"text": r.label}, {"text": " • "}, {"text": r.year}]},
+        "thumbnailRenderer": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": thumbs(r.id)}}},
+    }})
+}
 
 // ---- JSON builders (the shapes ytmusicapi reads) ---------------------------------------------
 
@@ -293,6 +386,8 @@ fn album_grid_item() -> Value {
 
 /// What the next POST answers instead of the account's own answer.
 pub enum Script {
+    /// Answers as the account would.
+    Pass,
     Json(Value),
     Raw(u16, Vec<u8>),
     Status(u16),
@@ -323,6 +418,8 @@ struct Account {
     liked: Vec<String>,
     /// Extra playlists made by a test: id, name, track ids.
     extra_playlists: Vec<(String, String, Vec<String>)>,
+    /// Audio playlist ids of the albums the account saved.
+    saved_albums: Vec<String>,
 }
 
 /// What a ranged GET of served audio does wrong, once.
@@ -373,6 +470,7 @@ impl FakeYt {
                     "trackAAAA07".into(),
                 ],
                 extra_playlists: Vec::new(),
+                saved_albums: Vec::new(),
             }),
             page_size: AtomicUsize::new(2),
             script: Mutex::new(VecDeque::new()),
@@ -402,6 +500,15 @@ impl FakeYt {
         self.script.lock().unwrap().push_back(s);
     }
 
+    /// Lets `n` posts through, then makes the next one answer `s`.
+    pub fn script_after(&self, n: usize, s: Script) {
+        let mut q = self.script.lock().unwrap();
+        for _ in 0..n {
+            q.push_back(Script::Pass);
+        }
+        q.push_back(s);
+    }
+
     pub fn posts(&self) -> Vec<PostCall> {
         self.posts.lock().unwrap().clone()
     }
@@ -419,6 +526,11 @@ impl FakeYt {
 
     pub fn liked_ids(&self) -> Vec<String> {
         self.account.lock().unwrap().liked.clone()
+    }
+
+    /// The audio playlist ids of the albums the account saved.
+    pub fn saved_albums(&self) -> Vec<String> {
+        self.account.lock().unwrap().saved_albums.clone()
     }
 
     pub fn serve(&self, url: &str, body: &[u8]) {
@@ -491,8 +603,12 @@ impl FakeYt {
                 // Generated tracks have no catalog entry: make a row for each.
                 Some(tracks.iter().map(|id| generated_row(id)).collect())
             }
-            "album" if arg == ALBUM => {
-                let ids: Vec<String> = ALBUM_TRACKS.iter().map(|s| (*s).to_owned()).collect();
+            "album" if release(arg).is_some() => {
+                let ids: Vec<String> = SONGS
+                    .iter()
+                    .filter(|s| s.album.is_some_and(|a| a.1 == arg))
+                    .map(|s| s.id.to_owned())
+                    .collect();
                 Some(rows_of(&ids, Layout::Album))
             }
             "s" => {
@@ -509,8 +625,20 @@ impl FakeYt {
         }
     }
 
-    fn grid_items(&self, kind: &str) -> Option<Vec<Value>> {
+    fn grid_items(&self, kind: &str, arg: &str) -> Option<Vec<Value>> {
         match kind {
+            // The "More" grid of an artist's releases: `arg` is the channel id and `a` or `s`.
+            "rel" => {
+                let (uc, group) = arg.rsplit_once('_')?;
+                let single = group == "s";
+                Some(
+                    artist_releases(uc)
+                        .into_iter()
+                        .filter(|r| (r.label == "Single") == single)
+                        .map(release_item)
+                        .collect(),
+                )
+            }
             "pls" => {
                 let mut items = vec![new_playlist_button()];
                 for (id, name, tracks) in PLAYLISTS {
@@ -559,14 +687,14 @@ impl FakeYt {
         // A continuation of the older kind.
         if let Some(token) = query_param(url, "ctoken") {
             let mut parts = token.splitn(3, '.');
-            let (Some(kind), Some(_), Some(start)) = (parts.next(), parts.next(), parts.next())
+            let (Some(kind), Some(arg), Some(start)) = (parts.next(), parts.next(), parts.next())
             else {
                 return status(400);
             };
             let Ok(start) = start.parse::<usize>() else {
                 return status(400);
             };
-            return match self.grid_page(kind, start) {
+            return match self.grid_page(kind, arg, start) {
                 Some((items, next)) => ok(json!({"continuationContents": {"gridContinuation": {
                     "items": items, "continuations": next}}})),
                 None => status(400),
@@ -576,10 +704,25 @@ impl FakeYt {
             return status(400);
         };
         match browse_id {
-            "FEmusic_liked_playlists" => self.grid_first("pls"),
-            "FEmusic_liked_albums" => self.grid_first("alb"),
+            "FEmusic_liked_playlists" => self.grid_first("pls", "x"),
+            "FEmusic_liked_albums" => self.grid_first("alb", "x"),
             "VLLM" => self.track_first("liked", "x", None),
-            id if id == ALBUM => self.track_first("album", ALBUM, Some(album_header())),
+            id if release(id).is_some() => {
+                self.track_first("album", id, Some(self.album_header(id)))
+            }
+            id if id.starts_with("UC") => match self.artist_response(id) {
+                Some(v) => ok(v),
+                None => status(400),
+            },
+            // An artist's "More" grid: `MPAD<channel id>`, the group in the params.
+            id if id.starts_with("MPAD") => {
+                let group = match body.get("params").and_then(Value::as_str) {
+                    Some("pAlbums") => "a",
+                    Some("pSingles") => "s",
+                    _ => return status(400),
+                };
+                self.grid_first("rel", &format!("{}_{group}", &id[4..]))
+            }
             id => match id.strip_prefix("VL") {
                 Some(pid) => self.track_first("pl", pid, None),
                 None => status(400),
@@ -588,20 +731,20 @@ impl FakeYt {
     }
 
     /// A page of a grid and the `continuations` array that leads to the next page.
-    fn grid_page(&self, kind: &str, start: usize) -> Option<(Vec<Value>, Value)> {
-        let all = self.grid_items(kind)?;
+    fn grid_page(&self, kind: &str, arg: &str, start: usize) -> Option<(Vec<Value>, Value)> {
+        let all = self.grid_items(kind, arg)?;
         let end = (start + self.size()).min(all.len());
         let items = all.get(start..end)?.to_vec();
         let next = if end < all.len() {
-            json!([{"nextContinuationData": {"continuation": format!("{kind}.x.{end}")}}])
+            json!([{"nextContinuationData": {"continuation": format!("{kind}.{arg}.{end}")}}])
         } else {
             Value::Null
         };
         Some((items, next))
     }
 
-    fn grid_first(&self, kind: &str) -> Response {
-        let Some((items, next)) = self.grid_page(kind, 0) else {
+    fn grid_first(&self, kind: &str, arg: &str) -> Response {
+        let Some((items, next)) = self.grid_page(kind, arg, 0) else {
             return status(400);
         };
         let mut grid = json!({"items": items});
@@ -630,6 +773,102 @@ impl FakeYt {
                 "contents": [{"musicResponsiveHeaderRenderer": h}]}}}}]);
         }
         ok(json!({"contents": {"twoColumnBrowseResultsRenderer": two_column}}))
+    }
+
+    /// The header of a release's album page: its title, type and year, the artists of its songs,
+    /// and the play and save buttons (the save one says what a press does).
+    fn album_header(&self, id: &str) -> Value {
+        let r = release(id).expect("a known release");
+        let mut buttons = Vec::new();
+        if let Some(pl) = r.audio_playlist {
+            let saved = self
+                .account
+                .lock()
+                .unwrap()
+                .saved_albums
+                .iter()
+                .any(|p| p == pl);
+            buttons.push(
+                json!({"musicPlayButtonRenderer": {"playNavigationEndpoint": {
+                "watchEndpoint": {"videoId": "trackAAAA01", "playlistId": pl}}}}),
+            );
+            buttons.push(
+                json!({"toggleButtonRenderer": {"defaultServiceEndpoint": {"likeEndpoint": {
+                "status": if saved { "INDIFFERENT" } else { "LIKE" },
+                "target": {"playlistId": pl}}}}}),
+            );
+        }
+        let seed = if id == ALBUM { "album01" } else { id };
+        json!({
+            "title": {"runs": [{"text": r.title}]},
+            "subtitle": {"runs": [{"text": r.label}, {"text": " • "}, {"text": r.year}]},
+            "straplineTextOne": {"runs": artist_runs(&release_artists(id))},
+            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": thumbs(seed)}}},
+            "buttons": buttons,
+        })
+    }
+
+    /// An artist page: the header, the songs, and a carousel for each group the artist has. The
+    /// albums carousel of an artist with more albums than `CAROUSEL_SHOWS` shows that many and
+    /// links to the "More" grid.
+    fn artist_response(&self, uc: &str) -> Option<Value> {
+        let (name, _) = ARTISTS.iter().find(|a| a.1 == uc)?;
+        let rows: Vec<Value> = SONGS
+            .iter()
+            .filter(|s| s.artists.iter().any(|a| a.1 == uc))
+            .map(|s| {
+                // The page's own artist is left out of the album artist's rows.
+                let layout = if uc == AR_ALB.1 {
+                    Layout::Album
+                } else {
+                    Layout::Playlist
+                };
+                row(s, layout, self.is_liked(s.id))
+            })
+            .collect();
+        let mut sections = vec![json!({"musicShelfRenderer": {"contents": rows}})];
+        let releases = artist_releases(uc);
+        let carousel = |title: &str, items: Vec<Value>, more: Option<&str>| {
+            let mut run = json!({"text": title});
+            if let Some(params) = more {
+                run["navigationEndpoint"] = json!({"browseEndpoint": {
+                    "browseId": format!("MPAD{uc}"), "params": params}});
+            }
+            json!({"musicCarouselShelfRenderer": {
+                "header": {"musicCarouselShelfBasicHeaderRenderer": {"title": {"runs": [run]}}},
+                "contents": items}})
+        };
+        let albums: Vec<&Release> = releases
+            .iter()
+            .copied()
+            .filter(|r| r.label == "Album")
+            .collect();
+        if !albums.is_empty() {
+            let more = albums.len() > CAROUSEL_SHOWS;
+            let items = albums
+                .iter()
+                .take(CAROUSEL_SHOWS)
+                .map(|r| release_item(r))
+                .collect();
+            sections.push(carousel("Albums", items, more.then_some("pAlbums")));
+        }
+        let singles: Vec<&Release> = releases
+            .iter()
+            .copied()
+            .filter(|r| r.label == "Single")
+            .collect();
+        if !singles.is_empty() {
+            let items = singles.iter().map(|r| release_item(r)).collect();
+            sections.push(carousel("Singles & EPs", items, None));
+        }
+        Some(json!({
+            "header": {"musicImmersiveHeaderRenderer": {
+                "title": {"runs": [{"text": name}]},
+                "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": thumbs(uc)}}},
+            }},
+            "contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {
+                "content": {"sectionListRenderer": {"contents": sections}}}}]}},
+        }))
     }
 
     fn search(&self, body: &Value, url: &str) -> Response {
@@ -677,6 +916,17 @@ impl FakeYt {
     }
 
     fn like(&self, body: &Value, liked: bool) -> Response {
+        if let Some(pl) = body.pointer("/target/playlistId").and_then(Value::as_str) {
+            if !RELEASES.iter().any(|r| r.audio_playlist == Some(pl)) {
+                return status(400);
+            }
+            let mut acct = self.account.lock().unwrap();
+            acct.saved_albums.retain(|p| p != pl);
+            if liked {
+                acct.saved_albums.push(pl.to_owned());
+            }
+            return ok(json!({"responseContext": {}}));
+        }
         let Some(id) = body.pointer("/target/videoId").and_then(Value::as_str) else {
             return status(400);
         };
@@ -699,15 +949,6 @@ fn generated_row(id: &str) -> Value {
         "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": format!("Long {id}")}]}}}],
         "fixedColumns": [{"musicResponsiveListItemFixedColumnRenderer": {"text": {"runs": [{"text": "1:00"}]}}}],
     }})
-}
-
-fn album_header() -> Value {
-    json!({
-        "title": {"runs": [{"text": "Fake Album"}]},
-        "subtitle": {"runs": [{"text": "Album"}, {"text": " • "}, {"text": "2019"}]},
-        "straplineTextOne": {"runs": [artist_run(AR_ALB)]},
-        "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": thumbs("album01")}}},
-    })
 }
 
 fn ok(v: Value) -> Response {
@@ -845,8 +1086,10 @@ impl Http for FakeYt {
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .collect(),
         });
-        if let Some(s) = self.script.lock().unwrap().pop_front() {
+        let scripted = self.script.lock().unwrap().pop_front();
+        if let Some(s) = scripted.filter(|s| !matches!(s, Script::Pass)) {
             return match s {
+                Script::Pass => unreachable!(),
                 Script::Json(v) => Ok(ok(v)),
                 Script::Raw(code, bytes) => Ok(Response {
                     status: code,

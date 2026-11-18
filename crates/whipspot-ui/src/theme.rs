@@ -516,6 +516,35 @@ impl Look {
         }
     }
 
+    /// The three stops of a link's hover gradient (a, b, c; the loop returns to a): A and B have
+    /// their own fixed set (the approved mockup), C takes a and b from the cover and c as a turn
+    /// of a by 55 degrees of hue away from b (see `third_stop`).
+    pub fn link_stops(&self) -> [Rgba; 3] {
+        match self.theme.id {
+            ThemeId::A => [
+                [0x2F, 0xD3, 0xC0, 0xFF],
+                [0x8A, 0xF0, 0xE0, 0xFF],
+                [0x4A, 0xA8, 0xFF, 0xFF],
+            ],
+            ThemeId::B => [
+                [0xD9, 0x8A, 0x4E, 0xFF],
+                [0xF4, 0xC9, 0x8E, 0xFF],
+                [0xE0, 0x60, 0x3A, 0xFF],
+            ],
+            ThemeId::C => [self.a, self.b, self.third_stop()],
+        }
+    }
+
+    /// Theme C's third link stop: `a` turned 55 degrees of hue, away from `b` so the three stops
+    /// differ (the mockup's own samples turn pink/orange to violet and green/yellow to teal).
+    fn third_stop(&self) -> Rgba {
+        let toward_b = (crate::palette::hue_of(self.b) - crate::palette::hue_of(self.a) + 540.0)
+            .rem_euclid(360.0)
+            - 180.0;
+        let turn = if toward_b > 0.0 { -55.0 } else { 55.0 };
+        crate::palette::turn_hue(self.a, turn)
+    }
+
     /// The accent ramp at `t` (0..1).
     pub fn at(&self, t: f32) -> Rgba {
         let t = t.clamp(0.0, 1.0) * 3.0;

@@ -1,11 +1,20 @@
-//! The provider's ids: `ytmusic:track:<videoId>`, `ytmusic:playlist:<id>` and
-//! `ytmusic:album:<browseId>`. An id from the outside is validated before it is used in a
-//! request, and an id from a response is validated before it leaves as a URI (nothing else
-//! reaches a request body or a URI).
+//! The provider's ids: `ytmusic:track:<videoId>`, `ytmusic:playlist:<id>`,
+//! `ytmusic:album:<MPRE browseId>` and `ytmusic:artist:<UC channelId>`. An id from the outside
+//! is validated before it is used in a request, and an id from a response is validated before it
+//! leaves as a URI (nothing else reaches a request body or a URI). Only a `UC` id is an artist
+//! and only an `MPRE` id is an album.
 
 pub const TRACK_PREFIX: &str = "ytmusic:track:";
 pub const PLAYLIST_PREFIX: &str = "ytmusic:playlist:";
 pub const ALBUM_PREFIX: &str = "ytmusic:album:";
+pub const ARTIST_PREFIX: &str = "ytmusic:artist:";
+
+/// What an album's browse id starts with.
+const ALBUM_BROWSE_START: &str = "MPRE";
+/// What an artist's channel id starts with.
+const ARTIST_CHANNEL_START: &str = "UC";
+/// What the id of an album's audio playlist (the one a save targets) starts with.
+const AUDIO_PLAYLIST_START: &str = "OLAK5uy_";
 
 /// The playlist of liked songs, as YouTube Music names it.
 pub const LIKED_PLAYLIST: &str = "LM";
@@ -49,10 +58,32 @@ pub fn parse_playlist_uri(uri: &str) -> Option<&str> {
     strip_valid(PLAYLIST_PREFIX, uri)
 }
 
+/// The URI of an album's browse id: only an `MPRE` id is an album.
 pub fn album_uri(browse_id: &str) -> Option<String> {
-    with_prefix(ALBUM_PREFIX, browse_id)
+    browse_id
+        .starts_with(ALBUM_BROWSE_START)
+        .then(|| with_prefix(ALBUM_PREFIX, browse_id))
+        .flatten()
 }
 
 pub fn parse_album_uri(uri: &str) -> Option<&str> {
-    strip_valid(ALBUM_PREFIX, uri)
+    strip_valid(ALBUM_PREFIX, uri).filter(|id| id.starts_with(ALBUM_BROWSE_START))
+}
+
+/// The URI of an artist's channel id: only a `UC` id is an artist.
+pub fn artist_uri(channel_id: &str) -> Option<String> {
+    channel_id
+        .starts_with(ARTIST_CHANNEL_START)
+        .then(|| with_prefix(ARTIST_PREFIX, channel_id))
+        .flatten()
+}
+
+pub fn parse_artist_uri(uri: &str) -> Option<&str> {
+    strip_valid(ARTIST_PREFIX, uri).filter(|id| id.starts_with(ARTIST_CHANNEL_START))
+}
+
+/// The id of an album's audio playlist, or `None` if it is not one (a save never targets
+/// anything else).
+pub fn audio_playlist_id(id: &str) -> Option<&str> {
+    (valid_id(id) && id.starts_with(AUDIO_PLAYLIST_START)).then_some(id)
 }

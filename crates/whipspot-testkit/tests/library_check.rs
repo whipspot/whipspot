@@ -100,6 +100,8 @@ async fn a_check_that_never_ends_does_not_delay_a_play() {
             duration_ms: 180_000,
             images: vec![],
             year: None,
+            album_ref: None,
+            artists: vec![],
         }],
         index: 0,
     });

@@ -156,7 +156,7 @@ impl SpotifyProvider {
         self
     }
 
-    /// Look for library changes made elsewhere every 5 minutes, beginning now (D12, D13); the
+    /// Look for library changes made elsewhere every 30 minutes, beginning now (D12, D13); the
     /// focus check and the Connect session's hints work without it. Spawns the timer: call
     /// inside a tokio runtime.
     pub fn with_library_watch(self) -> Self {
@@ -297,6 +297,8 @@ impl Provider for SpotifyProvider {
                 eq: true,
                 search: true,
                 likes: true,
+                explore: true,
+                save_albums: true,
             },
             auth_steps,
         }
@@ -477,7 +479,7 @@ mod tests {
         let json = serde_json::to_string(&rig().p.info()).unwrap();
         assert_eq!(
             json,
-            r#"{"id":"spotify","name":"Spotify","glyph":"stream","caps":{"library":true,"pcmTap":true,"eq":true,"search":true,"likes":true},"authSteps":[{"id":"playback","label":"Playback","inputs":[],"hint":{"text":"Playing music needs a Spotify Premium login."}},{"id":"web","label":"Library","inputs":[{"name":"clientId","label":"Client ID","pattern":"^[0-9a-fA-F]{32}$","format":"32 hex characters","maxLen":32}],"hint":{"text":"Browsing your playlists needs your own Spotify app. Create one in the Spotify developer dashboard (the app owner needs Premium) and add this redirect URI:","copy":"http://127.0.0.1:8899/callback"}}]}"#
+            r#"{"id":"spotify","name":"Spotify","glyph":"stream","caps":{"library":true,"pcmTap":true,"eq":true,"search":true,"likes":true,"explore":true,"saveAlbums":true},"authSteps":[{"id":"playback","label":"Playback","inputs":[],"hint":{"text":"Playing music needs a Spotify Premium login."}},{"id":"web","label":"Library","inputs":[{"name":"clientId","label":"Client ID","pattern":"^[0-9a-fA-F]{32}$","format":"32 hex characters","maxLen":32}],"hint":{"text":"Browsing your playlists needs your own Spotify app. Create one in the Spotify developer dashboard (the app owner needs Premium) and add this redirect URI:","copy":"http://127.0.0.1:8899/callback"}}]}"#
         );
         assert!(rig().p.library().is_some());
         assert_eq!(rig().p.image_hosts(), ["scdn.co", "spotifycdn.com"]);

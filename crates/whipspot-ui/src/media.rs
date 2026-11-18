@@ -26,6 +26,7 @@ use crate::draw::{
 };
 use crate::icons::{Icon, icon, pause_filled, play_filled, skip_filled};
 use crate::likes::{LIKE_HINT, LikeBook, heart};
+use crate::link::{self, Face, Place};
 use crate::now_playing::format_time;
 use crate::signal::{self, Kind, kind_color};
 use crate::spectrum::FRAME_INTERVAL;
@@ -893,16 +894,20 @@ impl MediaControl {
                     g.cy - 21.0,
                     g.title_max,
                 );
-                let aw = text(
-                    p,
-                    &n.track.artist,
-                    13.0,
-                    ink.muted,
-                    false,
-                    g.text_x,
-                    g.cy + 2.0,
-                    g.title_max,
-                );
+                let face = Face {
+                    size: 13.0,
+                    medium: false,
+                    color: ink.muted,
+                    shadow: false,
+                };
+                let at = Place {
+                    x: g.text_x,
+                    y: g.cy + 2.0,
+                    centre: false,
+                    max_w: g.title_max,
+                };
+                let refs = &n.track.artists;
+                let aw = link::line(ui, "media-artist", k, &n.track.artist, refs, face, at);
                 text_w = Some(tw.max(aw));
             }
         });

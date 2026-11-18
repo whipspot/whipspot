@@ -5,6 +5,7 @@
 use whipspot_core::skin::{PanelWindows, ScreenPoint, ScreenRect, Size, Skin};
 
 use super::dock::visible;
+use super::trace;
 
 /// A resize in progress.
 struct Held {
@@ -47,11 +48,26 @@ impl ResizeController {
                 size,
                 k: k.max(1),
             });
+            if trace::enabled() {
+                trace::line(format_args!(
+                    "resize-press panel={panel} pointer={} size={}x{} k={} upp={}",
+                    trace::point(Some(pointer)),
+                    size.0,
+                    size.1,
+                    k.max(1),
+                    windows.units_per_pixel()
+                ));
+            }
         }
     }
 
     /// Ends the resize.
     pub fn release(&mut self) {
+        if trace::enabled()
+            && let Some(h) = &self.held
+        {
+            trace::line(format_args!("resize-release panel={}", h.panel));
+        }
         self.held = None;
     }
 
@@ -112,7 +128,19 @@ impl ResizeController {
             (new.h as f32 * unit).round() as i32,
         );
         let moves = followers(windows, h.panel, old, (nw - old.w, nh - old.h));
-        if windows.resize_panel(h.panel, nw, nh).is_err() {
+        let sent = windows.resize_panel(h.panel, nw, nh);
+        if trace::enabled() {
+            trace::line(format_args!(
+                "resize-move panel={} pointer={} size={}x{} sent={nw}x{nh} ok={} moves={}",
+                h.panel,
+                trace::point(Some(pointer)),
+                new.w,
+                new.h,
+                sent.is_ok(),
+                trace::moves(&moves)
+            ));
+        }
+        if sent.is_err() {
             return;
         }
         *live = (new.w, new.h);

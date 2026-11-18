@@ -5,10 +5,16 @@
 //!   types, see the `compile_fail` doctest on [`WebApi::new`]). The token travels only in the
 //!   `Authorization` header and is never logged, formatted or put in an error.
 //! * Talks only to `https://api.spotify.com/v1/{me, me/playlists, me/tracks, me/albums,
-//!   playlists/{id}/items, albums/{id}/tracks, search}` with `limit=50` (search: 10, the most
-//!   Spotify allows now), plus `/me/library` and `/me/library/contains` for likes; no `fields=`
-//!   filter, no batch, `/tracks/{id}` or the old `/playlists/{id}/tracks`. Search is `type=track`
-//!   only. Redirects are never followed.
+//!   playlists/{id}/items, albums/{id}, albums/{id}/tracks, artists/{id}, artists/{id}/albums,
+//!   search}` with `limit=50` (search: 10, the most Spotify allows now), plus `/me/library` and
+//!   `/me/library/contains` for likes (tracks and albums); no `fields=` filter, no batch,
+//!   `/tracks/{id}` or the old `/playlists/{id}/tracks`. Search is `type=track` only. Ids reach a
+//!   path only after the strict 22-character base62 check. Redirects are never followed.
+//! * Exploring (D3, D5 of album-artist-explore): an artist page is `/artists/{id}`, its releases
+//!   `/artists/{id}/albums` and its Popular list a track search `artist:"<name>"` filtered to the
+//!   tracks that credit the artist; an album page is `/albums/{id}`.
+//!   A release whose artists leave the page's artist out is a guest appearance (`AppearsOn`)
+//!   in every list, since `album_group` is gone from the API (F1).
 //! * Strictly one request at a time per call, on demand, paged by offset computed here.
 //! * First 429: the [`gate::RateGate`] closes; every later call fails without touching the network
 //!   until the cooldown ends. 401: one forced token refresh and one retry of that request. No
@@ -19,6 +25,7 @@ pub mod model;
 
 use std::{
     fmt,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -29,13 +36,14 @@ use serde_json::Value;
 use crate::{
     auth::Secret,
     auth_manager::{AuthError, TokenSource, WebTokens},
-    uri::{is_spotify_id, parse_track_uri},
+    uri::{album_uri_id, artist_uri_id, is_saveable_uri, is_spotify_id},
     web_auth::consts::SCOPE_LIBRARY_MODIFY,
 };
 use gate::{RateGate, cooldown_secs};
 pub use model::{
-    Album, AlbumPage, Fingerprint, MAX_ROWS, MAX_TEXT_CHARS, Playlist, PlaylistPage, Readable,
-    SEARCH_MAX_ROWS, Track, TrackPage, UnexpectedShape,
+    Album, AlbumDetail, AlbumPage, Artist, ArtistPage, Fingerprint, MAX_ROWS, MAX_TEXT_CHARS,
+    Playlist, PlaylistPage, Readable, ReleaseGroup, SEARCH_MAX_ROWS, Track, TrackPage,
+    UnexpectedShape,
 };
 
 /// Items per request (the documented maximum for the endpoints used).
@@ -109,7 +117,11 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::RateLimited { retry_after_secs } => {
-                write!(f, "Spotify is rate-limiting this app. Try again in about {retry_after_secs} s.")
+                write!(
+                    f,
+                    "Spotify is rate-limiting this app. Try again in about {}.",
+                    wait_text(*retry_after_secs)
+                )
             }
             Error::WebNotLoggedIn => f.write_str("the Spotify library is not connected"),
             Error::NotReadable => f.write_str(
@@ -131,6 +143,19 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// A wait for people: "26 s", "3 min", "12 h 22 min" (rounded up to the minute from 90 s on).
+fn wait_text(secs: u64) -> String {
+    if secs < 90 {
+        return format!("{secs} s");
+    }
+    let mins = secs.div_ceil(60);
+    match (mins / 60, mins % 60) {
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
 
 impl Serialize for Error {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -163,6 +188,8 @@ pub struct WebApi {
     /// The logged-in user's id once asked for, and a generation bumped by
     /// [`WebApi::forget_user`] so an answer that was in flight across a logout is not kept.
     me: Mutex<(u64, Option<String>)>,
+    /// Requests sent in this run, numbered in the log so the quota spent is visible (MD199).
+    sent: AtomicU64,
 }
 
 impl WebApi {
@@ -199,6 +226,7 @@ impl WebApi {
             gate: RateGate::default(),
             clock,
             me: Mutex::new((0, None)),
+            sent: AtomicU64::new(0),
         }
     }
 
@@ -325,6 +353,11 @@ impl WebApi {
         if offset >= SEARCH_MAX_ROWS {
             return Err(Error::InvalidOffset);
         }
+        self.search_page(q, offset).await
+    }
+
+    /// The search request itself; `q` is already checked by the caller.
+    async fn search_page(&self, q: &str, offset: u32) -> Result<TrackPage, Error> {
         let enc: String = url::form_urlencoded::byte_serialize(q.as_bytes()).collect();
         let v = self
             .get(
@@ -333,6 +366,86 @@ impl WebApi {
             )
             .await?;
         model::parse_search_page(&v, offset).map_err(|UnexpectedShape| Error::UnexpectedShape)
+    }
+
+    /// An artist page: the header (`/artists/{id}`), the first page of all their releases and the
+    /// Popular list. `uri` must be exactly `spotify:artist:<22 base62>`. The Popular list is the
+    /// part that may fail without failing the page (it is a search, a second-hand source): any
+    /// error but a rate limit leaves it empty.
+    pub async fn artist_page(&self, uri: &str) -> Result<ArtistPage, Error> {
+        let id = artist_uri_id(uri).ok_or(Error::InvalidId)?;
+        let v = self
+            .get(&format!("/artists/{id}"), Forbidden::AccessDenied)
+            .await?;
+        let artist =
+            model::parse_artist(&v, uri).map_err(|UnexpectedShape| Error::UnexpectedShape)?;
+        let releases = self.artist_releases(uri, ReleaseGroup::All, 0).await?;
+        let popular = match self.popular(&artist).await {
+            Ok(p) => p,
+            Err(e @ Error::RateLimited { .. }) => return Err(e),
+            Err(_) => Vec::new(),
+        };
+        Ok(ArtistPage {
+            artist,
+            popular,
+            releases,
+        })
+    }
+
+    /// One page of an artist's releases of `group`.
+    pub async fn artist_releases(
+        &self,
+        uri: &str,
+        group: ReleaseGroup,
+        offset: u32,
+    ) -> Result<AlbumPage, Error> {
+        let id = artist_uri_id(uri).ok_or(Error::InvalidId)?;
+        check_offset(offset)?;
+        let groups = match group {
+            ReleaseGroup::All => "album,single,compilation,appears_on",
+            ReleaseGroup::Albums => "album,compilation",
+            ReleaseGroup::Singles => "single",
+            ReleaseGroup::AppearsOn => "appears_on",
+        };
+        let v = self
+            .get(
+                &format!(
+                    "/artists/{id}/albums?include_groups={groups}&limit={PAGE_SIZE}&offset={offset}"
+                ),
+                Forbidden::AccessDenied,
+            )
+            .await?;
+        model::parse_releases_page(&v, offset, group, uri)
+            .map_err(|UnexpectedShape| Error::UnexpectedShape)
+    }
+
+    /// The Popular list (D3): a track search for the artist's name, keeping the tracks that
+    /// credit the artist's uri, at most ten. The name loses its quotes and is capped before it
+    /// goes into the query.
+    async fn popular(&self, artist: &Artist) -> Result<Vec<Track>, Error> {
+        let name: String = artist.name.chars().filter(|c| *c != '"').collect();
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let enc: String =
+            url::form_urlencoded::byte_serialize(format!("artist:\"{name}\"").as_bytes()).collect();
+        let v = self
+            .get(
+                &format!("/search?type=track&limit={SEARCH_PAGE_SIZE}&q={enc}"),
+                Forbidden::AccessDenied,
+            )
+            .await?;
+        model::parse_popular(&v, &artist.uri).map_err(|UnexpectedShape| Error::UnexpectedShape)
+    }
+
+    /// An album by its uri: the album and its first page of tracks (`/albums/{id}`).
+    pub async fn album(&self, uri: &str) -> Result<AlbumDetail, Error> {
+        let id = album_uri_id(uri).ok_or(Error::InvalidId)?;
+        let v = self
+            .get(&format!("/albums/{id}"), Forbidden::AccessDenied)
+            .await?;
+        model::parse_album_detail(&v, uri).map_err(|UnexpectedShape| Error::UnexpectedShape)
     }
 
     /// One page of a playlist's items. `id` is validated before it reaches a URL path.
@@ -357,12 +470,13 @@ impl WebApi {
     }
 
     /// Which of `uris` are saved (liked), one bool per uri in the same order. A uri that is not
-    /// exactly `spotify:track:<22 base62>` is answered false and never sent. At most 40 uris go
+    /// exactly `spotify:track:<22 base62>` or `spotify:album:<22 base62>` is answered false and
+    /// never sent. At most 40 uris go
     /// in one request.
     pub async fn liked(&self, uris: &[String]) -> Result<Vec<bool>, Error> {
         let mut out = vec![false; uris.len()];
         let valid: Vec<usize> = (0..uris.len())
-            .filter(|&i| parse_track_uri(&uris[i]).is_some_and(|c| c == uris[i]))
+            .filter(|&i| is_saveable_uri(&uris[i]))
             .collect();
         for batch in valid.chunks(LIKED_BATCH) {
             let joined = batch
@@ -387,12 +501,12 @@ impl WebApi {
         Ok(out)
     }
 
-    /// Save (`liked`) or remove one track. An invalid uri or a login known to lack
+    /// Save (`liked`) or remove one track or album. An invalid uri or a login known to lack
     /// `user-library-modify` fails with no request. A 403 on the write forgets the scope while the
     /// granted scopes are unknown (so the heart reads as not writable until the next login);
     /// with the scope known to be granted the refusal is reported and the scope stays.
     pub async fn set_liked(&self, uri: &str, liked: bool) -> Result<(), Error> {
-        if parse_track_uri(uri).is_none_or(|c| c != uri) {
+        if !is_saveable_uri(uri) {
             return Err(Error::InvalidId);
         }
         if self.tokens.has_scope(SCOPE_LIBRARY_MODIFY) == Some(false) {
@@ -443,16 +557,22 @@ impl WebApi {
         // At most two passes: the request and, after a 401, one retry with a refreshed token.
         for attempt in 0..2 {
             // Gate first: while it is closed not even a token refresh touches the network.
-            self.gate
-                .check((self.clock)())
-                .map_err(|retry_after_secs| Error::RateLimited { retry_after_secs })?;
+            if let Err(retry_after_secs) = self.gate.check((self.clock)()) {
+                log::warn!(
+                    "web api {method} {path}: not sent, rate gate closed for {retry_after_secs} s"
+                );
+                return Err(Error::RateLimited { retry_after_secs });
+            }
             let bearer = match forced.take() {
                 Some(t) => t,
-                None => self
-                    .tokens
-                    .access_token()
-                    .await
-                    .map_err(|e| self.auth_failed(&e))?,
+                None => match self.tokens.access_token().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let e = self.auth_failed(&e);
+                        log::warn!("web api {method} {path}: no access token: {}", e.kind());
+                        return Err(e);
+                    }
+                },
             };
             let mut req = self
                 .http
@@ -461,8 +581,33 @@ impl WebApi {
             if method != reqwest::Method::GET {
                 req = req.header(reqwest::header::CONTENT_LENGTH, "0");
             }
-            let resp = req.send().await.map_err(|_| Error::Network)?;
+            let n = self.sent.fetch_add(1, Ordering::Relaxed) + 1;
+            let started = Instant::now();
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "web api #{n} {method} {path}: network error after {} ms ({})",
+                        started.elapsed().as_millis(),
+                        net_kind(&e)
+                    );
+                    return Err(Error::Network);
+                }
+            };
             let status = resp.status().as_u16();
+            let ms = started.elapsed().as_millis();
+            if (200..=299).contains(&status) {
+                log::debug!("web api #{n} {method} {path} -> {status} ({ms} ms)");
+            } else if status != 429 {
+                log::warn!(
+                    "web api #{n} {method} {path} -> {status} ({ms} ms){}",
+                    if status == 401 && attempt == 0 {
+                        ", refreshing the token and retrying"
+                    } else {
+                        ""
+                    }
+                );
+            }
             match status {
                 200..=299 => return Ok(resp),
                 401 if attempt == 0 => {
@@ -481,6 +626,12 @@ impl WebApi {
                         .and_then(|v| v.to_str().ok());
                     let secs = cooldown_secs(header);
                     self.gate.block((self.clock)(), secs);
+                    let reason = limit_reason(resp).await;
+                    log::warn!(
+                        "web api #{n} {method} {path} -> 429 ({ms} ms), reason {}, wait {secs} s ({})",
+                        reason.unwrap_or("not given"),
+                        wait_text(secs)
+                    );
                     return Err(Error::RateLimited {
                         retry_after_secs: secs,
                     });
@@ -520,7 +671,7 @@ enum Forbidden {
     AccessDenied,
 }
 
-/// A validated `spotify:track:<id>` percent-encoded for a query value (`:` becomes `%3A`).
+/// A validated `spotify:track:<id>` or `spotify:album:<id>` percent-encoded for a query value (`:` becomes `%3A`).
 fn encode_uri(uri: &str) -> String {
     url::form_urlencoded::byte_serialize(uri.as_bytes()).collect()
 }
@@ -530,6 +681,44 @@ fn check_offset(offset: u32) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::InvalidOffset)
+    }
+}
+
+/// The `error.reason` of a 429 body when it is a known word (`QUOTA_EXCEEDED` marks the
+/// Development Mode quota), for the log only; never a decision and never the body itself.
+/// At most 4 KiB is read.
+async fn limit_reason(mut resp: reqwest::Response) -> Option<&'static str> {
+    const KNOWN: [&str; 2] = ["QUOTA_EXCEEDED", "RATE_LIMITED"];
+    let mut body: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if body.len() + chunk.len() > 4096 {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let v: Value = serde_json::from_slice(&body).ok()?;
+    let reason = v.get("error")?.get("reason")?.as_str()?;
+    Some(
+        KNOWN
+            .iter()
+            .find(|k| **k == reason)
+            .copied()
+            .unwrap_or("other"),
+    )
+}
+
+/// What kind of transport failure a reqwest error was, as a fixed word (never its text).
+fn net_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_request() {
+        "request"
+    } else if e.is_body() {
+        "body"
+    } else {
+        "other"
     }
 }
 

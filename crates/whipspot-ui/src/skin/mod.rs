@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use lune_ui::desktop::WindowShape;
 use lune_ui::image::{ImageData, ImageId as LuneImage, ImageStore};
+use lune_ui::input::{Event, PointerButton};
 use lune_ui::shortcuts::{CommandId, Shortcuts};
 use lune_ui::ui::Ui;
-use whipspot_core::player::{PlayerAction, PlayerHandle, PlayerNotice};
+use whipspot_core::player::{PlayerAction, PlayerHandle, PlayerNotice, PlayerState};
 
 use crate::library::{Access, LibraryAnswer, ProviderChoice};
 use whipspot_core::skin::{
@@ -33,6 +34,88 @@ mod lists;
 mod resize;
 mod text;
 mod vis;
+
+/// The `--skin-trace` diagnostic (D3): one stderr line per panel drag event (press, move, release,
+/// lost release, rescale) and resize event (resize press, move, release; the host adds button,
+/// OS release and scale lines) with the pointer, the leader's
+/// frame, the pixel scale, the desktop units per pixel and the moves sent. Numbers only. A user-run flag of the real app in a debug build; a
+/// release build never turns it on, and without [`enable`] nothing is printed.
+pub mod trace {
+    use std::fmt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use whipspot_core::skin::{ScreenPoint, ScreenRect};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    /// Turns the trace on (debug builds only; a release build ignores it).
+    pub fn enable() {
+        if cfg!(debug_assertions) {
+            ENABLED.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the trace prints.
+    pub fn enabled() -> bool {
+        cfg!(debug_assertions) && ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Prints `skin-trace <args>` to stderr when the trace is on.
+    pub fn line(args: fmt::Arguments<'_>) {
+        if enabled() {
+            eprintln!("skin-trace {args}");
+        }
+    }
+
+    /// `x,y`, or `-` for none.
+    pub(crate) fn point(p: Option<ScreenPoint>) -> String {
+        p.map_or_else(|| "-".to_owned(), |p| format!("{},{}", p.x, p.y))
+    }
+
+    /// `x,y wxh`, or `-` for none.
+    pub(crate) fn rect(r: Option<ScreenRect>) -> String {
+        r.map_or_else(
+            || "-".to_owned(),
+            |r| format!("{},{} {}x{}", r.x, r.y, r.w, r.h),
+        )
+    }
+
+    /// `[panel:x,y ...]`.
+    pub(crate) fn moves(moves: &[(usize, ScreenPoint)]) -> String {
+        let items: Vec<String> = moves
+            .iter()
+            .map(|&(p, o)| format!("{p}:{},{}", o.x, o.y))
+            .collect();
+        format!("[{}]", items.join(" "))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_trace_formats_numbers_only() {
+            assert_eq!(point(Some(ScreenPoint { x: -3, y: 4 })), "-3,4");
+            assert_eq!(point(None), "-");
+            assert_eq!(
+                rect(Some(ScreenRect {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: 4
+                })),
+                "1,2 3x4"
+            );
+            assert_eq!(
+                moves(&[
+                    (1, ScreenPoint { x: 5, y: 6 }),
+                    (2, ScreenPoint { x: 7, y: 8 })
+                ]),
+                "[1:5,6 2:7,8]"
+            );
+        }
+    }
+}
 
 use dock::DragController;
 use draw::{Ctx, Scrolls};
@@ -172,7 +255,8 @@ enum Op {
     DockAll,
     OnTop(bool),
     Minimise,
-    Rescale(u32, u32),
+    /// The desktop units per skin pixel before the change, and the new pixel scale.
+    Rescale(f32, u32),
 }
 
 /// A text shown in place of the scrolling title for a while.
@@ -229,10 +313,19 @@ struct Active {
     panels: Vec<PanelState>,
     drag: DragController,
     resize: ResizeController,
+    /// The panel whose drag area or resize grip is held, and which of the two.
+    holder: Option<(usize, Hold)>,
     /// The docked flags want recomputing at the next `drive`.
     need_dock: bool,
     ops: Vec<Op>,
     quit: bool,
+}
+
+/// What a held press moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    Drag,
+    Resize,
 }
 
 /// The shape of a panel for the window: its polygons in skin pixels; `None` for a rectangle or
@@ -326,6 +419,7 @@ impl Active {
             panels,
             drag: DragController::new(k),
             resize: ResizeController::default(),
+            holder: None,
             need_dock: true,
             ops: vec![Op::OnTop(on_top)],
             quit: false,
@@ -339,6 +433,70 @@ impl Active {
             self.visible[panel] = visible;
             self.ops.push(Op::Visible(panel, visible));
             self.ops.push(Op::DockAll);
+        }
+    }
+
+    /// Turns one frame's raw events of panel `panel` into effects. A drag or resize whose release
+    /// never came is ended as a release would end it: luneui's pointer events carry no button
+    /// state, but the OS sends a held button's events to the window that took the press, so a
+    /// pointer event at another panel, or a new press anywhere, means the button was let go
+    /// where no panel saw it (a click let through by a pointer-shaped window, macOS).
+    fn events(
+        &mut self,
+        panel: usize,
+        events: &[Event],
+        m: Metrics,
+        state: &PlayerState,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if panel >= self.panels.len() {
+            return effects;
+        }
+        for event in events {
+            if let Some((holder, hold)) = self.holder {
+                let lost = match event {
+                    Event::PointerMoved { .. } => holder != panel,
+                    Event::PointerButton {
+                        button: PointerButton::Primary,
+                        pressed,
+                        ..
+                    } => holder != panel || *pressed,
+                    _ => false,
+                };
+                if lost {
+                    if trace::enabled() {
+                        trace::line(format_args!("lost-release holder={holder} seen-at={panel}"));
+                    }
+                    effects.push(self.drop_hold(holder, hold));
+                }
+            }
+            let before = effects.len();
+            self.panels[panel]
+                .input
+                .event(event, m, &self.skin, panel, state, &mut effects);
+            // A press or release of this event sets the holder for the events after it.
+            for e in &effects[before..] {
+                match e {
+                    Effect::DragPress => self.holder = Some((panel, Hold::Drag)),
+                    Effect::ResizePress => self.holder = Some((panel, Hold::Resize)),
+                    Effect::DragRelease | Effect::ResizeRelease => self.holder = None,
+                    _ => {}
+                }
+            }
+        }
+        effects
+    }
+
+    /// Ends the hold of `holder` without its release event: its press is dropped and the release
+    /// effect (for `apply`) returned.
+    fn drop_hold(&mut self, holder: usize, hold: Hold) -> Effect {
+        if let Some(h) = self.panels.get_mut(holder) {
+            h.input.cancel();
+        }
+        self.holder = None;
+        match hold {
+            Hold::Drag => Effect::DragRelease,
+            Hold::Resize => Effect::ResizeRelease,
         }
     }
 
@@ -467,19 +625,40 @@ impl SkinUi {
     }
 
     /// The leader's scale changed: stores `k` and rescales the docked panels' places at the next
-    /// `drive` (the host resizes and reshapes the windows).
-    pub fn rescaled(&mut self, k: u32) {
+    /// `drive` (the host resizes and reshapes the windows). `units_per_pixel_before` is the
+    /// desktop units per physical pixel before the change (the host's new one is what the
+    /// windows say by then): the places scale by the change in desktop units per skin pixel.
+    pub fn rescaled(&mut self, k: u32, units_per_pixel_before: f32) {
         let k = k.clamp(1, MAX_PIXEL_SCALE);
         let old = std::mem::replace(&mut self.k, k);
         if let Some(a) = &mut self.active
             && old != k
         {
-            a.ops.push(Op::Rescale(old, k));
+            a.ops
+                .push(Op::Rescale(units_per_pixel_before * old as f32, k));
         }
     }
 
     pub fn pixel_scale(&self) -> u32 {
         self.k
+    }
+
+    /// The host saw every mouse button of panel `panel` go up (their release, or the window losing
+    /// focus): a drag or resize the panel holds ends as its release would (docks recomputed at the
+    /// next `drive`), even when the toolkit's release event never comes.
+    pub fn buttons_up(&mut self, panel: usize) {
+        let Some(a) = &mut self.active else {
+            return;
+        };
+        if let Some((holder, hold)) = a.holder
+            && holder == panel
+        {
+            if trace::enabled() {
+                trace::line(format_args!("buttons-up holder={holder}"));
+            }
+            let release = a.drop_hold(holder, hold);
+            let _ = a.apply(holder, vec![release]);
+        }
     }
 
     /// Whether a change can still come that the host has not taken: a load or a listing still
@@ -711,7 +890,7 @@ impl SkinUi {
                 Op::DockAll => a.drag.dock_all(windows),
                 Op::OnTop(on) => windows.set_always_on_top(on),
                 Op::Minimise => windows.minimise(),
-                Op::Rescale(old, new) => a.drag.rescale(old, new, windows),
+                Op::Rescale(old_unit, new) => a.drag.rescale(old_unit, new, windows),
             }
         }
         if a.drag.dragging() {
@@ -794,12 +973,7 @@ impl SkinUi {
         };
         let size = a.size[panel];
         a.panels[panel].input.set_size(size);
-        let mut effects = Vec::new();
-        for event in &raw.events {
-            a.panels[panel]
-                .input
-                .event(event, m, &a.skin, panel, &state, &mut effects);
-        }
+        let effects = a.events(panel, &raw.events, m, &state);
         // The scroll bar acts on the list, which keeps its own position.
         let mut rest = Vec::with_capacity(effects.len());
         for effect in effects {
@@ -1225,6 +1399,8 @@ mod tests {
                     duration_ms: 1000,
                     images: vec![],
                     year: None,
+                    album_ref: None,
+                    artists: vec![],
                 }],
                 skipped: 0,
                 next_offset: None,
@@ -1352,7 +1528,7 @@ mod tests {
         // The panel below followed by 29.
         assert_eq!(w.origin(3), (0, 245));
         // The pixel scale changing leaves the sizes.
-        ui.rescaled(2);
+        ui.rescaled(2, 1.0);
         ui.drive(&mut w);
         assert_eq!(ui.active.as_ref().unwrap().size[2], (325, 145));
         // Released: no more resizing.
@@ -1364,5 +1540,269 @@ mod tests {
         w.pointer = Some(ScreenPoint { x: 900, y: 900 });
         ui.drive(&mut w);
         assert_eq!(ui.active.as_ref().unwrap().size[2], (325, 145));
+    }
+
+    /// The test skin with a drag area over the whole main panel.
+    fn draggable() -> LoadedSkin {
+        use whipspot_core::skin::{Align, Anchor, Rect, Widget, WidgetKind};
+        let mut s = skin(1);
+        s.panels[0].widgets.push(Widget {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 50,
+            },
+            anchor: Anchor {
+                h: Align::Start,
+                v: Align::Start,
+            },
+            kind: WidgetKind::DragArea,
+        });
+        LoadedSkin {
+            generation: 1,
+            name: "x.skin".to_owned(),
+            skin: Arc::new(s),
+        }
+    }
+
+    fn press_at(x: f32, y: f32, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos: (x, y),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: lune_ui::input::Modifiers::default(),
+        }
+    }
+
+    /// Main at (0, 0), the equalizer docked under it, the library away.
+    fn drag_windows() -> FakeWindows {
+        let frame = |x, y| ScreenRect {
+            x,
+            y,
+            w: 100,
+            h: 50,
+        };
+        FakeWindows::new(vec![frame(0, 0), frame(0, 50), frame(500, 0)])
+    }
+
+    /// One frame of panel `panel` with `events`, its effects applied and the ops driven.
+    fn frame(ui: &mut SkinUi, w: &mut FakeWindows, panel: usize, events: &[Event]) {
+        const M: Metrics = Metrics { k: 1.0, scale: 1.0 };
+        let state = super::fake::player_state();
+        let a = ui.active.as_mut().unwrap();
+        let effects = a.events(panel, events, M, &state);
+        let _ = a.apply(panel, effects);
+        ui.drive(w);
+    }
+
+    #[test]
+    fn a_move_at_another_panel_ends_a_drag_whose_release_was_lost() {
+        let mut ui = ui();
+        ui.active = Some(Active::new(draggable(), None, 1, false));
+        let mut w = drag_windows();
+        ui.drive(&mut w);
+        w.pointer = Some(ScreenPoint { x: 10, y: 10 });
+        frame(&mut ui, &mut w, 0, &[press_at(10.0, 10.0, true)]);
+        assert!(ui.active.as_ref().unwrap().drag.dragging());
+        w.pointer = Some(ScreenPoint { x: 40, y: 30 });
+        frame(
+            &mut ui,
+            &mut w,
+            0,
+            &[Event::PointerMoved { pos: (10.0, 10.0) }],
+        );
+        assert_eq!(w.origin(0), (30, 20));
+        assert_eq!(w.origin(1), (30, 70), "the docked equalizer follows");
+        // The release went to no panel; then the pointer moves over the library: no button is
+        // held there, so the drag ends as a release would.
+        w.pointer = Some(ScreenPoint { x: 520, y: 10 });
+        frame(
+            &mut ui,
+            &mut w,
+            2,
+            &[Event::PointerMoved { pos: (20.0, 10.0) }],
+        );
+        let a = ui.active.as_ref().unwrap();
+        assert!(!a.drag.dragging());
+        assert!(a.holder.is_none());
+        assert!(!a.panels[0].input.held());
+        assert!(w.docked[1], "the docks were recomputed");
+        // A later move moves nothing.
+        let moved = w.moves.len();
+        w.pointer = Some(ScreenPoint { x: 700, y: 300 });
+        frame(
+            &mut ui,
+            &mut w,
+            0,
+            &[Event::PointerMoved { pos: (5.0, 5.0) }],
+        );
+        frame(
+            &mut ui,
+            &mut w,
+            2,
+            &[Event::PointerMoved { pos: (5.0, 5.0) }],
+        );
+        assert_eq!(w.moves.len(), moved);
+        assert_eq!(w.origin(0), (30, 20));
+    }
+
+    #[test]
+    fn a_new_press_ends_a_drag_whose_release_was_lost_and_a_real_drag_is_kept() {
+        let mut ui = ui();
+        ui.active = Some(Active::new(draggable(), None, 1, false));
+        let mut w = drag_windows();
+        ui.drive(&mut w);
+        w.pointer = Some(ScreenPoint { x: 10, y: 10 });
+        frame(&mut ui, &mut w, 0, &[press_at(10.0, 10.0, true)]);
+        // Moves at the pressed panel keep the drag.
+        w.pointer = Some(ScreenPoint { x: 60, y: 40 });
+        frame(
+            &mut ui,
+            &mut w,
+            0,
+            &[Event::PointerMoved { pos: (10.0, 10.0) }],
+        );
+        assert!(ui.active.as_ref().unwrap().drag.dragging());
+        assert_eq!(w.origin(0), (50, 30));
+        // A press on the library (its release never came on main): the drag ends.
+        frame(&mut ui, &mut w, 2, &[press_at(5.0, 5.0, true)]);
+        assert!(!ui.active.as_ref().unwrap().drag.dragging());
+        let moved = w.moves.len();
+        w.pointer = Some(ScreenPoint { x: 300, y: 300 });
+        frame(
+            &mut ui,
+            &mut w,
+            0,
+            &[Event::PointerMoved { pos: (5.0, 5.0) }],
+        );
+        assert_eq!(w.moves.len(), moved);
+        // A press on main again while held there (the release lost) starts a fresh drag from
+        // the new press, not the old one.
+        w.pointer = Some(ScreenPoint { x: 55, y: 35 });
+        frame(&mut ui, &mut w, 0, &[press_at(5.0, 5.0, true)]);
+        w.pointer = Some(ScreenPoint { x: 65, y: 45 });
+        frame(&mut ui, &mut w, 0, &[press_at(15.0, 15.0, true)]);
+        assert!(ui.active.as_ref().unwrap().drag.dragging());
+        w.pointer = Some(ScreenPoint { x: 165, y: 45 });
+        frame(
+            &mut ui,
+            &mut w,
+            0,
+            &[Event::PointerMoved { pos: (15.0, 15.0) }],
+        );
+        assert_eq!(w.origin(0), (150, 30));
+        // A real release ends it.
+        frame(&mut ui, &mut w, 0, &[press_at(5.0, 5.0, false)]);
+        assert!(!ui.active.as_ref().unwrap().drag.dragging());
+    }
+
+    /// The host's release from the OS's button state (macOS): `buttons_up` at the holder, then
+    /// the release it fed the panel's translator, then perhaps the window's own late release. The
+    /// resize ends at the first; the two releases after it do nothing.
+    #[test]
+    fn an_os_release_ends_a_resize_and_the_releases_after_it_do_nothing() {
+        use whipspot_core::skin::{Align, Anchor, Rect, Widget, WidgetKind};
+        let mut loaded = resizable();
+        let mut s = (*loaded.skin).clone();
+        s.panels[2].widgets.push(Widget {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 275,
+                h: 116,
+            },
+            anchor: Anchor {
+                h: Align::Start,
+                v: Align::Start,
+            },
+            kind: WidgetKind::ResizeArea,
+        });
+        loaded.skin = Arc::new(s);
+        let mut ui = ui();
+        ui.active = Some(Active::new(loaded, None, 1, false));
+        let rect = |x, y, w, h| ScreenRect { x, y, w, h };
+        let mut w = FakeWindows::new(vec![
+            rect(0, 0, 100, 50),
+            rect(0, 50, 100, 50),
+            rect(0, 100, 275, 116),
+            rect(0, 216, 275, 50),
+        ]);
+        ui.drive(&mut w);
+        w.pointer = Some(ScreenPoint { x: 10, y: 110 });
+        frame(&mut ui, &mut w, 2, &[press_at(10.0, 10.0, true)]);
+        assert!(ui.active.as_ref().unwrap().resize.resizing());
+        w.pointer = Some(ScreenPoint { x: 60, y: 110 });
+        frame(
+            &mut ui,
+            &mut w,
+            2,
+            &[Event::PointerMoved { pos: (60.0, 10.0) }],
+        );
+        assert_eq!(ui.active.as_ref().unwrap().size[2], (325, 116));
+        // The OS says the button is up: the host calls `buttons_up` at the holder.
+        ui.buttons_up(2);
+        w.pointer = Some(ScreenPoint { x: 200, y: 300 });
+        ui.drive(&mut w);
+        assert!(
+            !ui.active.as_ref().unwrap().resize.resizing(),
+            "ended by buttons_up"
+        );
+        assert_eq!(w.resizes.len(), 1);
+        // The release the host fed the translator, then the window's own late one.
+        frame(&mut ui, &mut w, 2, &[press_at(60.0, 10.0, false)]);
+        frame(&mut ui, &mut w, 2, &[press_at(60.0, 10.0, false)]);
+        let a = ui.active.as_ref().unwrap();
+        assert!(!a.resize.resizing());
+        assert!(a.holder.is_none());
+        assert!(!a.panels[2].input.held());
+        assert_eq!(a.size[2], (325, 116), "no resize after the release");
+        assert_eq!(w.resizes.len(), 1);
+        assert!(w.docked[3], "the docks were recomputed");
+    }
+
+    #[test]
+    fn the_hosts_buttons_up_at_the_holder_ends_the_drag_whose_release_was_lost() {
+        let mut ui = ui();
+        ui.active = Some(Active::new(draggable(), None, 1, false));
+        let mut w = drag_windows();
+        ui.drive(&mut w);
+        w.pointer = Some(ScreenPoint { x: 10, y: 10 });
+        frame(&mut ui, &mut w, 0, &[press_at(10.0, 10.0, true)]);
+        w.pointer = Some(ScreenPoint { x: 60, y: 40 });
+        frame(
+            &mut ui,
+            &mut w,
+            0,
+            &[Event::PointerMoved { pos: (10.0, 10.0) }],
+        );
+        assert_eq!(w.origin(0), (50, 30));
+        // Another panel's buttons going up does nothing.
+        ui.buttons_up(2);
+        assert!(ui.active.as_ref().unwrap().holder.is_some());
+        // The holder's buttons are up (released where the toolkit did not see it, or focus
+        // lost); its moves then keep coming at the holder itself.
+        ui.buttons_up(0);
+        w.pointer = Some(ScreenPoint { x: 160, y: 140 });
+        frame(
+            &mut ui,
+            &mut w,
+            0,
+            &[Event::PointerMoved { pos: (10.0, 10.0) }],
+        );
+        let a = ui.active.as_ref().unwrap();
+        assert!(!a.drag.dragging());
+        assert!(a.holder.is_none());
+        assert!(!a.panels[0].input.held());
+        assert_eq!(
+            w.origin(0),
+            (50, 30),
+            "the move at the holder moved nothing"
+        );
+        assert!(w.docked[1], "the docks were recomputed");
+        // The toolkit's own release arriving after it changes nothing.
+        frame(&mut ui, &mut w, 0, &[press_at(10.0, 10.0, false)]);
+        assert!(!ui.active.as_ref().unwrap().drag.dragging());
+        assert_eq!(w.origin(0), (50, 30));
     }
 }

@@ -363,8 +363,14 @@ impl Slot {
         };
         let refresh = match self.store.get(self.refresh_account) {
             Ok(Some(r)) => r,
-            Ok(None) => return Err(AuthError::NotLoggedIn),
-            Err(_) => return Err(store_err()),
+            Ok(None) => {
+                log::debug!("{}: no stored login, not refreshing", self.refresh_account);
+                return Err(AuthError::NotLoggedIn);
+            }
+            Err(_) => {
+                log::warn!("{}: credential store read failed", self.refresh_account);
+                return Err(store_err());
+            }
         };
         let client_id = match self.client_id_account {
             None => None,
@@ -374,8 +380,14 @@ impl Slot {
                 Err(_) => return Err(store_err()),
             },
         };
+        log::debug!("{}: refreshing the access token", self.refresh_account);
         match self.backend.refresh(client_id.as_deref(), &refresh).await {
             Ok(t) => {
+                log::info!(
+                    "{}: access token refreshed, granted scopes: {}",
+                    self.refresh_account,
+                    scopes_text(&t.scopes)
+                );
                 // Spotify may not rotate the refresh token: an empty one keeps the stored value.
                 let persisted = !should_store_refresh(t.refresh.expose())
                     || self.store.set(self.refresh_account, &t.refresh).is_ok();
@@ -384,6 +396,10 @@ impl Slot {
                 Ok(t.access)
             }
             Err(TokenError::InvalidGrant) => {
+                log::warn!(
+                    "{}: refresh refused (invalid grant), the stored login is dropped",
+                    self.refresh_account
+                );
                 // The stored login is dead. Drop only this slot's refresh token (the public web
                 // client id stays so the connect card can prefill it).
                 self.clear_login_state();
@@ -392,7 +408,11 @@ impl Slot {
                     Err(_) => Err(store_err()),
                 }
             }
-            Err(e) => Err(from_token_error(&e)),
+            Err(e) => {
+                let e = from_token_error(&e);
+                log::warn!("{}: refresh failed: {e}", self.refresh_account);
+                Err(e)
+            }
         }
     }
 
@@ -400,9 +420,14 @@ impl Slot {
     /// so a timeout or denial leaves the previous state untouched.
     async fn login(&self, client_id: Option<&str>) -> Result<(), AuthError> {
         self.set_error(None);
+        log::info!("{}: login started", self.refresh_account);
         let result = self.login_inner(client_id).await;
-        if let Err(e) = &result {
-            self.set_error(Some(e));
+        match &result {
+            Ok(()) => log::info!("{}: login stored", self.refresh_account),
+            Err(e) => {
+                log::warn!("{}: login failed: {e}", self.refresh_account);
+                self.set_error(Some(e));
+            }
         }
         result
     }
@@ -432,6 +457,11 @@ impl Slot {
             self.clear_login_state();
             return Err(AuthError::CredentialStore);
         }
+        log::info!(
+            "{}: granted scopes: {}",
+            self.refresh_account,
+            scopes_text(&tokens.scopes)
+        );
         self.set_cache(&tokens);
         Ok(())
     }
@@ -447,8 +477,21 @@ impl Slot {
                 result = Err(AuthError::CredentialStore);
             }
         }
+        match &result {
+            Ok(()) => log::info!("{}: logged out", self.refresh_account),
+            Err(e) => log::warn!("{}: logout failed: {e}", self.refresh_account),
+        }
         self.set_error(result.as_ref().err());
         result
+    }
+}
+
+/// The granted scopes for a log line; "unknown" when the token response did not list them.
+fn scopes_text(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "unknown".to_owned()
+    } else {
+        scopes.join(" ")
     }
 }
 

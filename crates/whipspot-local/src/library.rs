@@ -5,12 +5,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use whipspot_core::provider::{
-    Album, AlbumPage, ImageRef, LibErrorKind, LibraryError, Playlist, PlaylistPage, Readable,
-    Track, TrackPage,
+    Album, AlbumDetail, AlbumKind, AlbumPage, Artist, ArtistPage, EntityRef, ImageRef,
+    LibErrorKind, LibraryError, MAX_ARTISTS, Playlist, PlaylistPage, Readable, ReleaseGroup, Track,
+    TrackPage,
 };
 use whipspot_core::text::display_text;
 
-use crate::ids::{ALBUM_PREFIX, ART_PREFIX, IdMinter, PLAYLIST_PREFIX, TRACK_PREFIX, path_key};
+use crate::ids::{
+    ALBUM_PREFIX, ART_PREFIX, ARTIST_URI_PREFIX, IdMinter, PLAYLIST_PREFIX, TRACK_PREFIX,
+    album_id_of_uri, album_uri_of_id, is_artist_uri, path_key,
+};
 use crate::index::{Entry, MAX_TEXT_CHARS};
 use crate::m3u;
 
@@ -37,6 +41,15 @@ struct AlbumRec {
     tracks: Vec<usize>,
 }
 
+/// An artist the tags name: its page header and the albums on it, as indexes into `albums`.
+struct ArtistRec {
+    artist: Artist,
+    /// Albums it is the album artist of, newest first.
+    own: Vec<usize>,
+    /// Albums where it is a track artist but not the album artist, newest first.
+    appears: Vec<usize>,
+}
+
 struct PlaylistRec {
     playlist: Playlist,
     tracks: Vec<usize>,
@@ -50,6 +63,8 @@ pub struct Catalog {
     by_key: HashMap<String, usize>,
     albums: Vec<AlbumRec>,
     album_by_id: HashMap<String, usize>,
+    artists: Vec<ArtistRec>,
+    artist_by_uri: HashMap<String, usize>,
     playlists: Vec<PlaylistRec>,
     playlist_by_id: HashMap<String, usize>,
     /// The playlist files the catalog was built from.
@@ -75,6 +90,48 @@ fn file_stem(path: &str) -> Option<String> {
     Some(display_text(&stem, MAX_TEXT_CHARS)).filter(|s| !s.is_empty())
 }
 
+/// The artists one tag text names, as (comparison key, name) pairs: split only on `;` (the tag's
+/// own separator; `/` and `,` appear inside real names), trimmed, unique by key, at most
+/// [`MAX_ARTISTS`]. An unset tag, and the "Unknown artist" a tagger writes, name nobody.
+fn artist_names(tag: Option<&str>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for piece in tag.unwrap_or_default().split(';') {
+        let name = piece.trim();
+        let key = name.to_lowercase();
+        if name.is_empty() || key == UNKNOWN_ARTIST.to_lowercase() {
+            continue;
+        }
+        if out.len() < MAX_ARTISTS && !out.iter().any(|(k, _)| *k == key) {
+            out.push((key, name.to_owned()));
+        }
+    }
+    out
+}
+
+/// The refs for `names`, by the uris minted for their keys.
+fn refs_of(names: &[(String, String)], uris: &HashMap<String, String>) -> Vec<EntityRef> {
+    names
+        .iter()
+        .filter_map(|(key, name)| {
+            Some(EntityRef {
+                uri: uris.get(key)?.clone(),
+                name: name.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Newest first, then by name, then by id: a stable order for an artist's releases.
+fn release_order(albums: &[AlbumRec], list: &mut [usize]) {
+    list.sort_by(|&a, &b| {
+        let (a, b) = (&albums[a].album, &albums[b].album);
+        b.year
+            .cmp(&a.year)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 impl Catalog {
     /// The catalog of `entries` (any order, duplicates by path dropped) and the playlist files
     /// `playlist_paths` (read here; one that fails to read is left out).
@@ -89,6 +146,29 @@ impl Catalog {
         let minted: Vec<(String, String, Entry)> = keyed
             .into_iter()
             .map(|(key, e)| (format!("{TRACK_PREFIX}{}", track_ids.id(&key)), key, e))
+            .collect();
+
+        // Artist uris: one per normalised name, minted in key order so a collision resolves the
+        // same way every time. The tags are read here; the index stores nothing new.
+        let track_artists =
+            |e: &Entry| artist_names(e.artist.as_deref().or(e.album_artist.as_deref()));
+        let album_artists =
+            |e: &Entry| artist_names(e.album_artist.as_deref().or(e.artist.as_deref()));
+        let mut display: BTreeMap<String, String> = BTreeMap::new();
+        for (_, _, e) in &minted {
+            for (key, name) in track_artists(e).into_iter().chain(album_artists(e)) {
+                display.entry(key).or_insert(name);
+            }
+        }
+        let mut artist_ids = IdMinter::default();
+        let artist_uris: HashMap<String, String> = display
+            .keys()
+            .map(|k| {
+                (
+                    k.clone(),
+                    format!("{ARTIST_URI_PREFIX}{}", artist_ids.id(k)),
+                )
+            })
             .collect();
 
         // Group into albums by (album artist or artist, album), lowercased.
@@ -127,7 +207,14 @@ impl Catalog {
                 let Some((uri, key, entry)) = slots[m].take() else {
                     continue;
                 };
-                let rec = track_rec(uri, key, entry);
+                let mut rec = track_rec(uri, key, entry);
+                rec.track.artists = refs_of(&track_artists(&rec.entry), &artist_uris);
+                if let Some(name) = &rec.entry.album {
+                    rec.track.album_ref = Some(EntityRef {
+                        uri: album_uri_of_id(&album_id),
+                        name: name.clone(),
+                    });
+                }
                 idxs.push(cat.tracks.len());
                 cat.tracks.push(rec);
             }
@@ -153,6 +240,9 @@ impl Catalog {
                 track_count: u32::try_from(idxs.len()).ok(),
                 images,
                 year: idxs.iter().find_map(|&i| cat.tracks[i].track.year),
+                artists: refs_of(&album_artists(&head.entry), &artist_uris),
+                kind: AlbumKind::Album,
+                uri: album_uri_of_id(&album_id),
             };
             cat.album_by_id.insert(album_id, cat.albums.len());
             cat.albums.push(AlbumRec {
@@ -160,6 +250,7 @@ impl Catalog {
                 tracks: idxs,
             });
         }
+        cat.build_artists(&display, &artist_uris, &album_artists);
         for (i, t) in cat.tracks.iter().enumerate() {
             cat.by_uri.insert(t.track.uri.clone(), i);
             cat.by_key.insert(t.key.clone(), i);
@@ -201,6 +292,130 @@ impl Catalog {
             cat.playlist_paths.push(path);
         }
         cat
+    }
+
+    /// The artist records: for each artist its own albums and the ones it only appears on.
+    fn build_artists(
+        &mut self,
+        display: &BTreeMap<String, String>,
+        uris: &HashMap<String, String>,
+        album_artists: &dyn Fn(&Entry) -> Vec<(String, String)>,
+    ) {
+        let mut own: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut appears: HashMap<String, Vec<usize>> = HashMap::new();
+        for (ai, a) in self.albums.iter().enumerate() {
+            let Some(&first) = a.tracks.first() else {
+                continue;
+            };
+            let owners = album_artists(&self.tracks[first].entry);
+            for (key, _) in &owners {
+                if let Some(uri) = uris.get(key) {
+                    own.entry(uri.as_str()).or_default().push(ai);
+                }
+            }
+            let mut guests: HashSet<String> = HashSet::new();
+            for &ti in &a.tracks {
+                for r in &self.tracks[ti].track.artists {
+                    if !owners.iter().any(|(k, _)| uris.get(k) == Some(&r.uri)) {
+                        guests.insert(r.uri.clone());
+                    }
+                }
+            }
+            for uri in guests {
+                appears.entry(uri).or_default().push(ai);
+            }
+        }
+        let mut recs = Vec::with_capacity(display.len());
+        for (key, name) in display {
+            let Some(uri) = uris.get(key) else { continue };
+            let mut mine = own.get(uri.as_str()).cloned().unwrap_or_default();
+            let mut guest = appears.remove(uri).unwrap_or_default();
+            release_order(&self.albums, &mut mine);
+            release_order(&self.albums, &mut guest);
+            let images = mine
+                .iter()
+                .chain(&guest)
+                .map(|&i| &self.albums[i].album.images)
+                .find(|im| !im.is_empty())
+                .cloned()
+                .unwrap_or_default();
+            recs.push(ArtistRec {
+                artist: Artist {
+                    uri: uri.clone(),
+                    name: name.clone(),
+                    images,
+                },
+                own: mine,
+                appears: guest,
+            });
+        }
+        for (i, r) in recs.iter().enumerate() {
+            self.artist_by_uri.insert(r.artist.uri.clone(), i);
+        }
+        self.artists = recs;
+    }
+
+    /// The artist `uri` opened: header, no popular list (the tags have none) and the first page
+    /// of all its releases.
+    pub fn artist_page(&self, uri: &str) -> Result<ArtistPage, LibraryError> {
+        let rec = self.artist_rec(uri)?;
+        Ok(ArtistPage {
+            artist: rec.artist.clone(),
+            popular: Vec::new(),
+            releases: self.releases_page(rec, ReleaseGroup::All, 0),
+        })
+    }
+
+    pub fn artist_releases(
+        &self,
+        uri: &str,
+        group: ReleaseGroup,
+        offset: u32,
+    ) -> Result<AlbumPage, LibraryError> {
+        Ok(self.releases_page(self.artist_rec(uri)?, group, offset))
+    }
+
+    fn artist_rec(&self, uri: &str) -> Result<&ArtistRec, LibraryError> {
+        if !is_artist_uri(uri) {
+            return Err(not_found("this artist is not in the library"));
+        }
+        self.artist_by_uri
+            .get(uri)
+            .map(|&i| &self.artists[i])
+            .ok_or_else(|| not_found("this artist is not in the library"))
+    }
+
+    fn releases_page(&self, rec: &ArtistRec, group: ReleaseGroup, offset: u32) -> AlbumPage {
+        let own = matches!(group, ReleaseGroup::All | ReleaseGroup::Albums);
+        let guest = matches!(group, ReleaseGroup::All | ReleaseGroup::AppearsOn);
+        let mut items: Vec<Album> = Vec::new();
+        if own {
+            items.extend(rec.own.iter().map(|&i| self.albums[i].album.clone()));
+        }
+        if guest {
+            items.extend(rec.appears.iter().map(|&i| Album {
+                kind: AlbumKind::AppearsOn,
+                ..self.albums[i].album.clone()
+            }));
+        }
+        let (items, next_offset, total) = page(&items, offset, Album::clone);
+        AlbumPage {
+            items,
+            skipped: 0,
+            next_offset,
+            total,
+        }
+    }
+
+    /// The album `uri` opened: the album and its first page of tracks.
+    pub fn album_detail(&self, uri: &str) -> Result<AlbumDetail, LibraryError> {
+        let not_here = || not_found("this album is not in the library");
+        let id = album_id_of_uri(uri).ok_or_else(not_here)?;
+        let &i = self.album_by_id.get(&id).ok_or_else(not_here)?;
+        Ok(AlbumDetail {
+            album: self.albums[i].album.clone(),
+            tracks: self.track_page(&self.albums[i].tracks, 0),
+        })
     }
 
     /// The entries, for the next scan to reuse and the index to save.
@@ -335,6 +550,8 @@ fn track_rec(uri: String, key: String, entry: Entry) -> TrackRec {
         duration_ms: entry.duration_ms,
         images,
         year: entry.year,
+        album_ref: None,
+        artists: vec![],
     };
     TrackRec {
         title_lc: track.name.to_lowercase(),

@@ -280,6 +280,7 @@ impl ConnectHost {
     /// status line follows the phase).
     fn set_phase(&self, s: &mut Shared, phase: Phase) {
         if s.phase != phase {
+            log::info!("spotify connect: {:?} -> {phase:?}", s.phase);
             s.phase = phase;
             // No receivers is fine.
             let _ = self.events.send(UiEvent::AuthChanged {
@@ -349,7 +350,8 @@ impl ConnectHost {
                     attempt = 0;
                     continue;
                 }
-                Err(_) => {
+                Err(e) => {
+                    log::warn!("spotify connect: no playback token: {e}");
                     attempt = self.back_off(epoch, attempt).await;
                     continue;
                 }
@@ -358,6 +360,12 @@ impl ConnectHost {
             let cfg = self.cfg();
             let started = self.backend.start(&token, &cfg).await;
             drop(token);
+            if started.is_err() {
+                log::warn!(
+                    "spotify connect: speaker start failed (attempt {})",
+                    attempt + 1
+                );
+            }
             let Ok(run) = started else {
                 attempt = if self.epoch() == epoch {
                     self.back_off(epoch, attempt).await

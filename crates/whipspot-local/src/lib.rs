@@ -28,9 +28,9 @@ use whipspot_core::engine::ReplayGain;
 use whipspot_core::events::UiEvent;
 use whipspot_core::folders::ScanStatus;
 use whipspot_core::provider::{
-    AlbumPage, AuthFailure, AuthFlow, BoxFuture, Capabilities, LibErrorKind, Library, LibraryError,
-    LoginInput, Playback, PlaybackError, PlaylistPage, Provider, ProviderAuthStatus,
-    ProviderContext, ProviderInfo, TrackPage,
+    AlbumDetail, AlbumPage, ArtistPage, AuthFailure, AuthFlow, BoxFuture, Capabilities,
+    LibErrorKind, Library, LibraryError, LoginInput, Playback, PlaybackError, PlaylistPage,
+    Provider, ProviderAuthStatus, ProviderContext, ProviderInfo, ReleaseGroup, TrackPage,
 };
 
 use crate::favourites::Favourites;
@@ -298,6 +298,8 @@ impl Provider for LocalProvider {
                 eq: true,
                 search: true,
                 likes: true,
+                explore: true,
+                save_albums: false,
             },
             auth_steps: vec![],
         }
@@ -453,5 +455,22 @@ impl Library for LocalProvider {
     }
     fn can_change_likes(&self) -> bool {
         true
+    }
+    fn artist<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<ArtistPage, LibraryError>> {
+        let result = self.shared.catalog().artist_page(uri);
+        Box::pin(async move { result })
+    }
+    fn album<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<AlbumDetail, LibraryError>> {
+        let result = self.shared.catalog().album_detail(uri);
+        Box::pin(async move { result })
+    }
+    fn artist_releases<'a>(
+        &'a self,
+        uri: &'a str,
+        group: ReleaseGroup,
+        offset: u32,
+    ) -> BoxFuture<'a, Result<AlbumPage, LibraryError>> {
+        let result = self.shared.catalog().artist_releases(uri, group, offset);
+        Box::pin(async move { result })
     }
 }

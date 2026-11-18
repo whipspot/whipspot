@@ -56,6 +56,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const STARTUP_UPDATE_DELAY: Duration = Duration::from_secs(5);
 /// The user-run flag that prints the dealer URIs a Connect session sees, redacted (D16).
 const CONNECT_TRACE_FLAG: &str = "--connect-trace";
+/// The user-run flag that prints each skin panel drag event's numbers to stderr (debug builds).
+const SKIN_TRACE_FLAG: &str = "--skin-trace";
 fn main() -> ExitCode {
     // First, before any window, GPU or audio library loads a DLL (M2-P1, D5).
     #[cfg(windows)]
@@ -70,6 +72,11 @@ fn main() -> ExitCode {
     // Without it nothing is subscribed or printed.
     if args.iter().any(|a| a == CONNECT_TRACE_FLAG) {
         trace::enable();
+    }
+    // `--skin-trace` (D3 of ux-fixes-1118): a skin drag's pointer, frames, scale and moves to
+    // stderr, numbers only. A release build ignores it.
+    if args.iter().any(|a| a == SKIN_TRACE_FLAG) {
+        whipspot_ui::skin::trace::enable();
     }
     // No directory root known: no settings file and no log, the app still runs.
     let paths = AppPaths::from_os();

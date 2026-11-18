@@ -165,6 +165,29 @@ fn hsl(h: f32, s: f32, l: f32) -> Rgb {
     [r + m, g + m, b + m]
 }
 
+/// The hue of `c`, degrees (0..360).
+pub(crate) fn hue_of(c: Rgba) -> f32 {
+    to_hsl([
+        f32::from(c[0]) / 255.0,
+        f32::from(c[1]) / 255.0,
+        f32::from(c[2]) / 255.0,
+    ])
+    .0
+}
+
+/// `c` with its hue turned by `degrees` (saturation and lightness kept): the rule for a second
+/// colour when a cover gives none, also the third stop of theme C's links.
+pub(crate) fn turn_hue(c: Rgba, degrees: f32) -> Rgba {
+    let rgb = [
+        f32::from(c[0]) / 255.0,
+        f32::from(c[1]) / 255.0,
+        f32::from(c[2]) / 255.0,
+    ];
+    let (h, s, l) = to_hsl(rgb);
+    let t = hsl(h + degrees, s, l);
+    [to8(t[0]), to8(t[1]), to8(t[2]), c[3]]
+}
+
 fn to8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }

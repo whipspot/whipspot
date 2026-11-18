@@ -12,7 +12,9 @@ use whipspot_core::player::{
     LibraryPage, LibraryQuery, PlayerAction, PlayerHandle, ProviderEntry, RequestId,
 };
 use whipspot_core::provider::model::LoginState;
-use whipspot_core::provider::{Album, ImageRef, LibErrorKind, LibraryError, Playlist, Track};
+use whipspot_core::provider::{
+    Album, Artist, ImageRef, LibErrorKind, LibraryError, Playlist, ReleaseGroup, Track,
+};
 
 /// The text a failed list shows (never the error's own text).
 pub const LOAD_FAILED: &str = "Could not load this list.";
@@ -132,6 +134,11 @@ enum Source {
     PlaylistItems(String),
     AlbumTracks(String),
     Search(String),
+    /// An album opened by its uri: the first page is the lookup, the rest are its tracks (the
+    /// source becomes [`Source::AlbumTracks`] once the lookup names the album's id).
+    AlbumDetail(String),
+    /// One group of an artist's releases.
+    Releases(String, ReleaseGroup),
 }
 
 impl Source {
@@ -150,6 +157,12 @@ impl Source {
             },
             Source::Search(query) => LibraryQuery::Search {
                 query: query.clone(),
+                offset,
+            },
+            Source::AlbumDetail(uri) => LibraryQuery::Album { uri: uri.clone() },
+            Source::Releases(uri, group) => LibraryQuery::ArtistReleases {
+                uri: uri.clone(),
+                group: *group,
                 offset,
             },
         }
@@ -194,6 +207,36 @@ impl<T> Slot<T> {
             total: None,
             refreshing: false,
         }
+    }
+
+    /// A list that waits: nothing is asked for until [`Self::begin`] (its first page arrives some
+    /// other way, or its owner is not ready).
+    fn idle(source: Source, serial: u64) -> Self {
+        Slot {
+            next_offset: None,
+            ..Slot::new(source, serial)
+        }
+    }
+
+    /// Lets an idle list ask for its first page.
+    fn begin(&mut self) {
+        if self.items.is_empty() && self.pending.is_none() && !self.failed {
+            self.next_offset = Some(0);
+        }
+    }
+
+    /// Takes a first page that came with another answer.
+    fn seed(&mut self, (items, next, total): Taken<T>) {
+        self.items = items;
+        self.next_offset = next.filter(|n| *n > 0);
+        self.total = total;
+        self.failed = false;
+        self.pending = None;
+    }
+
+    /// The first page was asked for and has not come yet (an idle list is not waiting).
+    pub fn waiting(&self) -> bool {
+        self.pending.is_some() || (self.next_offset == Some(0) && !self.failed)
     }
 
     /// A complete list that no request fills (the queue's copy): nothing more to ask for.
@@ -319,6 +362,143 @@ pub struct Open {
     pub images: Vec<ImageRef>,
     pub year: Option<u16>,
     pub tracks: Slot<Track>,
+    /// What an album opened by its uri adds; `None` for everything else.
+    pub explore: Option<Explore>,
+}
+
+impl Open {
+    /// An album opened by uri has been described: its name, covers and year replace what the link
+    /// knew, later pages of its tracks come from its id, and its first artist's releases are due.
+    fn named(&mut self, album: Album) {
+        self.name.clone_from(&album.name);
+        if !album.images.is_empty() {
+            self.images.clone_from(&album.images);
+        }
+        if album.year.is_some() {
+            self.year = album.year;
+        }
+        self.tracks.source = Source::AlbumTracks(album.id.clone());
+        if let Some(e) = &mut self.explore {
+            if let Some(first) = album.artists.first() {
+                e.more = Slot::new(
+                    Source::Releases(first.uri.clone(), ReleaseGroup::All),
+                    self.tracks.serial,
+                );
+            }
+            e.album = Some(album);
+        }
+    }
+}
+
+/// An album opened by its uri: what the lookup said of it and the rest of its first artist's
+/// releases.
+#[derive(Debug)]
+pub struct Explore {
+    /// The album as the lookup described it, once it has answered.
+    pub album: Option<Album>,
+    /// The releases of the album's first artist ("More by"), as the lookup names them.
+    pub more: Slot<Album>,
+}
+
+/// One request whose answer is a single value: pending, failed or here.
+#[derive(Debug)]
+pub struct Fetch<T> {
+    pending: Option<RequestId>,
+    failed: bool,
+    data: Option<T>,
+}
+
+impl<T> Fetch<T> {
+    fn new() -> Self {
+        Fetch {
+            pending: None,
+            failed: false,
+            data: None,
+        }
+    }
+
+    /// The value, once the answer is in.
+    pub fn data(&self) -> Option<&T> {
+        self.data.as_ref()
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Still waiting for the answer (asked, or not asked yet).
+    pub fn loading(&self) -> bool {
+        self.data.is_none() && !self.failed
+    }
+
+    fn due(&self) -> bool {
+        self.data.is_none() && self.pending.is_none() && !self.failed
+    }
+
+    fn is_pending(&self, request: RequestId) -> bool {
+        self.pending == Some(request)
+    }
+}
+
+/// The groups of an artist's releases, in the order the page's chips show them.
+pub const GROUPS: [ReleaseGroup; 4] = [
+    ReleaseGroup::All,
+    ReleaseGroup::Albums,
+    ReleaseGroup::Singles,
+    ReleaseGroup::AppearsOn,
+];
+
+/// An artist page opened by its uri: the header and popular tracks, and one list of releases per
+/// group (the first page of each is asked for as soon as the header is in, so the page knows
+/// which chips have anything behind them).
+#[derive(Debug)]
+pub struct ArtistOpen {
+    pub uri: String,
+    /// The name and portraits the link knew; the lookup's replace them.
+    pub name: String,
+    pub images: Vec<ImageRef>,
+    pub serial: u64,
+    head: Fetch<Artist>,
+    /// The popular tracks: the whole list, and the (at most [`POPULAR_SHOWN`]) rows the page lists.
+    pub popular: Vec<Track>,
+    pub shown: Slot<Track>,
+    /// Releases by group, indexed as [`GROUPS`].
+    groups: [Slot<Album>; 4],
+}
+
+/// How many popular rows the artist page lists.
+pub const POPULAR_SHOWN: usize = 5;
+
+impl ArtistOpen {
+    /// The artist as the lookup described it, once it has answered.
+    pub fn artist(&self) -> Option<&Artist> {
+        self.head.data()
+    }
+
+    pub fn head(&self) -> &Fetch<Artist> {
+        &self.head
+    }
+
+    /// The releases of `group`.
+    pub fn releases(&self, group: ReleaseGroup) -> &Slot<Album> {
+        &self.groups[group_index(group)]
+    }
+
+    /// The name on show: the lookup's, else the link's.
+    pub fn display_name(&self) -> &str {
+        self.artist()
+            .map_or(self.name.as_str(), |a| a.name.as_str())
+    }
+
+    /// The portraits on show: the lookup's, else the link's.
+    pub fn display_images(&self) -> &[ImageRef] {
+        self.artist()
+            .map_or(self.images.as_slice(), |a| a.images.as_slice())
+    }
+}
+
+fn group_index(group: ReleaseGroup) -> usize {
+    GROUPS.iter().position(|g| *g == group).unwrap_or(0)
 }
 
 /// Fills each track without an album name with the album's name, covers and year (MD72):
@@ -340,6 +520,8 @@ pub enum ListKind {
     OpenPlaylist,
     OpenAlbum,
     Search,
+    /// One group of the open artist's releases.
+    Releases(ReleaseGroup),
 }
 
 /// A page taken apart: its items, the offset to ask for next and the list's total.
@@ -379,6 +561,12 @@ pub struct LibraryModel {
     pub open_album: Option<Open>,
     /// The search results, with the query that produced them.
     pub search: Option<Open>,
+    /// The artist page on show.
+    pub open_artist: Option<ArtistOpen>,
+    /// A release a Play on the artist page asked for (the request and whether to shuffle), and
+    /// its tracks once they are in.
+    autoplay: Option<(RequestId, bool)>,
+    ready_play: Option<(Vec<Track>, bool)>,
     /// Playlists the provider refused to read this session (D48): a `NotReadable` answer marks
     /// one, a page that arrives later clears it.
     refused: HashSet<String>,
@@ -406,6 +594,9 @@ impl LibraryModel {
             open_playlist: None,
             open_album: None,
             search: None,
+            open_artist: None,
+            autoplay: None,
+            ready_play: None,
             refused: HashSet::new(),
             prefills,
         }
@@ -445,6 +636,14 @@ impl LibraryModel {
         .flatten()
         {
             o.tracks.refresh();
+        }
+    }
+
+    /// Loads the albums list again when `provider`'s lists are on show (an album was saved or
+    /// removed).
+    pub fn refresh_albums(&mut self, provider: &str) {
+        if self.active.as_deref() == Some(provider) {
+            self.albums.refresh();
         }
     }
 
@@ -501,6 +700,9 @@ impl LibraryModel {
         for request in self.refresh_requests() {
             self.send(player, request);
         }
+        for request in self.explore_requests() {
+            self.send(player, request);
+        }
     }
 
     /// The provider whose library the lists show.
@@ -521,6 +723,7 @@ impl LibraryModel {
             images: Vec::new(),
             year: None,
             tracks: Slot::new(Source::PlaylistItems(id.to_owned()), serial),
+            explore: None,
         });
     }
 
@@ -537,7 +740,122 @@ impl LibraryModel {
             images: images.to_vec(),
             year,
             tracks: Slot::new(Source::AlbumTracks(id.to_owned()), serial),
+            explore: None,
         });
+    }
+
+    /// Opens an album by its uri (the explored album page): the lookup answers its first tracks
+    /// and its own description, which replace what the link knew. Opening the one already open
+    /// does nothing.
+    pub fn open_explored_album(
+        &mut self,
+        uri: &str,
+        name: &str,
+        images: &[ImageRef],
+        year: Option<u16>,
+    ) {
+        if self.open_album.as_ref().is_some_and(|o| o.id == uri) {
+            return;
+        }
+        let serial = self.ids.next().0;
+        self.open_album = Some(Open {
+            id: uri.to_owned(),
+            name: name.to_owned(),
+            images: images.to_vec(),
+            year,
+            tracks: Slot::new(Source::AlbumDetail(uri.to_owned()), serial),
+            explore: Some(Explore {
+                album: None,
+                more: Slot::idle(Source::Releases(String::new(), ReleaseGroup::All), serial),
+            }),
+        });
+    }
+
+    /// Opens an artist page by its uri; its header, popular tracks and releases load as
+    /// [`Self::pump`] sends the requests. Opening the one already open does nothing.
+    pub fn open_artist(&mut self, uri: &str, name: &str, images: &[ImageRef]) {
+        if self.open_artist.as_ref().is_some_and(|a| a.uri == uri) {
+            return;
+        }
+        let serial = self.ids.next().0;
+        let group = |g| Slot::idle(Source::Releases(uri.to_owned(), g), serial);
+        self.open_artist = Some(ArtistOpen {
+            uri: uri.to_owned(),
+            name: name.to_owned(),
+            images: images.to_vec(),
+            serial,
+            head: Fetch::new(),
+            popular: Vec::new(),
+            shown: Slot::fixed(Vec::new(), serial),
+            groups: GROUPS.map(group),
+        });
+    }
+
+    /// Asks for the tracks of the release `uri`; they come back through [`Self::take_play`].
+    pub fn play_release(&mut self, uri: &str, shuffle: bool, player: &PlayerHandle) {
+        if self.active.is_none() || self.autoplay.is_some() {
+            return;
+        }
+        let id = self.ids.next();
+        self.autoplay = Some((id, shuffle));
+        self.send(
+            player,
+            Request {
+                id,
+                query: LibraryQuery::Album {
+                    uri: uri.to_owned(),
+                },
+            },
+        );
+    }
+
+    /// The tracks a [`Self::play_release`] asked for, once they are in, and whether to shuffle.
+    pub fn take_play(&mut self) -> Option<(Vec<Track>, bool)> {
+        self.ready_play.take()
+    }
+
+    /// Whether a [`Self::play_release`] is waiting for its answer.
+    pub fn play_pending(&self) -> bool {
+        self.autoplay.is_some()
+    }
+
+    /// The first requests of the open artist and album pages: the artist's header, the first
+    /// page of each group once the header is in, the album's "More by" list.
+    fn explore_requests(&mut self) -> Vec<Request> {
+        let ids = &mut self.ids;
+        let mut out = Vec::new();
+        let first_page = |slot: &mut Slot<Album>, ids: &mut Ids, out: &mut Vec<Request>| {
+            if slot.next_offset == Some(0)
+                && slot.items.is_empty()
+                && let Some(r) = slot.request(ids)
+            {
+                out.push(r);
+            }
+        };
+        if let Some(a) = &mut self.open_artist {
+            if a.head.due() {
+                let id = ids.next();
+                a.head.pending = Some(id);
+                out.push(Request {
+                    id,
+                    query: LibraryQuery::Artist { uri: a.uri.clone() },
+                });
+            }
+            for slot in &mut a.groups {
+                first_page(slot, ids, &mut out);
+            }
+        }
+        if let Some(e) = self.open_album.as_mut().and_then(|o| o.explore.as_mut()) {
+            first_page(&mut e.more, ids, &mut out);
+        }
+        out
+    }
+
+    /// Asks for the artist's header again after it failed.
+    pub fn retry_artist(&mut self) {
+        if let Some(a) = &mut self.open_artist {
+            a.head.failed = false;
+        }
     }
 
     /// Starts a search: the results load from the start and an older search's request goes stale.
@@ -549,6 +867,7 @@ impl LibraryModel {
             images: Vec::new(),
             year: None,
             tracks: Slot::new(Source::Search(query.to_owned()), serial),
+            explore: None,
         });
     }
 
@@ -562,6 +881,7 @@ impl LibraryModel {
             ListKind::OpenPlaylist => self.open_playlist.as_mut()?.tracks.request(ids),
             ListKind::OpenAlbum => self.open_album.as_mut()?.tracks.request(ids),
             ListKind::Search => self.search.as_mut()?.tracks.request(ids),
+            ListKind::Releases(g) => self.open_artist.as_mut()?.groups[group_index(g)].request(ids),
         }
     }
 
@@ -594,6 +914,11 @@ impl LibraryModel {
             ListKind::Search => {
                 if let Some(o) = &mut self.search {
                     o.tracks.failed = false;
+                }
+            }
+            ListKind::Releases(g) => {
+                if let Some(a) = &mut self.open_artist {
+                    a.groups[group_index(g)].failed = false;
                 }
             }
         }
@@ -639,6 +964,14 @@ impl LibraryModel {
             .as_mut()
             .filter(|o| o.tracks.is_pending(request))
         {
+            // An album opened by uri answers with the album and its first tracks.
+            let result = match result {
+                Ok(LibraryPage::AlbumDetail(d)) => {
+                    o.named(d.album);
+                    Ok(LibraryPage::Tracks(d.tracks))
+                }
+                other => other,
+            };
             let Open {
                 name,
                 images,
@@ -657,6 +990,50 @@ impl LibraryModel {
             .filter(|o| o.tracks.is_pending(request))
         {
             o.tracks.finish(result, tracks_of);
+        } else if let Some(e) = self
+            .open_album
+            .as_mut()
+            .and_then(|o| o.explore.as_mut())
+            .filter(|e| e.more.is_pending(request))
+        {
+            e.more.finish(result, albums_of);
+        } else if let Some(a) = self
+            .open_artist
+            .as_mut()
+            .filter(|a| a.head.is_pending(request))
+        {
+            a.head.pending = None;
+            match result {
+                Ok(LibraryPage::Artist(page)) => {
+                    a.shown = Slot::fixed(
+                        page.popular.iter().take(POPULAR_SHOWN).cloned().collect(),
+                        a.serial,
+                    );
+                    a.popular = page.popular;
+                    let r = page.releases;
+                    a.groups[0].seed((r.items, r.next_offset, r.total));
+                    for g in &mut a.groups[1..] {
+                        g.begin();
+                    }
+                    a.head.data = Some(page.artist);
+                }
+                _ => a.head.failed = true,
+            }
+        } else if let Some(a) = self
+            .open_artist
+            .as_mut()
+            .filter(|a| a.groups.iter().any(|g| g.is_pending(request)))
+        {
+            if let Some(g) = a.groups.iter_mut().find(|g| g.is_pending(request)) {
+                g.finish(result, albums_of);
+            }
+        } else if self.autoplay.is_some_and(|(id, _)| id == request) {
+            let shuffle = self.autoplay.take().is_some_and(|(_, s)| s);
+            if let Ok(LibraryPage::AlbumDetail(d)) = result
+                && !d.tracks.items.is_empty()
+            {
+                self.ready_play = Some((d.tracks.items, shuffle));
+            }
         }
     }
 
@@ -705,6 +1082,8 @@ mod tests {
             duration_ms: 1000,
             images: vec![],
             year: None,
+            album_ref: None,
+            artists: vec![],
         }
     }
 
@@ -737,6 +1116,8 @@ mod tests {
                     eq: true,
                     search: true,
                     likes: false,
+                    explore: false,
+                    save_albums: false,
                 },
                 auth_steps: Vec::new(),
             },
@@ -1174,5 +1555,324 @@ mod tests {
             })),
         });
         assert_eq!(m.playlists.total(), Some(8));
+    }
+
+    // ---- exploring artists and albums
+
+    use whipspot_core::provider::{AlbumDetail, AlbumKind, AlbumPage, ArtistPage, EntityRef};
+
+    fn release(n: u32, kind: AlbumKind) -> Album {
+        Album {
+            id: format!("id{n}"),
+            uri: format!("p:album:{n}"),
+            name: format!("Release {n}"),
+            artist: "Ann".into(),
+            track_count: None,
+            images: vec![],
+            year: Some(2000 + n as u16),
+            artists: vec![EntityRef {
+                uri: "p:artist:1".into(),
+                name: "Ann".into(),
+            }],
+            kind,
+        }
+    }
+
+    fn releases(items: Vec<Album>, next: Option<u32>, total: Option<u32>) -> AlbumPage {
+        AlbumPage {
+            items,
+            skipped: 0,
+            next_offset: next,
+            total,
+        }
+    }
+
+    fn artist_page(popular: u32, first: AlbumPage) -> ArtistPage {
+        ArtistPage {
+            artist: Artist {
+                uri: "p:artist:1".into(),
+                name: "Ann".into(),
+                images: vec![],
+            },
+            popular: (1..=popular).map(track).collect(),
+            releases: first,
+        }
+    }
+
+    fn answer(m: &mut LibraryModel, request: RequestId, page: LibraryPage) {
+        m.push_page(LibraryAnswer {
+            request,
+            result: Ok(page),
+        });
+    }
+
+    #[test]
+    fn an_artist_asks_for_its_header_then_the_first_page_of_every_other_group() {
+        let mut m = ready();
+        m.open_artist("p:artist:1", "Ann", &[]);
+        // Nothing but the header is asked for at first, and only once.
+        let first = m.explore_requests();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].query,
+            LibraryQuery::Artist {
+                uri: "p:artist:1".into()
+            }
+        );
+        assert!(
+            m.explore_requests().is_empty(),
+            "one header request in flight"
+        );
+        assert!(m.open_artist.as_ref().is_some_and(|a| a.head().loading()));
+
+        let own = vec![release(1, AlbumKind::Album), release(2, AlbumKind::Single)];
+        answer(
+            &mut m,
+            first[0].id,
+            LibraryPage::Artist(artist_page(8, releases(own, None, Some(2)))),
+        );
+        let a = m.open_artist.as_ref().expect("open");
+        assert_eq!(a.artist().map(|x| x.name.as_str()), Some("Ann"));
+        // Every popular track is kept, five are listed.
+        assert_eq!((a.popular.len(), a.shown.items().len()), (8, POPULAR_SHOWN));
+        // The All list took the page that came with the header.
+        assert_eq!(a.releases(ReleaseGroup::All).items().len(), 2);
+        assert!(!a.releases(ReleaseGroup::All).has_more());
+
+        // Now the three other groups ask for their first page, each once.
+        let probes = m.explore_requests();
+        let groups: Vec<_> = probes
+            .iter()
+            .map(|r| match &r.query {
+                LibraryQuery::ArtistReleases { group, offset, .. } => (*group, *offset),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                (ReleaseGroup::Albums, 0),
+                (ReleaseGroup::Singles, 0),
+                (ReleaseGroup::AppearsOn, 0)
+            ]
+        );
+        assert!(m.explore_requests().is_empty());
+        // An answer lands in its own group; an empty group stays empty.
+        answer(
+            &mut m,
+            probes[1].id,
+            LibraryPage::Albums(releases(vec![release(2, AlbumKind::Single)], None, Some(1))),
+        );
+        answer(
+            &mut m,
+            probes[2].id,
+            LibraryPage::Albums(releases(vec![], None, Some(0))),
+        );
+        let a = m.open_artist.as_ref().expect("open");
+        assert_eq!(a.releases(ReleaseGroup::Singles).items().len(), 1);
+        assert!(a.releases(ReleaseGroup::AppearsOn).items().is_empty());
+        assert!(a.releases(ReleaseGroup::Albums).loading(), "still waiting");
+    }
+
+    #[test]
+    fn a_failed_header_leaves_the_groups_idle_and_retry_asks_again() {
+        let mut m = ready();
+        m.open_artist("p:artist:1", "Ann", &[]);
+        let req = m.explore_requests().remove(0);
+        m.push_page(LibraryAnswer {
+            request: req.id,
+            result: Err(LibraryError::new(LibErrorKind::Http, "x")),
+        });
+        let a = m.open_artist.as_ref().expect("open");
+        assert!(a.head().failed());
+        assert!(
+            m.explore_requests().is_empty(),
+            "a failed header waits for a retry"
+        );
+        m.retry_artist();
+        assert_eq!(m.explore_requests().len(), 1);
+    }
+
+    #[test]
+    fn opening_the_same_artist_again_keeps_what_loaded_and_another_replaces_it() {
+        let mut m = ready();
+        m.open_artist("p:artist:1", "Ann", &[]);
+        let req = m.explore_requests().remove(0);
+        answer(
+            &mut m,
+            req.id,
+            LibraryPage::Artist(artist_page(1, releases(vec![], None, Some(0)))),
+        );
+        m.open_artist("p:artist:1", "Ann", &[]);
+        assert!(m.open_artist.as_ref().is_some_and(|a| a.artist().is_some()));
+        m.open_artist("p:artist:2", "Bo", &[]);
+        let a = m.open_artist.as_ref().expect("open");
+        assert!(a.artist().is_none());
+        // The answer to the first artist's request is stale now.
+        let late = m.explore_requests();
+        assert_eq!(late.len(), 1, "the new artist asks for its own header");
+        answer(
+            &mut m,
+            req.id,
+            LibraryPage::Artist(artist_page(1, releases(vec![], None, Some(0)))),
+        );
+        assert!(m.open_artist.as_ref().is_some_and(|a| a.artist().is_none()));
+    }
+
+    #[test]
+    fn a_group_pages_on_and_a_failed_page_waits_for_its_retry() {
+        let mut m = ready();
+        m.open_artist("p:artist:1", "Ann", &[]);
+        let req = m.explore_requests().remove(0);
+        let all: Vec<_> = (1..=3).map(|n| release(n, AlbumKind::Album)).collect();
+        answer(
+            &mut m,
+            req.id,
+            LibraryPage::Artist(artist_page(0, releases(all, Some(3), Some(5)))),
+        );
+        let next = m
+            .next_page(ListKind::Releases(ReleaseGroup::All))
+            .expect("the second page is due");
+        assert_eq!(
+            next.query,
+            LibraryQuery::ArtistReleases {
+                uri: "p:artist:1".into(),
+                group: ReleaseGroup::All,
+                offset: 3
+            }
+        );
+        m.push_page(LibraryAnswer {
+            request: next.id,
+            result: Err(LibraryError::new(LibErrorKind::Http, "x")),
+        });
+        assert!(m.next_page(ListKind::Releases(ReleaseGroup::All)).is_none());
+        let a = m.open_artist.as_ref().expect("open");
+        assert!(a.releases(ReleaseGroup::All).failed());
+        assert_eq!(a.releases(ReleaseGroup::All).items().len(), 3);
+    }
+
+    fn detail(tracks_n: u32, next: Option<u32>) -> LibraryPage {
+        LibraryPage::AlbumDetail(AlbumDetail {
+            album: Album {
+                images: vec![ImageRef {
+                    url: "u".into(),
+                    width: Some(300),
+                    height: Some(300),
+                }],
+                ..release(7, AlbumKind::Album)
+            },
+            tracks: TrackPage {
+                items: (1..=tracks_n).map(track).collect(),
+                skipped: 0,
+                next_offset: next,
+                total: Some(tracks_n + next.map_or(0, |_| 5)),
+                truncated: false,
+            },
+        })
+    }
+
+    #[test]
+    fn an_album_opened_by_uri_looks_up_then_pages_its_tracks_by_id_and_asks_for_more_by() {
+        let mut m = ready();
+        m.open_explored_album("p:album:7", "Link name", &[], None);
+        let req = m.next_page(ListKind::OpenAlbum).expect("lookup");
+        assert_eq!(
+            req.query,
+            LibraryQuery::Album {
+                uri: "p:album:7".into()
+            }
+        );
+        assert!(
+            m.explore_requests().is_empty(),
+            "More by waits for the lookup"
+        );
+        answer(&mut m, req.id, detail(3, Some(3)));
+        let o = m.open_album.as_ref().expect("open");
+        // The lookup's own description replaced what the link knew; the first tracks are in.
+        assert_eq!((o.name.as_str(), o.year), ("Release 7", Some(2007)));
+        assert_eq!(o.images.len(), 1);
+        assert_eq!(o.tracks.items().len(), 3);
+        assert!(o.explore.as_ref().is_some_and(|e| e.album.is_some()));
+        // The next page is a plain tracks page by the album's id.
+        let more = m.next_page(ListKind::OpenAlbum).expect("next page");
+        assert_eq!(
+            more.query,
+            LibraryQuery::AlbumTracks {
+                id: "id7".into(),
+                offset: 3
+            }
+        );
+        // And the first artist's releases are due.
+        let by = m.explore_requests();
+        assert_eq!(
+            by.iter().map(|r| r.query.clone()).collect::<Vec<_>>(),
+            [LibraryQuery::ArtistReleases {
+                uri: "p:artist:1".into(),
+                group: ReleaseGroup::All,
+                offset: 0
+            }]
+        );
+        answer(
+            &mut m,
+            by[0].id,
+            LibraryPage::Albums(releases(
+                vec![release(7, AlbumKind::Album), release(8, AlbumKind::Album)],
+                None,
+                Some(2),
+            )),
+        );
+        let o = m.open_album.as_ref().expect("open");
+        let names: Vec<_> = crate::artist::more_by(o)
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        assert_eq!(names, ["id8"], "this album is not among its own 'More by'");
+        // Opening it again changes nothing; another album starts afresh.
+        m.open_explored_album("p:album:7", "x", &[], None);
+        assert!(
+            m.open_album
+                .as_ref()
+                .is_some_and(|o| o.tracks.items().len() == 3)
+        );
+        m.open_explored_album("p:album:9", "Other", &[], None);
+        assert!(
+            m.open_album
+                .as_ref()
+                .is_some_and(|o| o.tracks.items().is_empty())
+        );
+    }
+
+    #[test]
+    fn a_play_on_a_release_hands_its_tracks_over_once_and_asks_one_at_a_time() {
+        let mut m = ready();
+        // The request is built by `play_release`, which needs a player; drive the state it uses.
+        let id = m.next_request();
+        m.autoplay = Some((id, true));
+        answer(&mut m, id, detail(2, None));
+        let (tracks, shuffle) = m.take_play().expect("the tracks of the release");
+        assert_eq!((tracks.len(), shuffle), (2, true));
+        assert!(m.take_play().is_none());
+        assert!(!m.play_pending());
+        // An empty album plays nothing; a failed lookup neither.
+        let id = m.next_request();
+        m.autoplay = Some((id, false));
+        answer(&mut m, id, detail(0, None));
+        assert!(m.take_play().is_none() && !m.play_pending());
+        let id = m.next_request();
+        m.autoplay = Some((id, false));
+        m.push_page(LibraryAnswer {
+            request: id,
+            result: Err(LibraryError::new(LibErrorKind::Http, "x")),
+        });
+        assert!(m.take_play().is_none() && !m.play_pending());
+    }
+
+    #[test]
+    fn a_change_of_provider_drops_the_open_artist_and_album() {
+        let mut m = ready();
+        m.open_artist("p:artist:1", "Ann", &[]);
+        m.open_explored_album("p:album:7", "x", &[], None);
+        m.sync(Some("q"));
+        assert!(m.open_artist.is_none() && m.open_album.is_none());
     }
 }

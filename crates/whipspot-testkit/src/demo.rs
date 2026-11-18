@@ -10,10 +10,11 @@ use std::time::Duration;
 use whipspot_core::engine::{SourceInfo, SourceWriter, StreamFormat};
 use whipspot_core::provider::model::LoginState;
 use whipspot_core::provider::{
-    Album, AlbumPage, AuthFailure, AuthFlow, AuthStepInfo, AuthStepStatus, BoxFuture, Capabilities,
-    InputSpec, LibErrorKind, Library, LibraryError, LoginInput, Playback, PlaybackError, Playlist,
-    PlaylistPage, Provider, ProviderAuthStatus, ProviderContext, ProviderInfo, Readable, StepHint,
-    Track, TrackPage,
+    Album, AlbumDetail, AlbumKind, AlbumPage, Artist, ArtistPage, AuthFailure, AuthFlow,
+    AuthStepInfo, AuthStepStatus, BoxFuture, Capabilities, EntityRef, InputSpec, LibErrorKind,
+    Library, LibraryError, LoginInput, MAX_POPULAR, Playback, PlaybackError, Playlist,
+    PlaylistPage, Provider, ProviderAuthStatus, ProviderContext, ProviderInfo, Readable,
+    ReleaseGroup, StepHint, Track, TrackPage,
 };
 
 use crate::fake_art::demo_images;
@@ -84,9 +85,86 @@ const EXTRA_PLAYLISTS: [(&str, u32); 9] = [
 /// Albums 3 to 12: track counts (8 to 30); names come from `ALBUM_NAMES`.
 const EXTRA_ALBUM_TRACKS: [u32; 10] = [16, 11, 20, 8, 25, 14, 18, 22, 12, 28];
 
+/// Releases of `ARTISTS[EXTRA_ARTIST]` that are on no list of the library: they only show on the
+/// artist's page and open from it (name, kind, year, tracks). They give that page a discography
+/// with singles and a name too long for a tile.
+const EXTRA_ARTIST: usize = 5;
+const EXTRA_RELEASES: [(&str, AlbumKind, u16, u32); 4] = [
+    ("Glass Hours", AlbumKind::Album, 2004, 9),
+    ("Lantern Walk (with Velmora)", AlbumKind::Single, 1989, 2),
+    ("North Lamp Live", AlbumKind::Single, 2001, 6),
+    (
+        "The Complete Harbour Recordings, Volume Two (Remastered Deluxe Edition)",
+        AlbumKind::Album,
+        1998,
+        12,
+    ),
+];
+
 /// The id of the album at `ALBUM_NAMES[idx]`.
 fn album_id(idx: usize) -> String {
     format!("demo-album-{}", idx + 1)
+}
+
+/// The uri of the album at `ALBUM_NAMES[idx]`.
+fn album_uri(idx: usize) -> String {
+    format!("demo:album:{}", idx + 1)
+}
+
+/// The uri of `ARTISTS[idx]`.
+fn artist_uri(idx: usize) -> String {
+    format!("demo:artist:{idx}")
+}
+
+fn artist_ref(idx: usize) -> EntityRef {
+    EntityRef {
+        uri: artist_uri(idx),
+        name: ARTISTS[idx].to_owned(),
+    }
+}
+
+fn album_ref(idx: usize) -> EntityRef {
+    EntityRef {
+        uri: album_uri(idx),
+        name: ALBUM_NAMES[idx].to_owned(),
+    }
+}
+
+/// The index of the artist an album is by.
+fn album_artist(idx: usize) -> usize {
+    match idx {
+        0 => 0,
+        1 => 5,
+        _ => idx % ARTISTS.len(),
+    }
+}
+
+/// How the album is listed on its own artist's page.
+fn album_kind(idx: usize) -> AlbumKind {
+    match idx % 4 {
+        2 => AlbumKind::Single,
+        3 => AlbumKind::Compilation,
+        _ => AlbumKind::Album,
+    }
+}
+
+/// The artist an album also features, when it does: it lists the album as "appears on".
+fn album_guest(idx: usize) -> Option<usize> {
+    (idx % 5 == 4).then(|| (album_artist(idx) + 1) % ARTISTS.len())
+}
+
+/// The index of the demo album a uri names (`demo:album:<n>`).
+fn parse_album_uri(uri: &str) -> Option<usize> {
+    let n: usize = uri.strip_prefix("demo:album:")?.parse().ok()?;
+    (1..=ALBUM_NAMES.len() + EXTRA_RELEASES.len())
+        .contains(&n)
+        .then(|| n - 1)
+}
+
+/// The index of the demo artist a uri names (`demo:artist:<i>`).
+fn parse_artist_uri(uri: &str) -> Option<usize> {
+    let i: usize = uri.strip_prefix("demo:artist:")?.parse().ok()?;
+    (i < ARTISTS.len()).then_some(i)
 }
 
 /// An invented release year, 1990..=2024, by album index.
@@ -99,6 +177,7 @@ fn set_album(t: &mut Track, idx: usize) {
     t.album = ALBUM_NAMES[idx].to_owned();
     t.images = demo_images(&album_id(idx));
     t.year = Some(album_year(idx));
+    t.album_ref = Some(album_ref(idx));
 }
 
 /// A demo track `n` (uri `demo:track:<n>`); names and artists are invented words.
@@ -116,6 +195,8 @@ fn track(n: u32) -> Track {
         duration_ms: 120_000 + (u64::from(n) * 7_919) % 240_000,
         images: vec![],
         year: None,
+        artists: vec![artist_ref(i % ARTISTS.len())],
+        album_ref: None,
     };
     set_album(&mut t, i % ALBUM_NAMES.len());
     t
@@ -155,14 +236,63 @@ fn playlist(
 fn album(idx: usize, artist: &str, tracks: Vec<Track>) -> (Album, Vec<Track>) {
     let id = album_id(idx);
     let a = Album {
+        uri: album_uri(idx),
         name: ALBUM_NAMES[idx].into(),
         artist: artist.into(),
         track_count: Some(tracks.len() as u32),
         images: demo_images(&id),
         year: Some(album_year(idx)),
         id,
+        artists: vec![artist_ref(album_artist(idx))],
+        kind: album_kind(idx),
     };
     (a, tracks)
+}
+
+/// The extra release `i` (see [`EXTRA_RELEASES`]) with `count` tracks numbered from `next`: its
+/// tracks credit its artist, and every third one a second artist too.
+fn extra_release(next: &mut u32, i: usize) -> (Album, Vec<Track>) {
+    let (name, kind, year, count) = EXTRA_RELEASES[i];
+    let idx = ALBUM_NAMES.len() + i;
+    let id = album_id(idx);
+    let me = artist_ref(EXTRA_ARTIST);
+    let guest = artist_ref((EXTRA_ARTIST + 1) % ARTISTS.len());
+    let album_ref = EntityRef {
+        uri: album_uri(idx),
+        name: name.to_owned(),
+    };
+    let tracks = (0..count)
+        .map(|k| {
+            let mut t = take(next, 1, None).remove(0);
+            t.album = name.to_owned();
+            t.images = demo_images(&id);
+            t.year = Some(year);
+            t.album_ref = Some(album_ref.clone());
+            t.artists = vec![me.clone()];
+            if k % 3 == 2 {
+                t.artists.push(guest.clone());
+            }
+            t.artist = t
+                .artists
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            t
+        })
+        .collect::<Vec<_>>();
+    let album = Album {
+        uri: album_uri(idx),
+        name: name.to_owned(),
+        artist: ARTISTS[EXTRA_ARTIST].to_owned(),
+        track_count: Some(count),
+        images: demo_images(&id),
+        year: Some(year),
+        id,
+        artists: vec![me],
+        kind,
+    };
+    (album, tracks)
 }
 
 /// The demo's whole library, built once.
@@ -170,6 +300,8 @@ struct Content {
     liked: Vec<Track>,
     playlists: Vec<(Playlist, Vec<Track>)>,
     albums: Vec<(Album, Vec<Track>)>,
+    /// Releases that are on no list (see [`EXTRA_RELEASES`]), indexed after the albums.
+    extras: Vec<(Album, Vec<Track>)>,
     /// Every track above, for search.
     all: Vec<Track>,
 }
@@ -204,6 +336,9 @@ impl Content {
             let tracks = take(&mut n, count, Some(idx));
             albums.push(album(idx, ARTISTS[idx % ARTISTS.len()], tracks));
         }
+        let extras = (0..EXTRA_RELEASES.len())
+            .map(|i| extra_release(&mut n, i))
+            .collect();
         let all: Vec<Track> = liked
             .iter()
             .cloned()
@@ -214,7 +349,16 @@ impl Content {
             liked,
             playlists,
             albums,
+            extras,
             all,
+        }
+    }
+
+    /// The album (or extra release) at `idx` of the uris' numbering.
+    fn release(&self, idx: usize) -> Option<&(Album, Vec<Track>)> {
+        match idx.checked_sub(self.albums.len()) {
+            None => self.albums.get(idx),
+            Some(i) => self.extras.get(i),
         }
     }
 }
@@ -324,6 +468,54 @@ impl DemoProvider {
         self
     }
 
+    /// The releases of artist `a` in `group`: its own albums, singles and compilations, and the
+    /// albums it appears on (those list the album's own artist, with the kind `AppearsOn`).
+    fn releases(&self, a: usize, group: ReleaseGroup) -> Vec<Album> {
+        let own = |k: &[AlbumKind]| {
+            let mut v = self
+                .content
+                .albums
+                .iter()
+                .enumerate()
+                .filter(|(i, (alb, _))| album_artist(*i) == a && k.contains(&alb.kind))
+                .map(|(_, (alb, _))| alb.clone())
+                .collect::<Vec<_>>();
+            if a == EXTRA_ARTIST {
+                v.extend(
+                    self.content
+                        .extras
+                        .iter()
+                        .filter(|(alb, _)| k.contains(&alb.kind))
+                        .map(|(alb, _)| alb.clone()),
+                );
+            }
+            v
+        };
+        let guest = || {
+            self.content
+                .albums
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| album_guest(*i) == Some(a))
+                .map(|(_, (alb, _))| Album {
+                    kind: AlbumKind::AppearsOn,
+                    ..alb.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        use AlbumKind::{Album as Lp, Compilation, Single};
+        match group {
+            ReleaseGroup::Albums => own(&[Lp, Compilation]),
+            ReleaseGroup::Singles => own(&[Single]),
+            ReleaseGroup::AppearsOn => guest(),
+            ReleaseGroup::All => {
+                let mut all = own(&[Lp, Compilation, Single]);
+                all.extend(guest());
+                all
+            }
+        }
+    }
+
     fn require_login(&self) -> Result<(), LibraryError> {
         if self.logged_in.load(Ordering::Relaxed) {
             Ok(())
@@ -396,6 +588,8 @@ impl Provider for DemoProvider {
                 eq: false,
                 search: true,
                 likes: true,
+                explore: true,
+                save_albums: true,
             },
             auth_steps: vec![
                 AuthStepInfo {
@@ -620,6 +814,7 @@ impl Library for DemoProvider {
                 .content
                 .albums
                 .iter()
+                .chain(&self.content.extras)
                 .find(|(a, _)| a.id == id)
                 .ok_or_else(unknown_id)?;
             let (items, next_offset, total) = page(tracks, offset);
@@ -690,5 +885,73 @@ impl Library for DemoProvider {
     }
     fn can_change_likes(&self) -> bool {
         self.likes_writable
+    }
+    fn artist<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<ArtistPage, LibraryError>> {
+        Box::pin(async move {
+            self.require_login()?;
+            let a = parse_artist_uri(uri).ok_or_else(unknown_id)?;
+            let mine = artist_uri(a);
+            let popular: Vec<Track> = self
+                .content
+                .all
+                .iter()
+                .filter(|t| t.artists.iter().any(|r| r.uri == mine))
+                .take(MAX_POPULAR)
+                .cloned()
+                .collect();
+            let all = self.releases(a, ReleaseGroup::All);
+            let (items, next_offset, total) = page(&all, 0);
+            Ok(ArtistPage {
+                artist: Artist {
+                    uri: mine,
+                    name: ARTISTS[a].to_owned(),
+                    images: demo_images(&format!("demo-artist-{a}")),
+                },
+                popular,
+                releases: AlbumPage {
+                    items,
+                    skipped: 0,
+                    next_offset,
+                    total,
+                },
+            })
+        })
+    }
+    fn album<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<AlbumDetail, LibraryError>> {
+        Box::pin(async move {
+            self.require_login()?;
+            let idx = parse_album_uri(uri).ok_or_else(unknown_id)?;
+            let (album, tracks) = self.content.release(idx).ok_or_else(unknown_id)?;
+            let (items, next_offset, total) = page(tracks, 0);
+            Ok(AlbumDetail {
+                album: album.clone(),
+                tracks: TrackPage {
+                    items,
+                    skipped: 0,
+                    next_offset,
+                    total,
+                    truncated: false,
+                },
+            })
+        })
+    }
+    fn artist_releases<'a>(
+        &'a self,
+        uri: &'a str,
+        group: ReleaseGroup,
+        offset: u32,
+    ) -> BoxFuture<'a, Result<AlbumPage, LibraryError>> {
+        Box::pin(async move {
+            self.require_login()?;
+            let a = parse_artist_uri(uri).ok_or_else(unknown_id)?;
+            let all = self.releases(a, group);
+            let (items, next_offset, total) = page(&all, offset);
+            Ok(AlbumPage {
+                items,
+                skipped: 0,
+                next_offset,
+                total,
+            })
+        })
     }
 }

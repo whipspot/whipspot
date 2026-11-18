@@ -85,12 +85,21 @@ pub enum Route {
         images: Vec<ImageRef>,
     },
     /// An album; `images` and `year` come from the card that opened it and fill its tracks (MD72).
+    /// With a `uri` (the provider can explore) it is addressed by that uri and shows the explored
+    /// album page; without one it is the plain album page, addressed by `id`.
     Album {
         id: String,
+        uri: String,
         name: String,
         artist: String,
         images: Vec<ImageRef>,
         year: Option<u16>,
+    },
+    /// An artist's page, opened by a link; `images` are the portraits the link knew (often none).
+    Artist {
+        uri: String,
+        name: String,
+        images: Vec<ImageRef>,
     },
     Queue,
     Account,
@@ -111,10 +120,34 @@ impl Route {
             Route::Search => "Search",
             Route::Playlist { .. } => "Playlist",
             Route::Album { .. } => "Album",
+            Route::Artist { .. } => "Artist",
             Route::Queue => "Queue",
             Route::Account => "Accounts",
             Route::Settings => "Settings",
             Route::Equalizer => "Equalizer",
+        }
+    }
+
+    /// The route's name for a breadcrumb: the playlist, album or artist's own name when it has
+    /// one, else [`Self::title`].
+    pub fn label(&self) -> String {
+        match self {
+            Route::Playlist { name, .. }
+            | Route::Album { name, .. }
+            | Route::Artist { name, .. }
+                if !name.is_empty() =>
+            {
+                name.clone()
+            }
+            other => other.title().to_owned(),
+        }
+    }
+
+    /// What identifies an album route: its uri when it has one, else its id.
+    pub fn album_key(&self) -> Option<&str> {
+        match self {
+            Route::Album { id, uri, .. } => Some(if uri.is_empty() { id } else { uri }),
+            _ => None,
         }
     }
 }
@@ -127,7 +160,11 @@ pub fn tab_of(route: &Route) -> Option<Tab> {
         Route::Albums | Route::Album { .. } => Some(Tab::Albums),
         Route::Liked => Some(Tab::Liked),
         Route::Search => Some(Tab::Search),
-        Route::Queue | Route::Account | Route::Settings | Route::Equalizer => None,
+        Route::Artist { .. }
+        | Route::Queue
+        | Route::Account
+        | Route::Settings
+        | Route::Equalizer => None,
     }
 }
 
@@ -166,6 +203,11 @@ impl History {
         self.at = self.entries.len() - 1;
     }
 
+    /// The entry before the current one, if any (a breadcrumb names it).
+    pub fn previous(&self) -> Option<&Route> {
+        self.at.checked_sub(1).map(|i| &self.entries[i])
+    }
+
     /// Goes one entry back; whether there was one.
     pub fn back(&mut self) -> bool {
         let ok = self.can_back();
@@ -201,6 +243,14 @@ mod tests {
         Route::Playlist {
             id: format!("p{n}"),
             name: format!("List {n}"),
+            images: vec![],
+        }
+    }
+
+    fn artist(name: &str) -> Route {
+        Route::Artist {
+            uri: format!("demo:artist:{name}"),
+            name: name.into(),
             images: vec![],
         }
     }
@@ -274,6 +324,7 @@ mod tests {
     fn h2_tab_of_every_route() {
         let album = Route::Album {
             id: "a".into(),
+            uri: String::new(),
             name: "A".into(),
             artist: "B".into(),
             images: vec![cover("a")],
@@ -287,6 +338,7 @@ mod tests {
             (album, Some(Tab::Albums)),
             (Route::Liked, Some(Tab::Liked)),
             (Route::Search, Some(Tab::Search)),
+            (artist("Velmora"), None),
             (Route::Queue, None),
             (Route::Account, None),
             (Route::Settings, None),
@@ -303,6 +355,7 @@ mod tests {
     fn r3_routes_carry_their_covers_and_compare_by_all_fields() {
         let album = |images: Vec<ImageRef>, year| Route::Album {
             id: "a".into(),
+            uri: String::new(),
             name: "A".into(),
             artist: "B".into(),
             images,
@@ -349,5 +402,31 @@ mod tests {
         assert_eq!(Tab::from_key("account"), Tab::Home);
         assert_eq!(Tab::from_key("nonsense"), Tab::Home);
         assert_eq!(Tab::from_key(""), Tab::Home);
+    }
+
+    #[test]
+    fn e1_breadcrumbs_name_the_previous_entry_and_albums_are_keyed_by_uri() {
+        let mut h = History::new(Route::Home);
+        assert!(h.previous().is_none());
+        h.push(artist("Velmora"));
+        assert_eq!(h.previous(), Some(&Route::Home));
+        let linked = Route::Album {
+            id: String::new(),
+            uri: "demo:album:1".into(),
+            name: "Low Tide".into(),
+            artist: String::new(),
+            images: vec![],
+            year: None,
+        };
+        h.push(linked.clone());
+        assert_eq!(h.previous().map(Route::label), Some("Velmora".to_owned()));
+        assert_eq!(linked.album_key(), Some("demo:album:1"));
+        assert_eq!(linked.label(), "Low Tide");
+        assert_eq!(Route::Liked.album_key(), None);
+        assert_eq!(Route::Home.label(), "Home");
+        assert_eq!(artist("").label(), "Artist");
+        assert_eq!(tab_of(&artist("x")), None);
+        // Going back leaves a previous entry only while there is one.
+        assert!(h.back() && h.back() && h.previous().is_none());
     }
 }

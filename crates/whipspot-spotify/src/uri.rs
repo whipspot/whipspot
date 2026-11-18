@@ -14,6 +14,26 @@ pub fn parse_track_uri(input: &str) -> Option<String> {
     is_base62_id(id).then(|| format!("{TRACK_PREFIX}{id}"))
 }
 
+/// The id of an exact `spotify:artist:<22 base62>` URI; anything else (a bare id, another type,
+/// extra segments, whitespace) is `None`.
+pub fn artist_uri_id(input: &str) -> Option<&str> {
+    typed_uri_id(input, "spotify:artist:")
+}
+
+/// The id of an exact `spotify:album:<22 base62>` URI; see [`artist_uri_id`].
+pub fn album_uri_id(input: &str) -> Option<&str> {
+    typed_uri_id(input, "spotify:album:")
+}
+
+fn typed_uri_id<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    input.strip_prefix(prefix).filter(|id| is_base62_id(id))
+}
+
+/// True for an exact `spotify:track:` or `spotify:album:` URI, the two kinds the library can save.
+pub fn is_saveable_uri(input: &str) -> bool {
+    album_uri_id(input).is_some() || parse_track_uri(input).is_some_and(|c| c == input)
+}
+
 /// True for a bare 22-char base62 id (playlist ids, track ids in the Web API).
 pub fn is_spotify_id(input: &str) -> bool {
     is_base62_id(input)
@@ -78,6 +98,29 @@ mod tests {
     fn rejects_non_alnum_ascii() {
         assert_eq!(parse_track_uri("4uLU6hMCjMI75M1A2tKUQ-"), None);
         assert_eq!(parse_track_uri("4uLU6hMCjMI75M1A2tKU/C"), None);
+    }
+
+    #[test]
+    fn typed_uris_are_exact() {
+        assert_eq!(artist_uri_id(&format!("spotify:artist:{ID}")), Some(ID));
+        assert_eq!(album_uri_id(&format!("spotify:album:{ID}")), Some(ID));
+        for bad in [
+            ID.to_owned(),
+            format!("spotify:album:{ID}"),
+            format!("spotify:artist:{ID}\n"),
+            format!("spotify:artist:{ID}:{ID}"),
+            format!("spotify:artist:{}", &ID[..21]),
+            format!("spotify:artist:../{}", &ID[3..]),
+            "spotify:artist:".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(artist_uri_id(&bad), None, "{bad:?}");
+        }
+        assert_eq!(album_uri_id(&format!("spotify:artist:{ID}")), None);
+        assert!(is_saveable_uri(&format!("spotify:album:{ID}")));
+        assert!(is_saveable_uri(&format!("spotify:track:{ID}")));
+        assert!(!is_saveable_uri(&format!("spotify:artist:{ID}")));
+        assert!(!is_saveable_uri(ID));
     }
 
     #[test]

@@ -213,6 +213,8 @@ mod tests {
                         duration_ms: 180000,
                         images: vec![],
                         year: Some(1999),
+                        album_ref: None,
+                        artists: vec![],
                     },
                 },
                 format!(

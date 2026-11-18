@@ -10,6 +10,7 @@
 mod account;
 mod anim;
 mod art;
+mod artist;
 mod background;
 mod browse;
 mod caption;
@@ -23,6 +24,7 @@ mod idle;
 mod layout;
 pub mod library;
 mod likes;
+mod link;
 mod lyrics;
 mod media;
 mod notices;
@@ -83,6 +85,7 @@ pub use equalizer::EqMeters;
 pub use history::{Route, Tab};
 pub use idle::Mode;
 pub use library::ProviderChoice;
+pub use link::LinkGlyph;
 pub use queue::QueueDrag;
 
 /// The key the host knows the diagnostics window by (`WindowSpec::key`, `WindowView::take_toggles`).
@@ -97,6 +100,23 @@ const TITLE_LEFT: f32 = 16.0;
 const EQ_DEMO_CLOCK: f64 = 0.37;
 /// A cross-fade side below this share of its full alpha is not drawn (and takes no input).
 const FADE_EPS: f32 = 0.02;
+/// The id scope the browse sheet draws in, kept alive while the idle view hides the sheet.
+const SHEET_SCOPE: &str = "sheet";
+/// Draws the sheet in [`SHEET_SCOPE`]: a keep-alive scope, so its state carries the scope on its
+/// chain, ended again before the frame finishes, so on a drawn frame state the sheet did not use
+/// is dropped as anywhere else. Only [`hold_sheet`] keeps it.
+fn draw_sheet<R>(ui: &mut Ui<'_>, f: impl FnOnce(&mut Ui<'_>) -> R) -> R {
+    let r = ui.keep_alive(SHEET_SCOPE, f);
+    ui.end_keep_alive(SHEET_SCOPE);
+    r
+}
+
+/// A frame the idle view skips the sheet: what the sheet used when it was last drawn (its scroll
+/// offsets) survives this frame.
+fn hold_sheet(ui: &mut Ui<'_>) {
+    ui.mark_alive(SHEET_SCOPE);
+}
+
 /// The frame interval while a cross-fade runs (about 60 Hz).
 const FADE_FRAME: Duration = Duration::from_millis(16);
 /// How often the Skins card's status line is redrawn while a skin loads (D5).
@@ -150,6 +170,10 @@ pub enum Hover {
     QueueRow(usize),
     /// The top bar's provider menu, open.
     ProviderMenu,
+    /// The `nth` artist or album link drawn in the frame (counted in drawing order), as when the
+    /// pointer is over it, or, with `focus`, as when it has keyboard focus; its gradient is at
+    /// `phase` (0..1 of a loop).
+    Link { nth: usize, focus: bool, phase: f32 },
 }
 
 /// What the demo forces: the view, a hover state and the panes' forced states
@@ -164,6 +188,8 @@ pub struct Force {
     pub queue_drag: Option<QueueDrag>,
     /// The first-run tour's card at this index of its list, shown whatever the saved flag says.
     pub tour: Option<usize>,
+    /// The artist page's selected release chip, whatever was clicked.
+    pub group: Option<whipspot_core::provider::ReleaseGroup>,
 }
 
 /// How much of a music service's streaming bitrate the user allows (MD88). The view shows the
@@ -444,6 +470,39 @@ impl NativeUi {
         self.last_mode
     }
 
+    /// Starts or stops recording the glyphs of lit artist and album links (the demo prints them).
+    pub fn trace_links(&mut self, on: bool) {
+        link::trace(on);
+    }
+
+    /// The boxes (x, y, w, h in logical px) of the artist and album links drawn in the last frame.
+    pub fn link_boxes(&self) -> Vec<[f32; 4]> {
+        link::boxes()
+    }
+
+    /// Starts or stops recording the boxes the artist and album pages draw (the demo's layout
+    /// check reads them with [`Self::page_boxes`]).
+    pub fn trace_page_boxes(&mut self, on: bool) {
+        draw::page_boxes_enable(on);
+    }
+
+    /// The boxes (x, y, w, h in logical px, page coordinates) the artist or album page drew in the
+    /// last frame, whether each is text, and the inner bounds of the sheet they must stay within.
+    pub fn page_boxes(&self, window: (f32, f32)) -> (Vec<(bool, [f32; 4])>, [f32; 4]) {
+        let sheet = Layout::new(Rect::new(0.0, 0.0, window.0, window.1)).sheet;
+        let vp = grid::viewport(sheet);
+        let boxes = draw::page_boxes()
+            .into_iter()
+            .map(|(k, r)| (k == draw::BoxKind::Text, [r.x, r.y, r.w, r.h]))
+            .collect();
+        (boxes, [vp.x, vp.y, vp.w, vp.h])
+    }
+
+    /// The glyphs of the lit links of the last frame; empty unless [`Self::trace_links`] is on.
+    pub fn take_link_trace(&mut self) -> Vec<LinkGlyph> {
+        link::take_trace()
+    }
+
     /// Forces the view and a hover state, whatever the idle machine and the pointer say (the
     /// demo's dumps only; an all-`None` value hands control back).
     #[doc(hidden)]
@@ -615,6 +674,11 @@ impl NativeUi {
         let now = ui.time();
         // How much motion this frame plays: the toolkit's tier, none in the demo's forced views.
         anim::set_pace(anim::pace_of(ui.tier(), self.force.mode.is_some()));
+        draw::page_boxes_frame();
+        link::begin_frame(match self.force.hover {
+            Some(Hover::Link { nth, focus, phase }) => Some(link::ForcedLink { nth, focus, phase }),
+            _ => None,
+        });
         self.art.note_time(now);
         self.track
             .update(state.current.as_ref().map(|n| n.track.uri.as_str()), now);
@@ -738,20 +802,27 @@ impl NativeUi {
                 folders,
             };
             let force = self.force;
-            with_alpha(ui, 1.0 - fade, |ui| {
-                sheet_surface(ui.painter(), &look, layout.sheet);
-                settings_out = self.browse.frame(
-                    ui,
-                    layout.sheet,
-                    &look,
-                    &state,
-                    player,
-                    &mut self.art,
-                    &mut self.likes,
-                    (&view, &force),
-                );
+            // The sheet's per-widget state (the scroll offsets of the grids, the home page and the
+            // track lists) survives the frames the idle view skips it (`hold_sheet`), and only
+            // those.
+            draw_sheet(ui, |ui| {
+                with_alpha(ui, 1.0 - fade, |ui| {
+                    sheet_surface(ui.painter(), &look, layout.sheet);
+                    settings_out = self.browse.frame(
+                        ui,
+                        layout.sheet,
+                        &look,
+                        &state,
+                        player,
+                        &mut self.art,
+                        &mut self.likes,
+                        (&view, &force),
+                    );
+                });
             });
             anchors = self.browse.anchors();
+        } else {
+            hold_sheet(ui);
         }
         if let Some(theme) = settings_out.theme {
             self.set_theme(theme);
@@ -814,7 +885,12 @@ impl NativeUi {
         }
         // The media control fades with the sheet and is gone in the idle view (v1 round 2); a
         // forced hover (the demo) keeps it up.
-        let media_alpha = media_alpha(fade, self.force.hover.is_some());
+        let media_alpha = media_alpha(
+            fade,
+            self.force
+                .hover
+                .is_some_and(|h| !matches!(h, Hover::Link { .. })),
+        );
         if media_alpha > FADE_EPS {
             let out = with_alpha(ui, media_alpha, |ui| {
                 self.media.frame(
@@ -883,6 +959,13 @@ impl NativeUi {
         );
 
         self.notices.draw(ui);
+        // A clicked artist or album link opens its page (the library switches to its provider
+        // first when another one shows).
+        for clicked in link::take_clicks() {
+            self.browse.open_ref(&clicked, &state.providers);
+            self.wake = true;
+            ui.request_repaint_at(now + FADE_FRAME);
+        }
     }
 }
 
@@ -1084,5 +1167,93 @@ mod tests {
         assert!(fresh.tour.running(), "an unseen tour starts at launch");
         assert!(UiPrefs::default().auto_hide);
         assert!(NativeUi::new(chrome, Tab::Home).auto_hide());
+    }
+
+    /// Draws one frame of a scrolling page the way the shell draws the sheet: inside
+    /// [`SHEET_SCOPE`] when `drawn`, and with the scope merely held when the idle view skips it.
+    /// Returns the page's scroll offset when it was drawn.
+    fn sheet_frame(
+        h: &mut lune_ui::testing::UiHarness,
+        ms: u64,
+        drawn: bool,
+        scoped: bool,
+    ) -> Option<f64> {
+        page_frame(h, ms, drawn, scoped, "page")
+    }
+
+    /// [`sheet_frame`] drawing the page `key`.
+    fn page_frame(
+        h: &mut lune_ui::testing::UiHarness,
+        ms: u64,
+        drawn: bool,
+        scoped: bool,
+        key: &str,
+    ) -> Option<f64> {
+        use lune_ui::widgets::scroll_area::{Extent, ScrollOptions};
+        h.at_ms(ms);
+        let mut offset = None;
+        h.frame(|ui| {
+            let mut page = |ui: &mut Ui<'_>| {
+                let vp = Rect::new(0.0, 0.0, 200.0, 100.0);
+                let area = ui.scroll_area(("grid", key), vp, &ScrollOptions::default(), |_, _| {
+                    (
+                        (),
+                        Extent {
+                            width: 200.0,
+                            height: 1000.0,
+                        },
+                    )
+                });
+                offset = Some(area.offset.1);
+            };
+            match (drawn, scoped) {
+                (true, true) => draw_sheet(ui, page),
+                (true, false) => page(ui),
+                (false, true) => hold_sheet(ui),
+                (false, false) => {}
+            }
+        });
+        offset
+    }
+
+    #[test]
+    fn a_scrolled_page_keeps_its_offset_across_the_frames_the_idle_view_skips_the_sheet() {
+        let run = |scoped: bool| {
+            let mut h = lune_ui::testing::UiHarness::new((200.0, 100.0));
+            sheet_frame(&mut h, 0, true, scoped);
+            h.input.pointer_to(50.0, 50.0);
+            h.input.scroll_pixels(0.0, -300.0);
+            sheet_frame(&mut h, 16, true, scoped);
+            let before = sheet_frame(&mut h, 32, true, scoped).expect("drawn");
+            // Idle: the sheet is not drawn for several frames.
+            for i in 0..6 {
+                assert_eq!(sheet_frame(&mut h, 100 + i * 16, false, scoped), None);
+            }
+            let after = sheet_frame(&mut h, 300, true, scoped).expect("drawn");
+            (before, after)
+        };
+        let (before, after) = run(true);
+        assert!(before > 0.0, "the page scrolled ({before})");
+        assert_eq!(after, before, "the offset survives the idle frames");
+        // The instrument can fail: without the scope the offset is dropped.
+        let (before, after) = run(false);
+        assert!(before > 0.0 && after == 0.0, "{before} -> {after}");
+    }
+
+    #[test]
+    fn a_page_not_drawn_while_the_sheet_is_drawn_loses_its_offset() {
+        // As on main: a tab switch (another page drawn in the sheet) drops the page's state;
+        // only the idle frames hold it.
+        let mut h = lune_ui::testing::UiHarness::new((200.0, 100.0));
+        page_frame(&mut h, 0, true, true, "a");
+        h.input.pointer_to(50.0, 50.0);
+        h.input.scroll_pixels(0.0, -300.0);
+        page_frame(&mut h, 16, true, true, "a");
+        let before = page_frame(&mut h, 32, true, true, "a").expect("drawn");
+        assert!(before > 0.0, "the page scrolled ({before})");
+        page_frame(&mut h, 48, true, true, "b");
+        page_frame(&mut h, 64, true, true, "b");
+        let after = page_frame(&mut h, 80, true, true, "a").expect("drawn");
+        assert_eq!(after, 0.0, "the offset was dropped with the page");
     }
 }

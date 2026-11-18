@@ -12,6 +12,8 @@ pub struct FakeProvider {
     has_library: bool,
     caps_library: bool,
     caps_likes: bool,
+    caps_explore: bool,
+    caps_save_albums: bool,
     hosts: &'static [&'static str],
     pub calls: Mutex<Vec<String>>,
     /// Logged at each load as `owner <id or ->` (the engine's source owner then).
@@ -26,6 +28,8 @@ impl FakeProvider {
             has_library: library,
             caps_library: library,
             caps_likes: false,
+            caps_explore: false,
+            caps_save_albums: false,
             hosts: &[],
             calls: Mutex::new(vec![]),
             owner: None,
@@ -53,6 +57,18 @@ impl FakeProvider {
     /// Declare `caps.likes` (the library keeps the default likes methods).
     pub fn with_caps_likes(mut self, v: bool) -> Self {
         self.caps_likes = v;
+        self
+    }
+
+    /// Declare `caps.explore` (the library keeps the default explore methods).
+    pub fn with_caps_explore(mut self, v: bool) -> Self {
+        self.caps_explore = v;
+        self
+    }
+
+    /// Declare `caps.save_albums`.
+    pub fn with_caps_save_albums(mut self, v: bool) -> Self {
+        self.caps_save_albums = v;
         self
     }
 
@@ -88,6 +104,8 @@ impl Provider for FakeProvider {
                 eq: false,
                 search: self.caps_library,
                 likes: self.caps_likes,
+                explore: self.caps_explore,
+                save_albums: self.caps_save_albums,
             },
             auth_steps: vec![AuthStepInfo {
                 id: "main",

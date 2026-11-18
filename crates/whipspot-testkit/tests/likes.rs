@@ -175,6 +175,8 @@ async fn k3_a_new_current_item_reads_its_liked_state() {
         duration_ms: 180_000,
         images: vec![],
         year: None,
+        album_ref: None,
+        artists: vec![],
     };
     r.h.dispatch(PlayerAction::PlayItem {
         context: vec![track],

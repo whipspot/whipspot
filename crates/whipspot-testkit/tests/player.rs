@@ -87,6 +87,8 @@ fn track(uri: &str) -> Track {
         duration_ms: 180_000,
         images: vec![],
         year: None,
+        album_ref: None,
+        artists: vec![],
     }
 }
 
@@ -638,6 +640,42 @@ async fn a_library_request_answers_with_its_request_id() {
             assert!(result.is_err());
         }
         other => panic!("{other:?}"),
+    }
+}
+
+// The explore queries are dispatched like the others and answer with their request id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explore_requests_answer_with_their_request_id() {
+    let r = rig();
+    let queries = [
+        LibraryQuery::Artist {
+            uri: "fakea:artist:1".into(),
+        },
+        LibraryQuery::Album {
+            uri: "fakea:album:1".into(),
+        },
+        LibraryQuery::ArtistReleases {
+            uri: "fakea:artist:1".into(),
+            group: whipspot_core::provider::ReleaseGroup::All,
+            offset: 0,
+        },
+    ];
+    for (i, query) in queries.into_iter().enumerate() {
+        let id = RequestId(20 + i as u64);
+        r.h.dispatch(PlayerAction::Library {
+            request: id,
+            provider: "fakea".into(),
+            query,
+        });
+        let n = wait_notice(&r.h, |n| matches!(n, PlayerNotice::LibraryPage { .. })).await;
+        match n {
+            PlayerNotice::LibraryPage { request, result } => {
+                assert_eq!(request, id);
+                // The fake is logged out.
+                assert!(result.is_err());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
 

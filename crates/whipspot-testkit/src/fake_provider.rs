@@ -14,10 +14,10 @@ use whipspot_core::events::UiEvent;
 
 use crate::Gate;
 use whipspot_core::provider::{
-    AlbumPage, AuthFailure, AuthFlow, AuthStepInfo, AuthStepStatus, BoxFuture, Capabilities,
-    LibErrorKind, Library, LibraryError, LoginInput, Playback, PlaybackError, PlaylistPage,
-    Provider, ProviderAuthStatus, ProviderContext, ProviderInfo, Remote, RemoteCommand, TrackPage,
-    model::LoginState,
+    AlbumDetail, AlbumPage, ArtistPage, AuthFailure, AuthFlow, AuthStepInfo, AuthStepStatus,
+    BoxFuture, Capabilities, LibErrorKind, Library, LibraryError, LoginInput, Playback,
+    PlaybackError, PlaylistPage, Provider, ProviderAuthStatus, ProviderContext, ProviderInfo,
+    ReleaseGroup, Remote, RemoteCommand, TrackPage, model::LoginState,
 };
 
 pub struct FakeProvider {
@@ -26,6 +26,7 @@ pub struct FakeProvider {
     glyph: whipspot_core::provider::ProviderGlyph,
     has_library: bool,
     caps_library: bool,
+    caps_explore: bool,
     /// Every trait call in order (`load <uri> <play> <pos>`, `play`, `pause`, `stop`,
     /// `seek <ms>`, `preload:<uri>`, `login <step>`, `logout <step>`, `liked <n>`,
     /// `set_liked <uri> <bool>`, `check_changes`, and with a remote `remote play`, `remote pause`, `remote next`,
@@ -63,6 +64,7 @@ impl FakeProvider {
             glyph: whipspot_core::provider::ProviderGlyph::Other,
             has_library: library,
             caps_library: library,
+            caps_explore: false,
             calls: Mutex::new(vec![]),
             fail_uris: Mutex::new(HashSet::new()),
             load_delay: Mutex::new(None),
@@ -174,6 +176,13 @@ impl FakeProvider {
         self
     }
 
+    /// Declare `caps.explore`: the explore lookups answer like every other library call (always
+    /// logged out). Needs a library.
+    pub fn with_caps_explore(mut self, v: bool) -> Self {
+        self.caps_explore = v;
+        self
+    }
+
     fn log(&self, s: impl Into<String>) {
         self.calls.lock().unwrap().push(s.into());
     }
@@ -191,6 +200,8 @@ impl Provider for FakeProvider {
                 eq: false,
                 search: self.caps_library,
                 likes: self.likes.lock().unwrap().on,
+                explore: self.caps_explore,
+                save_albums: false,
             },
             auth_steps: vec![AuthStepInfo {
                 id: "main",
@@ -364,6 +375,20 @@ impl Library for FakeProvider {
         _q: &'a str,
         _o: u32,
     ) -> BoxFuture<'a, Result<TrackPage, LibraryError>> {
+        Box::pin(async { Err(logged_out()) })
+    }
+    fn artist<'a>(&'a self, _uri: &'a str) -> BoxFuture<'a, Result<ArtistPage, LibraryError>> {
+        Box::pin(async { Err(logged_out()) })
+    }
+    fn album<'a>(&'a self, _uri: &'a str) -> BoxFuture<'a, Result<AlbumDetail, LibraryError>> {
+        Box::pin(async { Err(logged_out()) })
+    }
+    fn artist_releases<'a>(
+        &'a self,
+        _uri: &'a str,
+        _group: ReleaseGroup,
+        _offset: u32,
+    ) -> BoxFuture<'a, Result<AlbumPage, LibraryError>> {
         Box::pin(async { Err(logged_out()) })
     }
     fn liked<'a>(&'a self, uris: &'a [String]) -> BoxFuture<'a, Result<Vec<bool>, LibraryError>> {

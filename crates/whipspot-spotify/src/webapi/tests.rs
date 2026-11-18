@@ -25,6 +25,7 @@ use crate::{
     web_auth::TokenError,
 };
 use whipspot_core::credential_store::CredentialStore;
+use whipspot_core::provider::AlbumKind;
 use whipspot_testkit::MemoryStore;
 
 const A: &str = "4uLU6hMCjMI75M1A2tKUQC";
@@ -837,17 +838,18 @@ async fn invalid_uris_are_false_and_never_sent() {
     let uris = [
         bad.clone(),
         uri(A),
-        format!("spotify:album:{B}"),
+        format!("spotify:artist:{B}"),
         A.to_owned(),
+        format!("spotify:album:{B}\n"),
     ];
     assert_eq!(
         r.api.liked(&uris).await.unwrap(),
-        [false, true, false, false]
+        [false, true, false, false, false]
     );
     let lines = r.mock.lines();
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains(&enc(A)));
-    assert!(!lines[0].contains("bad") && !lines[0].contains("album"));
+    assert!(!lines[0].contains("bad") && !lines[0].contains("artist"));
     // Nothing valid: no request at all.
     assert_eq!(r.api.liked(&[bad]).await.unwrap(), [false]);
     assert_eq!(r.api.liked(&[]).await.unwrap(), Vec::<bool>::new());
@@ -1135,4 +1137,314 @@ async fn fingerprint_without_a_web_login_sends_no_request() {
     assert_eq!(r.api.fingerprint().await, Err(Error::WebNotLoggedIn));
     assert_eq!(r.mock.count(), 0);
     assert_eq!(r.web.refreshes.load(SeqCst), 0);
+}
+
+// ---------------------------------------------------------------- explore (artists, albums)
+
+const ART: &str = "0OdUWJ0sBjDrqHygGUXeCF";
+
+fn art_uri() -> String {
+    format!("spotify:artist:{ART}")
+}
+
+fn alb_uri(id: &str) -> String {
+    format!("spotify:album:{id}")
+}
+
+fn artist_body(name: &str) -> serde_json::Value {
+    json!({"id": ART, "name": name, "images": [{"url": "https://i.scdn.co/p", "width": 640}]})
+}
+
+fn release_entry(id: &str, group: &str) -> serde_json::Value {
+    json!({"id": id, "name": "R", "album_type": "album", "album_group": group,
+           "artists": [{"uri": art_uri(), "name": "Maker"}]})
+}
+
+fn popular_body(n: usize) -> serde_json::Value {
+    let tracks: Vec<_> = (0..n)
+        .map(|i| {
+            json!({"type": "track", "uri": format!("spotify:track:{i:0>22}"), "name": "P",
+                   "duration_ms": 1000, "artists": [{"uri": art_uri(), "name": "Maker"}]})
+        })
+        .collect();
+    json!({"tracks": {"items": tracks, "total": 99, "next": null}})
+}
+
+/// X1: an artist page is three requests, in this order, on the documented paths only.
+#[tokio::test]
+async fn an_artist_page_asks_the_artist_its_releases_and_a_filtered_search() {
+    let releases = items_page(
+        vec![release_entry(A, "album"), release_entry(B, "single")],
+        json!("n"),
+    );
+    let r = rig(vec![
+        ok(artist_body("Maker")),
+        ok(releases),
+        ok(popular_body(12)),
+    ]);
+    let page = r.api.artist_page(&art_uri()).await.unwrap();
+    assert_eq!(
+        r.mock.lines(),
+        [
+            format!("GET /artists/{ART} HTTP/1.1"),
+            format!(
+                "GET /artists/{ART}/albums?include_groups=album,single,compilation,appears_on&limit=50&offset=0 HTTP/1.1"
+            ),
+            "GET /search?type=track&limit=10&q=artist%3A%22Maker%22 HTTP/1.1".to_owned(),
+        ]
+    );
+    assert_eq!(page.artist.name, "Maker");
+    assert_eq!(page.releases.items.len(), 2);
+    assert_eq!(page.releases.next_offset, Some(2));
+    assert_eq!(page.popular.len(), 10);
+    // The bearer travels in the header only.
+    for h in r.mock.hits.lock().unwrap().iter() {
+        assert_eq!(h.authorization.as_deref(), Some("Bearer web-access-1"));
+        assert!(!h.request_line.contains("web-access"));
+    }
+}
+
+/// X2: quotes in the name never reach the query, and an odd name is percent-encoded.
+#[tokio::test]
+async fn the_popular_query_strips_quotes_and_encodes_the_name() {
+    let r = rig(vec![
+        ok(artist_body("\"Weird\" & Co")),
+        ok(items_page(vec![], json!(null))),
+        ok(popular_body(0)),
+    ]);
+    r.api.artist_page(&art_uri()).await.unwrap();
+    assert_eq!(
+        r.mock.lines()[2],
+        "GET /search?type=track&limit=10&q=artist%3A%22Weird+%26+Co%22 HTTP/1.1"
+    );
+}
+
+/// X3: the Popular list is the one part that may fail; a rate limit still fails the page.
+#[tokio::test]
+async fn a_failed_popular_search_leaves_the_list_empty_but_a_429_fails_the_page() {
+    let none = || ok(items_page(vec![], json!(null)));
+    let r = rig(vec![
+        ok(artist_body("Maker")),
+        none(),
+        status(500),
+        ok(artist_body("Maker")),
+        none(),
+        ok(json!({"unexpected": true})),
+        ok(artist_body("Maker")),
+        none(),
+        too_many(Some("7")),
+    ]);
+    assert!(
+        r.api
+            .artist_page(&art_uri())
+            .await
+            .unwrap()
+            .popular
+            .is_empty()
+    );
+    assert!(
+        r.api
+            .artist_page(&art_uri())
+            .await
+            .unwrap()
+            .popular
+            .is_empty()
+    );
+    assert!(matches!(
+        r.api.artist_page(&art_uri()).await,
+        Err(Error::RateLimited {
+            retry_after_secs: 7
+        })
+    ));
+}
+
+/// X4: a bad uri or offset sends nothing; a foreign artist body is not the artist.
+#[tokio::test]
+async fn explore_arguments_are_validated_before_any_request() {
+    let r = rig(vec![
+        ok(artist_body("Maker")),
+        ok(json!({"id": B, "name": "Other"})),
+    ]);
+    for bad in [
+        "",
+        ART,
+        &format!("spotify:album:{ART}"),
+        &format!("spotify:artist:{ART}\n"),
+        &format!("spotify:artist:{}", &ART[..21]),
+        "spotify:artist:../../me",
+        &format!("spotify:artist:{}", "9".repeat(5000)),
+    ] {
+        assert_eq!(
+            r.api.artist_page(bad).await,
+            Err(Error::InvalidId),
+            "{bad:?}"
+        );
+        assert_eq!(
+            r.api.artist_releases(bad, ReleaseGroup::All, 0).await,
+            Err(Error::InvalidId)
+        );
+    }
+    for bad in [
+        "",
+        A,
+        &art_uri(),
+        &format!("spotify:album:{A}/x"),
+        "spotify:album:%2e%2e",
+    ] {
+        assert_eq!(r.api.album(bad).await, Err(Error::InvalidId), "{bad:?}");
+    }
+    assert_eq!(
+        r.api
+            .artist_releases(&art_uri(), ReleaseGroup::All, MAX_ROWS)
+            .await,
+        Err(Error::InvalidOffset)
+    );
+    assert_eq!(r.mock.count(), 0);
+    // The answer for another artist than the one asked for is refused.
+    assert_eq!(
+        r.api.artist_page(&format!("spotify:artist:{B}")).await,
+        Err(Error::UnexpectedShape)
+    );
+    assert_eq!(r.mock.count(), 1);
+}
+
+/// X5: the release groups map onto the documented `include_groups`, paged by the offset given.
+#[tokio::test]
+async fn release_groups_and_offsets_reach_the_request() {
+    let r = rig(vec![
+        ok(items_page(vec![release_entry(A, "album")], json!(null))),
+        ok(items_page(vec![release_entry(A, "single")], json!(null))),
+        ok(items_page(vec![release_entry(A, "appears_on")], json!("n"))),
+    ]);
+    let albums = r
+        .api
+        .artist_releases(&art_uri(), ReleaseGroup::Albums, 50)
+        .await
+        .unwrap();
+    let singles = r
+        .api
+        .artist_releases(&art_uri(), ReleaseGroup::Singles, 0)
+        .await
+        .unwrap();
+    let guest = r
+        .api
+        .artist_releases(&art_uri(), ReleaseGroup::AppearsOn, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.mock.lines(),
+        [
+            format!(
+                "GET /artists/{ART}/albums?include_groups=album,compilation&limit=50&offset=50 HTTP/1.1"
+            ),
+            format!("GET /artists/{ART}/albums?include_groups=single&limit=50&offset=0 HTTP/1.1"),
+            format!(
+                "GET /artists/{ART}/albums?include_groups=appears_on&limit=50&offset=100 HTTP/1.1"
+            ),
+        ]
+    );
+    assert_eq!(albums.items[0].kind, AlbumKind::Album);
+    assert_eq!(singles.items[0].kind, AlbumKind::Single);
+    assert_eq!(
+        (guest.items[0].kind, guest.next_offset),
+        (AlbumKind::AppearsOn, Some(101))
+    );
+}
+
+/// X6: an album is one request; its tracks carry the album's name and link.
+#[tokio::test]
+async fn an_album_is_one_request_and_names_itself_on_its_tracks() {
+    let simple = json!({"type": "track", "uri": format!("spotify:track:{B}"), "name": "One",
+        "duration_ms": 1000, "artists": [{"uri": art_uri(), "name": "Maker"}]});
+    let body = json!({"id": A, "name": "The Album", "album_type": "album", "total_tracks": 1,
+        "artists": [{"uri": art_uri(), "name": "Maker"}], "release_date": "2001",
+        "tracks": {"items": [simple], "total": 1, "next": null}});
+    let r = rig(vec![ok(body), status(404), status(403)]);
+    let d = r.api.album(&alb_uri(A)).await.unwrap();
+    assert_eq!(r.mock.lines(), [format!("GET /albums/{A} HTTP/1.1")]);
+    assert_eq!(d.album.uri, alb_uri(A));
+    assert_eq!(d.tracks.items[0].album, "The Album");
+    assert_eq!(
+        d.tracks.items[0].album_ref.as_ref().map(|x| x.uri.clone()),
+        Some(alb_uri(A))
+    );
+    assert_eq!(r.api.album(&alb_uri(A)).await, Err(Error::Http(404)));
+    assert_eq!(r.api.album(&alb_uri(A)).await, Err(Error::AccessDenied));
+}
+
+/// X7: a 429 on any explore call closes the gate for the others.
+#[tokio::test]
+async fn a_429_on_an_explore_call_closes_the_gate() {
+    let r = rig(vec![too_many(Some("9"))]);
+    assert!(matches!(
+        r.api.album(&alb_uri(A)).await,
+        Err(Error::RateLimited { .. })
+    ));
+    assert!(matches!(
+        r.api.artist_page(&art_uri()).await,
+        Err(Error::RateLimited { .. })
+    ));
+    assert!(matches!(
+        r.api
+            .artist_releases(&art_uri(), ReleaseGroup::All, 0)
+            .await,
+        Err(Error::RateLimited { .. })
+    ));
+    assert_eq!(r.mock.count(), 1);
+}
+
+/// X8: albums are saved and read back through the same two calls as tracks, strict uri only.
+#[tokio::test]
+async fn albums_are_saved_and_checked_like_tracks() {
+    let r = rig(vec![ok(json!([true, false])), ok(json!({})), ok(json!({}))]);
+    let album = alb_uri(A);
+    assert_eq!(
+        r.api.liked(&[album.clone(), uri(B)]).await.unwrap(),
+        [true, false]
+    );
+    r.api.set_liked(&album, true).await.unwrap();
+    r.api.set_liked(&album, false).await.unwrap();
+    let e = |u: &str| url::form_urlencoded::byte_serialize(u.as_bytes()).collect::<String>();
+    assert_eq!(
+        r.mock.lines(),
+        [
+            format!(
+                "GET /me/library/contains?uris={},{} HTTP/1.1",
+                e(&album),
+                enc(B)
+            ),
+            format!("PUT /me/library?uris={} HTTP/1.1", e(&album)),
+            format!("DELETE /me/library?uris={} HTTP/1.1", e(&album)),
+        ]
+    );
+    // An artist, a bare id and an album uri with junk are not saveable.
+    for bad in [
+        art_uri(),
+        A.to_owned(),
+        format!("{album}x"),
+        format!("{album}\n"),
+    ] {
+        assert_eq!(
+            r.api.set_liked(&bad, true).await,
+            Err(Error::InvalidId),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(r.mock.count(), 3);
+}
+
+#[test]
+fn waits_read_as_seconds_minutes_or_hours() {
+    assert_eq!(super::wait_text(26), "26 s");
+    assert_eq!(super::wait_text(89), "89 s");
+    assert_eq!(super::wait_text(90), "2 min");
+    assert_eq!(super::wait_text(3600), "1 h");
+    assert_eq!(super::wait_text(44_515), "12 h 22 min");
+    assert_eq!(
+        Error::RateLimited {
+            retry_after_secs: 44_515
+        }
+        .to_string(),
+        "Spotify is rate-limiting this app. Try again in about 12 h 22 min."
+    );
 }

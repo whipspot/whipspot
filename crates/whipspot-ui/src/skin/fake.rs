@@ -177,6 +177,8 @@ pub(crate) fn with_current(mut state: PlayerState, duration_ms: u64) -> PlayerSt
             duration_ms,
             images: Vec::new(),
             year: None,
+            album_ref: None,
+            artists: vec![],
         },
         provider: "test",
         source_format: None,

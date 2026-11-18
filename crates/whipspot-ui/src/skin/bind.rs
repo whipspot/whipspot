@@ -266,6 +266,8 @@ mod tests {
                 duration_ms,
                 images: Vec::new(),
                 year: None,
+                album_ref: None,
+                artists: vec![],
             },
             provider: "test",
             source_format: None,

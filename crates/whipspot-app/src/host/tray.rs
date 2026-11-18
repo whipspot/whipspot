@@ -960,6 +960,8 @@ mod tests {
             duration_ms: 200_000,
             images: vec![],
             year: None,
+            album_ref: None,
+            artists: vec![],
         };
         h.dispatch(PlayerAction::PlayItem {
             context: vec![track(1), track(2)],

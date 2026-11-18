@@ -37,7 +37,9 @@ use lune_ui::ui::Ui;
 use lune_ui::window::{glass_attributes, panel_attributes};
 use whipspot_core::player::{PlayerAction, PlayerHandle};
 use whipspot_core::skin::{PanelWindows, ScreenPoint};
-use whipspot_ui::skin::{FrontChange, OPEN_FAILED, PanelPlan, SkinStatus, SkinUi, pixel_scale};
+use whipspot_ui::skin::{
+    FrontChange, OPEN_FAILED, PanelPlan, SkinStatus, SkinUi, pixel_scale, trace,
+};
 use whipspot_ui::title::{WindowTitle, window_title};
 use whipspot_ui::tray::{TrayMenu, TrayRequest};
 use whipspot_ui::{Chrome, DIAGNOSTICS_KEY, DiagnosticsUi, NativeUi};
@@ -54,7 +56,7 @@ pub use panel_view::PanelView;
 pub use tray::smoke as tray_smoke;
 
 use frame::UiState;
-use panels::{HostPanelWindows, PanelSet, physical};
+use panels::{FOLLOW_TICK, HostPanelWindows, PanelSet, physical};
 use title::TitleMarquee;
 use tray::{TrayControl, route_tray_events};
 
@@ -390,6 +392,11 @@ struct Win<'a> {
     flow: ControlFlow,
     /// What the OS title shows, and when it rotates (MD52).
     title: TitleMarquee,
+    /// Whether the window is maximised, read from the OS when it opens and on each resize, never
+    /// per frame: on macOS winit answers for a borderless window by swapping its style mask to
+    /// titled and back, which rebuilds the window's frame view (most of a frame's time) and drops
+    /// a mouse release that is under way. A skin panel is never maximised and never asks.
+    maximized: bool,
 }
 
 impl Win<'_> {
@@ -566,6 +573,48 @@ impl<'p, 'a> App<'p, 'a> {
         self.fallback.is_some() || self.skin.as_deref().is_some_and(SkinUi::pending)
     }
 
+    /// Checks the buttons held on the skin panels against the OS's own button state (macOS): a
+    /// button the OS says is up gets the release the window never got, through the panel's
+    /// translator as a real one would (so a skin button acts and a list sees its release), and a
+    /// panel left with no button down ends its drag or resize. Nothing when the OS cannot say.
+    fn os_buttons_up(&mut self) {
+        let Some(set) = self.set.as_mut() else {
+            return;
+        };
+        if !set.buttons.any_panel() {
+            return;
+        }
+        let os = platform::mouse_buttons_down();
+        let ids = set.ids();
+        for (i, id) in ids.into_iter().enumerate() {
+            let released = set.buttons.os_released(i, os);
+            if released.is_empty() {
+                continue;
+            }
+            let mut all_up = false;
+            for &button in &released {
+                all_up |= set.buttons.set(i, button, false);
+                if trace::enabled() {
+                    trace::line(format_args!(
+                        "os-release panel={i} button={}",
+                        trace_button(button)
+                    ));
+                }
+            }
+            if let Some(win) = self.wins.get_mut(&id) {
+                for &button in &released {
+                    win.translator.mouse_input(ElementState::Released, button);
+                }
+                if !win.hidden {
+                    win.window.request_redraw();
+                }
+            }
+            if all_up && let Some(skin) = self.skin.as_deref_mut() {
+                skin.buttons_up(i);
+            }
+        }
+    }
+
     /// The loop's control flow: the earliest ask of any window, the marquee's next rotation,
     /// the smoke's deadline, the skin poll and the panels' pointer followers.
     fn set_flow(&self, event_loop: &ActiveEventLoop) {
@@ -582,7 +631,7 @@ impl<'p, 'a> App<'p, 'a> {
         if self.polling() {
             flow = merge_flow(flow, ControlFlow::WaitUntil(self.next_poll));
         }
-        if let Some(set) = self.set.as_ref().filter(|s| s.follows()) {
+        if let Some(set) = self.set.as_ref().filter(|s| s.ticks(platform::OS_BUTTONS)) {
             flow = merge_flow(flow, ControlFlow::WaitUntil(set.next_tick));
         }
         if let Some(tray) = &self.tray {
@@ -659,9 +708,11 @@ impl<'p, 'a> App<'p, 'a> {
         let surface = WindowSurface::new(&shared.gpu, raw, (size.width, size.height))?;
         let frame = FrameRenderer::new(&mut shared.gpu, surface.format());
         let id = window.id();
+        let maximized = slot.panel().is_none() && window.is_maximized();
         self.wins.insert(
             id,
             Win {
+                maximized,
                 translator: Translator::new(size, window.scale_factor()),
                 output: OutputState::new(),
                 clipboard: Clipboard::new(),
@@ -724,7 +775,7 @@ impl<'p, 'a> App<'p, 'a> {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let size = win.surface.size();
         let scale = win.window.scale_factor();
-        let maximized = win.window.is_maximized();
+        let maximized = win.maximized;
         view.set_maximized(maximized);
         let input = win.translator.take(self.start.elapsed());
         view.images(&mut shared.gpu);
@@ -1146,6 +1197,13 @@ impl<'p, 'a> App<'p, 'a> {
         };
         if panel == 0 {
             let k = pixel_scale(scale);
+            let (upp_before, upp_after) = set.leader_rescaled();
+            if trace::enabled() {
+                trace::line(format_args!(
+                    "scale panel=0 factor={scale} k={}->{k} upp={upp_before}->{upp_after}",
+                    set.k
+                ));
+            }
             if k != set.k {
                 set.k = k;
                 for i in 1..set.len() {
@@ -1153,7 +1211,7 @@ impl<'p, 'a> App<'p, 'a> {
                 }
                 set.reshape_all();
                 if let Some(skin) = self.skin.as_deref_mut() {
-                    skin.rescaled(k);
+                    skin.rescaled(k, upp_before);
                 }
             }
         } else {
@@ -1378,11 +1436,19 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
             if self.polling() && self.next_poll <= now + DEADLINE_SLACK {
                 self.poll_front(event_loop);
             }
-            if let Some(set) = self.set.as_mut()
-                && set.follows()
-                && set.next_tick <= now + DEADLINE_SLACK
-            {
-                set.follow_tick();
+            let due = self.set.as_ref().is_some_and(|s| {
+                s.ticks(platform::OS_BUTTONS) && s.next_tick <= now + DEADLINE_SLACK
+            });
+            if due {
+                // A release the OS saw but the window never got first, so a panel freed by it
+                // follows the pointer again on this same tick.
+                self.os_buttons_up();
+                if let Some(set) = self.set.as_mut() {
+                    if set.follows() {
+                        set.follow_tick();
+                    }
+                    set.next_tick = Instant::now() + FOLLOW_TICK;
+                }
             }
             if let Some(tray) = &mut self.tray {
                 tray.due(now);
@@ -1410,8 +1476,34 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
                 }
                 return;
             }
+            WindowEvent::MouseInput { state, button, .. } if panel.is_some() => {
+                let (i, pressed) = (panel.unwrap_or_default(), *state == ElementState::Pressed);
+                let all_up = self
+                    .set
+                    .as_mut()
+                    .is_some_and(|set| set.buttons.set(i, *button, pressed));
+                // A drag or resize the panel holds ends here even when the toolkit's release
+                // never comes (the skin then ignores it).
+                if all_up && let Some(skin) = self.skin.as_deref_mut() {
+                    skin.buttons_up(i);
+                }
+                if trace::enabled()
+                    && let Some(win) = self.wins.get(&id)
+                {
+                    trace::line(format_args!(
+                        "button panel={i} pressed={pressed} factor={}",
+                        win.window.scale_factor()
+                    ));
+                }
+            }
             WindowEvent::Focused(focused) if panel.is_some() => {
                 let (i, focused) = (panel.unwrap_or_default(), *focused);
+                if !focused
+                    && self.set.as_mut().is_some_and(|set| set.buttons.clear(i))
+                    && let Some(skin) = self.skin.as_deref_mut()
+                {
+                    skin.buttons_up(i);
+                }
                 if let Some(skin) = self.skin.as_deref_mut() {
                     skin.focused(i, focused);
                 }
@@ -1466,6 +1558,9 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
         };
         if let WindowEvent::Resized(size) = &event {
             win.surface.resize(&shared.gpu, size.width, size.height);
+            if win.slot.panel().is_none() {
+                win.maximized = win.window.is_maximized();
+            }
         }
         win.translator.window_event(&event);
         if !win.hidden {
@@ -1483,6 +1578,20 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
             skin.keep_report(&HostPanelWindows::new(set));
         }
         self.close_set();
+    }
+}
+
+/// A mouse button as a number for the skin trace: 0 left, 1 right, 2 middle, 3 back, 4 forward,
+/// then the other buttons by their own number.
+fn trace_button(button: winit::event::MouseButton) -> u16 {
+    use winit::event::MouseButton;
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Right => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Back => 3,
+        MouseButton::Forward => 4,
+        MouseButton::Other(n) => n,
     }
 }
 

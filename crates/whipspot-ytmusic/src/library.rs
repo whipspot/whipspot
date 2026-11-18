@@ -1,5 +1,7 @@
 //! The library of the user's YouTube Music account, over InnerTube (D6): liked songs, playlists,
-//! saved albums, the tracks of a playlist or album, song search, and likes.
+//! saved albums, the tracks of a playlist or album, song search, and likes, and the exploring of
+//! artists and albums by URI (an artist page, an album page, an artist's releases; saving an
+//! album is a like of its audio playlist).
 //!
 //! Every call is one or two InnerTube requests, made on a blocking thread. A list is paged by
 //! continuation: the token that leads to offset N of a list is kept (per list and offset), so a
@@ -18,7 +20,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use whipspot_core::provider::{
-    AlbumPage, BoxFuture, LibErrorKind, Library, LibraryError, PlaylistPage, Track, TrackPage,
+    Album, AlbumDetail, AlbumPage, Artist, ArtistPage, BoxFuture, EntityRef, LibErrorKind, Library,
+    LibraryError, PlaylistPage, ReleaseGroup, Track, TrackPage,
 };
 use whipspot_core::text::display_text;
 
@@ -36,6 +39,7 @@ const MSG_SHAPE: &str = "YouTube Music's answer was not readable";
 const MSG_INVALID: &str = "Invalid id";
 const MSG_NO_POSITION: &str = "That position is not in the list";
 const MSG_INTERNAL: &str = "Internal error";
+const MSG_NO_ALBUM_SAVE: &str = "This album cannot be saved";
 
 /// A list stops after this many rows, as Spotify's does.
 pub const MAX_ROWS: u32 = 2000;
@@ -44,6 +48,14 @@ pub const MAX_REWALK_PAGES: usize = 20;
 const MAX_QUERY_CHARS: usize = 200;
 const MAX_LIKES: usize = 20_000;
 const MAX_ALBUM_HEADERS: usize = 64;
+/// Artist pages kept (each holds at most [`parse::MAX_ITEMS`] releases of two groups).
+const MAX_ARTIST_PAGES: usize = 16;
+/// Releases of an artist in one page of `artist_releases`.
+pub const RELEASE_PAGE: usize = 50;
+/// The most pages of a "More" grid followed.
+const MAX_MORE_PAGES: usize = 5;
+/// The most album pages one `liked` call fetches for albums it has not seen.
+const MAX_ALBUM_PROBES: usize = 8;
 /// InnerTube's filter for song results (`EgWKAQ` + songs + spelling correction on).
 const SONGS_FILTER: &str = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
 
@@ -56,6 +68,8 @@ enum ListKey {
     Playlist(String),
     Album(String),
     Search(String),
+    /// The full list of one group of an artist's releases: the "More" page's browse id and params.
+    Releases(String, String),
 }
 
 impl ListKey {
@@ -71,6 +85,7 @@ impl ListKey {
             ListKey::Playlist(id) => ("browse", json!({"browseId": format!("VL{id}")})),
             ListKey::Album(id) => ("browse", json!({"browseId": id})),
             ListKey::Search(q) => ("search", json!({"query": q, "params": SONGS_FILTER})),
+            ListKey::Releases(id, params) => ("browse", json!({"browseId": id, "params": params})),
         }
     }
 }
@@ -82,6 +97,15 @@ struct State {
     tokens: HashMap<(ListKey, u32), Continuation>,
     likes: HashMap<String, bool>,
     album_headers: HashMap<String, AlbumHeader>,
+    /// By channel id.
+    artists: HashMap<String, ArtistEntry>,
+}
+
+/// An artist page as parsed, and the full release lists once they were read.
+struct ArtistEntry {
+    page: Arc<parse::ArtistParse>,
+    albums: Option<Arc<Vec<Album>>>,
+    singles: Option<Arc<Vec<Album>>>,
 }
 
 struct Core {
@@ -234,7 +258,8 @@ impl Core {
     ) -> Result<TrackPage, LibraryError> {
         let parse = |resp: &Value| {
             let header = album.and_then(|id| match parse::album_header(resp) {
-                Some(h) => {
+                Some(mut h) => {
+                    h.uri = ids::album_uri(id).unwrap_or_default();
                     let mut st = lock(&self.state);
                     if st.album_headers.len() >= MAX_ALBUM_HEADERS {
                         st.album_headers.clear();
@@ -312,19 +337,35 @@ impl Core {
 
     fn liked(&self, uris: &[String]) -> Result<Vec<bool>, LibraryError> {
         self.begin()?;
-        let st = lock(&self.state);
-        Ok(uris
-            .iter()
-            .map(|u| {
-                ids::parse_track_uri(u)
-                    .and_then(|id| st.likes.get(id))
-                    .copied()
-                    .unwrap_or(false)
-            })
-            .collect())
+        let mut probes = 0usize;
+        let mut out = Vec::with_capacity(uris.len());
+        for u in uris {
+            let answer = if let Some(id) = ids::parse_track_uri(u) {
+                lock(&self.state).likes.get(id).copied().unwrap_or(false)
+            } else if let Some(id) = ids::parse_album_uri(u) {
+                let cached = lock(&self.state).album_headers.get(id).cloned();
+                let header = match cached {
+                    Some(h) => Some(h),
+                    // An album not seen yet costs one page; past the bound it reads as not saved.
+                    None if probes < MAX_ALBUM_PROBES => {
+                        probes += 1;
+                        Some(self.album_header_for(id)?)
+                    }
+                    None => None,
+                };
+                header.and_then(|h| h.saved).unwrap_or(false)
+            } else {
+                false
+            };
+            out.push(answer);
+        }
+        Ok(out)
     }
 
     fn set_liked(&self, uri: &str, liked: bool) -> Result<(), LibraryError> {
+        if let Some(id) = ids::parse_album_uri(uri) {
+            return self.set_album_liked(id, liked);
+        }
         let id = ids::parse_track_uri(uri).ok_or_else(invalid)?;
         self.begin()?;
         let endpoint = if liked {
@@ -341,6 +382,234 @@ impl Core {
         }
         st.likes.insert(id.to_owned(), liked);
         Ok(())
+    }
+
+    /// The header of an album page: kept, else read with the first page of its tracks.
+    fn album_header_for(&self, id: &str) -> Result<AlbumHeader, LibraryError> {
+        if let Some(h) = lock(&self.state).album_headers.get(id).cloned() {
+            return Ok(h);
+        }
+        self.track_page(ListKey::Album(id.to_owned()), 0, Some(id))?;
+        lock(&self.state)
+            .album_headers
+            .get(id)
+            .cloned()
+            .ok_or_else(shape)
+    }
+
+    /// Saves or removes an album: a like of its audio playlist, which the page itself names. An
+    /// album whose page names none cannot be saved (a playlist id is never guessed).
+    fn set_album_liked(&self, id: &str, liked: bool) -> Result<(), LibraryError> {
+        self.begin()?;
+        let header = self.album_header_for(id)?;
+        let playlist = header
+            .audio_playlist_id
+            .ok_or_else(|| LibraryError::new(LibErrorKind::InvalidArgument, MSG_NO_ALBUM_SAVE))?;
+        let endpoint = if liked {
+            "like/like"
+        } else {
+            "like/removelike"
+        };
+        self.tube
+            .post(endpoint, json!({"target": {"playlistId": playlist}}))
+            .map_err(map_tube)?;
+        if let Some(h) = lock(&self.state).album_headers.get_mut(id) {
+            h.saved = Some(liked);
+        }
+        Ok(())
+    }
+
+    // ---- exploring ----------------------------------------------------------------------------
+
+    /// The artist page of channel `id`: kept, else read.
+    fn artist_page(&self, id: &str) -> Result<Arc<parse::ArtistParse>, LibraryError> {
+        if let Some(e) = lock(&self.state).artists.get(id) {
+            return Ok(e.page.clone());
+        }
+        let uri = ids::artist_uri(id).ok_or_else(invalid)?;
+        let resp = self
+            .tube
+            .post("browse", json!({"browseId": id}))
+            .map_err(map_tube)?;
+        let page = Arc::new(parse::artist_page(&resp, &uri).ok_or_else(shape)?);
+        let mut st = lock(&self.state);
+        if st.artists.len() >= MAX_ARTIST_PAGES {
+            st.artists.clear();
+        }
+        st.artists.insert(
+            id.to_owned(),
+            ArtistEntry {
+                page: page.clone(),
+                albums: None,
+                singles: None,
+            },
+        );
+        Ok(page)
+    }
+
+    /// Every release of one group (`Albums` or `Singles`): the carousel's, or the whole of its
+    /// "More" grid when it has one (at most [`MAX_MORE_PAGES`] pages). If the grid cannot be read
+    /// the carousel's items stand in, and are not kept, so the next call asks again.
+    fn group_releases(
+        &self,
+        id: &str,
+        group: ReleaseGroup,
+    ) -> Result<Arc<Vec<Album>>, LibraryError> {
+        let page = self.artist_page(id)?;
+        let kept = |e: &ArtistEntry| match group {
+            ReleaseGroup::Singles => e.singles.clone(),
+            _ => e.albums.clone(),
+        };
+        if let Some(list) = lock(&self.state).artists.get(id).and_then(kept) {
+            return Ok(list);
+        }
+        let shelf = match group {
+            ReleaseGroup::Singles => &page.singles,
+            _ => &page.albums,
+        };
+        let owner = EntityRef {
+            uri: ids::artist_uri(id).ok_or_else(invalid)?,
+            name: page.name.clone(),
+        };
+        let mut items = shelf.items.clone();
+        let mut complete = true;
+        if let Some(more) = &shelf.more {
+            match self.more_releases(more, group, &owner) {
+                Ok(list) if !list.is_empty() => items = list,
+                Ok(_) => {}
+                Err(e) if e.kind == LibErrorKind::WebNotLoggedIn => return Err(e),
+                Err(_) => complete = false,
+            }
+        }
+        let mut seen: Vec<String> = Vec::new();
+        items.retain(|a| {
+            let new = !seen.contains(&a.uri);
+            if new {
+                seen.push(a.uri.clone());
+            }
+            new
+        });
+        items.truncate(parse::MAX_ITEMS);
+        let list = Arc::new(items);
+        if complete && let Some(e) = lock(&self.state).artists.get_mut(id) {
+            match group {
+                ReleaseGroup::Singles => e.singles = Some(list.clone()),
+                _ => e.albums = Some(list.clone()),
+            }
+        }
+        Ok(list)
+    }
+
+    fn more_releases(
+        &self,
+        more: &parse::More,
+        group: ReleaseGroup,
+        owner: &EntityRef,
+    ) -> Result<Vec<Album>, LibraryError> {
+        let list = ListKey::Releases(more.browse_id.clone(), more.params.clone());
+        let (mut out, mut cont) = (Vec::new(), None::<Continuation>);
+        for _ in 0..MAX_MORE_PAGES {
+            let resp = self.request(&list, cont.as_ref())?;
+            let page = parse::releases_page(&resp, group, owner).ok_or_else(shape)?;
+            out.extend(page.items);
+            match page.next {
+                Some(next) if out.len() < parse::MAX_ITEMS => cont = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// The whole list of `group` (`All` is albums, then singles).
+    fn release_list(&self, id: &str, group: ReleaseGroup) -> Result<Vec<Album>, LibraryError> {
+        Ok(match group {
+            ReleaseGroup::Albums | ReleaseGroup::Singles => {
+                self.group_releases(id, group)?.as_ref().clone()
+            }
+            ReleaseGroup::All => {
+                let mut all = self
+                    .group_releases(id, ReleaseGroup::Albums)?
+                    .as_ref()
+                    .clone();
+                for a in self.group_releases(id, ReleaseGroup::Singles)?.iter() {
+                    if !all.iter().any(|x| x.uri == a.uri) {
+                        all.push(a.clone());
+                    }
+                }
+                all.truncate(parse::MAX_ITEMS);
+                all
+            }
+            // The artist page has no list of releases that name the artist as a guest.
+            ReleaseGroup::AppearsOn => Vec::new(),
+        })
+    }
+
+    fn artist(&self, uri: &str) -> Result<ArtistPage, LibraryError> {
+        let id = ids::parse_artist_uri(uri).ok_or_else(invalid)?;
+        self.begin()?;
+        let page = self.artist_page(id)?;
+        let all = self.release_list(id, ReleaseGroup::All)?;
+        Ok(ArtistPage {
+            artist: Artist {
+                uri: uri.to_owned(),
+                name: page.name.clone(),
+                images: page.images.clone(),
+            },
+            popular: page.popular.clone(),
+            releases: release_page(&all, 0),
+        })
+    }
+
+    fn artist_releases(
+        &self,
+        uri: &str,
+        group: ReleaseGroup,
+        offset: u32,
+    ) -> Result<AlbumPage, LibraryError> {
+        let id = ids::parse_artist_uri(uri).ok_or_else(invalid)?;
+        self.begin()?;
+        let all = self.release_list(id, group)?;
+        Ok(release_page(&all, offset))
+    }
+
+    fn album(&self, uri: &str) -> Result<AlbumDetail, LibraryError> {
+        let id = ids::parse_album_uri(uri).ok_or_else(invalid)?;
+        let tracks = self.track_page(ListKey::Album(id.to_owned()), 0, Some(id))?;
+        let header = lock(&self.state)
+            .album_headers
+            .get(id)
+            .cloned()
+            .ok_or_else(shape)?;
+        Ok(AlbumDetail {
+            album: Album {
+                id: uri.to_owned(),
+                uri: uri.to_owned(),
+                name: header.title,
+                artist: header.artist,
+                track_count: None,
+                images: header.images,
+                year: header.year,
+                artists: header.artists,
+                kind: header.kind,
+            },
+            tracks,
+        })
+    }
+}
+
+/// One page of `list` from `offset`.
+fn release_page(list: &[Album], offset: u32) -> AlbumPage {
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(list.len());
+    let end = (start + RELEASE_PAGE).min(list.len());
+    AlbumPage {
+        items: list[start..end].to_vec(),
+        skipped: 0,
+        next_offset: (end < list.len())
+            .then(|| u32::try_from(end).ok())
+            .flatten(),
+        total: u32::try_from(list.len()).ok(),
     }
 }
 
@@ -429,5 +698,27 @@ impl Library for YtLibrary {
 
     fn can_change_likes(&self) -> bool {
         self.0.auth.cookies_usable()
+    }
+
+    fn artist<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<ArtistPage, LibraryError>> {
+        let uri = uri.to_owned();
+        blocking(self.0.clone(), move |c| c.artist(&uri))
+    }
+
+    fn album<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<AlbumDetail, LibraryError>> {
+        let uri = uri.to_owned();
+        blocking(self.0.clone(), move |c| c.album(&uri))
+    }
+
+    fn artist_releases<'a>(
+        &'a self,
+        uri: &'a str,
+        group: ReleaseGroup,
+        offset: u32,
+    ) -> BoxFuture<'a, Result<AlbumPage, LibraryError>> {
+        let uri = uri.to_owned();
+        blocking(self.0.clone(), move |c| {
+            c.artist_releases(&uri, group, offset)
+        })
     }
 }

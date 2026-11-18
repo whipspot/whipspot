@@ -10,6 +10,8 @@ use lune_ui::desktop::{DesktopPoint, DesktopRect};
 use lune_ui::dock::{DockDrag, docked_sets, docked_with};
 use whipspot_core::skin::{Edge, PanelWindows, ScreenPoint, ScreenRect, Skin};
 
+use super::trace;
+
 /// The snap distance in skin pixels (scaled by the pixel scale and desktop units per pixel).
 const SNAP_SKIN_PX: f32 = 10.0;
 
@@ -196,6 +198,16 @@ impl DragController {
         } else {
             0
         };
+        if trace::enabled() {
+            trace::line(format_args!(
+                "press panel={panel} pointer={} leader={} k={} upp={} within={within} moving={}",
+                trace::point(Some(pointer)),
+                trace::rect(windows.frame(0)),
+                self.k,
+                windows.units_per_pixel(),
+                moving.len()
+            ));
+        }
         self.active = Some(Active {
             drag: DockDrag::start(to_point(pointer), &rects, &moving),
             vis,
@@ -228,6 +240,15 @@ impl DragController {
             .filter(|&(v, o)| rects[v].origin() != o)
             .map(|(v, o)| (active.vis[v], from_point(o)))
             .collect();
+        if trace::enabled() {
+            trace::line(format_args!(
+                "move pointer={} leader={} upp={} moves={}",
+                trace::point(Some(pointer)),
+                trace::rect(windows.frame(0)),
+                windows.units_per_pixel(),
+                trace::moves(&moves)
+            ));
+        }
         if !moves.is_empty() {
             // A refused batch is retried by the next move.
             let _ = windows.move_panels(&moves);
@@ -236,6 +257,13 @@ impl DragController {
 
     /// Ends the drag and recomputes which panels are docked.
     pub fn release(&mut self, windows: &mut dyn PanelWindows) {
+        if trace::enabled() && self.active.is_some() {
+            trace::line(format_args!(
+                "release pointer={} leader={}",
+                trace::point(windows.pointer()),
+                trace::rect(windows.frame(0))
+            ));
+        }
         self.active = None;
         self.dock_all(windows);
     }
@@ -262,31 +290,55 @@ impl DragController {
         }
     }
 
-    /// The pixel scale changed from `old_k` to `new_k`: every docked member keeps its place
-    /// relative to the leader, scaled (integer, rounded toward the leader).
-    pub fn rescale(&mut self, old_k: u32, new_k: u32, windows: &mut dyn PanelWindows) {
+    /// The pixel scale changed to `new_k`, and the desktop units per skin pixel from `old_unit`
+    /// (`units_per_pixel() * k` before the change) to `units_per_pixel() * new_k` now: every
+    /// docked member keeps its place relative to the leader, scaled by that ratio (rounded toward
+    /// the leader). On a desktop in physical pixels (Windows) the ratio is `new_k / old_k`; on one
+    /// in points (macOS) a move between a 2x and a 1x screen leaves the places as they are.
+    pub fn rescale(&mut self, old_unit: f32, new_k: u32, windows: &mut dyn PanelWindows) {
         self.k = new_k.max(1);
-        let (old, new) = (i64::from(old_k.max(1)), i64::from(new_k.max(1)));
-        let Some(l) = windows.frame(0) else {
-            return;
-        };
-        let scale = |o: i32, l: i32| -> i32 {
-            let d = (i64::from(o) - i64::from(l)) * new / old;
-            (i64::from(l) + d).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-        };
-        let moves: Vec<(usize, ScreenPoint)> = (1..windows.count())
-            .filter(|&p| self.is_docked(p))
-            .filter_map(|p| windows.frame(p).map(|f| (p, f)))
-            .map(|(p, f)| {
-                (
-                    p,
-                    ScreenPoint {
-                        x: scale(f.x, l.x),
-                        y: scale(f.y, l.y),
-                    },
-                )
-            })
-            .collect();
+        let new_unit = windows.units_per_pixel() * self.k as f32;
+        let ratio = f64::from(new_unit) / f64::from(old_unit);
+        let leader = windows.frame(0);
+        let mut moves: Vec<(usize, ScreenPoint)> = Vec::new();
+        if let Some(l) = leader
+            && ratio.is_finite()
+            && ratio > 0.0
+        {
+            let scale = |o: i32, l: i32| -> i32 {
+                let d = (f64::from(o) - f64::from(l)) * ratio;
+                // A ratio a float step off a whole one must not lose a unit to truncation.
+                let d = if (d - d.round()).abs() < 1e-3 {
+                    d.round()
+                } else {
+                    d.trunc()
+                };
+                (f64::from(l) + d).clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+            };
+            moves = (1..windows.count())
+                .filter(|&p| self.is_docked(p))
+                .filter_map(|p| windows.frame(p).map(|f| (p, f)))
+                .map(|(p, f)| {
+                    (
+                        p,
+                        ScreenPoint {
+                            x: scale(f.x, l.x),
+                            y: scale(f.y, l.y),
+                        },
+                    )
+                })
+                .filter(|&(p, o)| windows.frame(p).is_some_and(|f| (f.x, f.y) != (o.x, o.y)))
+                .collect();
+        }
+        if trace::enabled() {
+            trace::line(format_args!(
+                "rescale leader={} k={} upp={} unit={old_unit}->{new_unit} moves={}",
+                trace::rect(leader),
+                self.k,
+                windows.units_per_pixel(),
+                trace::moves(&moves)
+            ));
+        }
         if !moves.is_empty() {
             let _ = windows.move_panels(&moves);
         }
@@ -518,14 +570,45 @@ mod tests {
         let (mut w, mut c) = laid_out(&s);
         w.frames[3].x = 900;
         c.dock_all(&mut w);
-        c.rescale(1, 2, &mut w);
+        // A desktop in physical pixels (one unit per pixel): units per skin px 1 -> 2.
+        c.rescale(1.0, 2, &mut w);
         assert_eq!(w.origin(0), (100, 50));
         assert_eq!(w.origin(1), (100, 282));
         assert_eq!(w.origin(2), (100, 514));
         assert_eq!(w.origin(3), (900, 50));
         // And back, rounded toward the leader.
         w.frames[1].y += 1;
-        c.rescale(2, 1, &mut w);
+        c.rescale(2.0, 1, &mut w);
         assert_eq!(w.origin(1), (100, 166));
+    }
+
+    #[test]
+    fn rescale_on_a_point_desktop_moves_nothing_when_only_the_backing_scale_changed() {
+        // macOS: a 2x screen (half a point per pixel, k 2) to a 1x one (a point per pixel, k 1).
+        // A panel keeps its size in points, so the docked places stay.
+        let s = skin();
+        let (mut w, _) = laid_out(&s);
+        w.units_per_pixel = 0.5;
+        let mut c = DragController::new(2);
+        c.dock_all(&mut w);
+        let before: Vec<_> = (0..4).map(|p| w.origin(p)).collect();
+        w.units_per_pixel = 1.0;
+        c.rescale(0.5 * 2.0, 1, &mut w);
+        let after: Vec<_> = (0..4).map(|p| w.origin(p)).collect();
+        assert_eq!(after, before);
+        assert!(w.moves.is_empty(), "nothing is moved");
+        // And back to the 2x screen.
+        w.units_per_pixel = 0.5;
+        c.rescale(1.0, 2, &mut w);
+        assert!(w.moves.is_empty());
+        // Windows: one unit per pixel, k 2 -> 1 halves the offsets as before.
+        let (mut w, _) = laid_out(&s);
+        let mut c = DragController::new(2);
+        c.dock_all(&mut w);
+        c.rescale(2.0, 1, &mut w);
+        assert_eq!(w.origin(0), (100, 50));
+        assert_eq!(w.origin(1), (100, 108));
+        assert_eq!(w.origin(2), (100, 166));
+        assert_eq!(w.origin(3), (237, 50));
     }
 }

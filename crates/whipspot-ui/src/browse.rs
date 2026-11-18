@@ -9,12 +9,13 @@ use lune_ui::scene::LayerId;
 use lune_ui::ui::Ui;
 use lune_ui::widgets::button::ButtonKind;
 use whipspot_core::player::{PlayerAction, PlayerHandle, PlayerNotice, PlayerState, ProviderEntry};
-use whipspot_core::provider::{Playlist, Readable, Track};
+use whipspot_core::provider::{Album, EntityRef, Playlist, Readable, Track};
 
 use crate::Anchors;
 use crate::account::{self, AccountView};
 use crate::anim;
 use crate::art::ArtCache;
+use crate::artist::{self, AlbumArgs, ArtistView};
 use crate::equalizer::EqualizerPane;
 use crate::grid::{self, Art, CardSpec, Covers, HomeOut, Page, PageOut, Section, Status};
 use crate::history::{History, Route, Tab, tab_of};
@@ -24,7 +25,7 @@ use crate::library::{
     library_entry,
 };
 use crate::likes::LikeBook;
-use crate::pages::{self, FilterCache, Hero, HeroOut};
+use crate::pages::{self, FilterCache, Hero, HeroOut, Save};
 use crate::queue::QueuePane;
 use crate::search;
 use crate::settings::{SettingsOut, SettingsPane, SettingsView};
@@ -69,6 +70,10 @@ pub struct Browse {
     /// A play disc was pressed: this route plays its first track once its first page is in.
     play_when_loaded: Option<Route>,
     pane: TrackTable,
+    /// The artist page's state (the selected chip, its Popular table).
+    artist: ArtistView,
+    /// A Save to library was pressed: the albums list loads again once the write is done.
+    album_saved: bool,
     /// The filter bar's text, the route it belongs to (it resets when the route changes) and
     /// whether it had keyboard focus in the last frame.
     filter: String,
@@ -119,6 +124,8 @@ impl Browse {
             pending_query: None,
             play_when_loaded: None,
             pane: TrackTable::default(),
+            artist: ArtistView::default(),
+            album_saved: false,
             filter: String::new(),
             filter_for: None,
             filter_focused: false,
@@ -157,11 +164,42 @@ impl Browse {
         self.play_when_loaded = None;
         if matches!(
             self.history.current(),
-            Route::Playlist { .. } | Route::Album { .. }
+            Route::Playlist { .. } | Route::Album { .. } | Route::Artist { .. }
         ) {
             let root = self.tab().root();
             self.history.push(root);
         }
+    }
+
+    /// Opens what a clicked artist or album link names: the library switches to the link's
+    /// provider first when another one shows (D6), then the page is pushed. A link whose
+    /// provider cannot explore, or that names neither an artist nor an album, does nothing.
+    pub(crate) fn open_ref(&mut self, r: &EntityRef, providers: &[ProviderEntry]) {
+        let Some(route) = link_route(r) else {
+            return;
+        };
+        let scheme = r.uri.split_once(':').map_or("", |(s, _)| s);
+        let Some(entry) = providers
+            .iter()
+            .find(|p| p.info.id == scheme && p.info.caps.library && p.info.caps.explore)
+        else {
+            return;
+        };
+        // The page already on show: nothing to open.
+        let on_show = match (self.history.current(), &route) {
+            (Route::Artist { uri: a, .. }, Route::Artist { uri: b, .. }) => a == b,
+            (cur @ Route::Album { .. }, Route::Album { uri, .. }) => cur.album_key() == Some(uri),
+            _ => false,
+        };
+        if on_show {
+            return;
+        }
+        let selected = self.choice.get();
+        let shown = library_entry(providers, selected.as_deref()).map(|e| e.info.id);
+        if shown != Some(entry.info.id) {
+            self.switch_to(entry.info.id);
+        }
+        self.navigate(route);
     }
 
     /// Goes back one route; whether there was one.
@@ -198,6 +236,9 @@ impl Browse {
             // any provider) reloads Liked, a change the provider reports reloads them all.
             PlayerNotice::LikesChanged { provider } => {
                 self.library.changed(&provider, true);
+                if std::mem::take(&mut self.album_saved) {
+                    self.library.refresh_albums(&provider);
+                }
                 None
             }
             PlayerNotice::LibraryChanged { provider } => {
@@ -382,7 +423,23 @@ impl Browse {
             settings_out
         });
         self.settle_play(player);
+        self.play_release(ui.time(), player);
         settings_out
+    }
+
+    /// Plays the release a Play on the artist page asked for, once its tracks are in.
+    fn play_release(&mut self, now: Duration, player: &PlayerHandle) {
+        let Some((tracks, shuffle)) = self.library.take_play() else {
+            return;
+        };
+        let index = if shuffle { pick(now, tracks.len()) } else { 0 };
+        if shuffle {
+            player.dispatch(PlayerAction::SetShuffle(true));
+        }
+        player.dispatch(PlayerAction::PlayItem {
+            context: tracks,
+            index,
+        });
     }
 
     /// The page of a library route while the library is usable.
@@ -402,6 +459,10 @@ impl Browse {
             Route::Home => self.home(ui, vp, c, on, covers),
             Route::Playlists => self.playlists(ui, vp, c, on, covers),
             Route::Albums => self.albums(ui, vp, c, on, covers),
+            Route::Artist { uri, name, images } => {
+                let at = (uri.as_str(), name.as_str(), images.as_slice());
+                self.artist_page(ui, sheet, at, force.group, on, covers, likes);
+            }
             Route::Queue => {
                 if self.filter_for.as_ref() != Some(route) {
                     self.filter.clear();
@@ -587,13 +648,7 @@ impl Browse {
     }
 
     fn album_route(&self, i: usize) -> Option<Route> {
-        self.library.albums.items().get(i).map(|a| Route::Album {
-            id: a.id.clone(),
-            name: a.name.clone(),
-            artist: a.artist.clone(),
-            images: a.images.clone(),
-            year: a.year,
-        })
+        self.library.albums.items().get(i).map(release_route)
     }
 
     fn playlists(
@@ -684,6 +739,12 @@ impl Browse {
         covers: &mut Covers<'_>,
         likes: &mut LikeBook,
     ) {
+        if let Route::Album { uri, .. } = route
+            && !uri.is_empty()
+        {
+            self.explored_album(ui, (sheet, c), route, on, covers, likes);
+            return;
+        }
         let Show {
             look,
             state,
@@ -786,13 +847,27 @@ impl Browse {
             let art = covers.get(images, side, scale);
             let (loaded, complete) = slot.map_or((&[][..], false), |s| (s.items(), !s.has_more()));
             let meta = pages::meta_text(album_page, year, count, loaded, complete);
+            // The album's artists as links, from the card that opened it (none when it was not
+            // opened from the albums grid).
+            let by_refs = match route {
+                Route::Album { id, .. } => self
+                    .library
+                    .albums
+                    .items()
+                    .iter()
+                    .find(|a| &a.id == id)
+                    .map_or(&[][..], |a| a.artists.as_slice()),
+                _ => &[][..],
+            };
             let spec = Hero {
                 crumb,
                 name,
                 by,
+                by_refs,
                 meta: &meta,
                 side,
                 art,
+                save: None,
             };
             hero = pages::hero(ui, c, look, &spec);
         } else {
@@ -813,7 +888,10 @@ impl Browse {
             Route::Search => "No results.",
             _ => "No songs.",
         };
-        let form = Form { album_page };
+        let form = Form {
+            album_page,
+            ..Form::default()
+        };
         let result = self.pane.frame(
             ui, geo.table, look, form, slot, visible, empty, current, covers, likes, player, hearts,
         );
@@ -848,6 +926,219 @@ impl Browse {
             } else if result.more {
                 self.library.request(kind, player);
             }
+        }
+    }
+
+    /// The artist page of `open` (its uri, the name and portraits the link knew).
+    #[allow(clippy::too_many_arguments)]
+    fn artist_page(
+        &mut self,
+        ui: &mut Ui<'_>,
+        sheet: Rect,
+        (uri, name, images): (&str, &str, &[whipspot_core::provider::ImageRef]),
+        forced: Option<whipspot_core::provider::ReleaseGroup>,
+        on: &Show<'_>,
+        covers: &mut Covers<'_>,
+        likes: &mut LikeBook,
+    ) {
+        let player = on.player;
+        self.filter_focused = false;
+        self.library.open_artist(uri, name, images);
+        let prev = self
+            .history
+            .previous()
+            .map(Route::label)
+            .unwrap_or_default();
+        ui.painter().on(LayerId::Popup);
+        let Some(open) = self.library.open_artist.as_ref() else {
+            return;
+        };
+        let out = self
+            .artist
+            .frame(ui, sheet, open, (&prev, forced), on, covers, likes);
+        let group = self.artist.group(uri);
+        // What the page asked for, read before the library is borrowed again.
+        let releases = open.releases(group).items();
+        let opened = out.open.and_then(|i| releases.get(i)).map(release_route);
+        let played = out
+            .play_release
+            .and_then(|i| releases.get(i))
+            .map(|a| a.uri.clone());
+        let first = first_release(open).map(|a| a.uri.clone());
+        let popular = open.popular.clone();
+        let head_failed = open.head().failed();
+        if out.crumb {
+            self.history.back();
+        }
+        if out.play || out.shuffle {
+            let plan = artist_play(popular.len(), first.as_deref(), out.shuffle, ui.time());
+            match plan {
+                ArtistPlay::Tracks { index, shuffle } => {
+                    if shuffle {
+                        player.dispatch(PlayerAction::SetShuffle(true));
+                    }
+                    player.dispatch(PlayerAction::PlayItem {
+                        context: popular,
+                        index,
+                    });
+                }
+                ArtistPlay::Release { uri, shuffle } => {
+                    self.library.play_release(&uri, shuffle, player);
+                }
+                ArtistPlay::Nothing => {}
+            }
+        }
+        if let Some(uri) = played {
+            self.library.play_release(&uri, false, player);
+        }
+        if let Some(route) = opened {
+            self.navigate(route);
+        }
+        if out.retry {
+            if head_failed {
+                self.library.retry_artist();
+            } else {
+                self.library.retry(ListKind::Releases(group), player);
+            }
+        } else if out.more {
+            self.library.request(ListKind::Releases(group), player);
+        }
+    }
+
+    /// The explored album page (an album opened by its uri): board 3's hero column, the table
+    /// with an Artist column, Save to library and "More by".
+    fn explored_album(
+        &mut self,
+        ui: &mut Ui<'_>,
+        (sheet, _): (Rect, Rect),
+        route: &Route,
+        on: &Show<'_>,
+        covers: &mut Covers<'_>,
+        likes: &mut LikeBook,
+    ) {
+        let Route::Album {
+            uri,
+            name,
+            images,
+            year,
+            artist,
+            ..
+        } = route
+        else {
+            return;
+        };
+        let Show {
+            state,
+            player,
+            hearts,
+            ..
+        } = *on;
+        self.library.open_explored_album(uri, name, images, *year);
+        ui.painter().on(LayerId::Popup);
+        let save_albums = state
+            .providers
+            .iter()
+            .find(|p| p.info.caps.library && Some(p.info.id) == self.library.provider())
+            .is_some_and(|p| p.info.caps.save_albums);
+        let prev = self
+            .history
+            .previous()
+            .map(Route::label)
+            .unwrap_or_default();
+        let Some(open) = self.library.open_album.as_ref() else {
+            return;
+        };
+        let named = open.explore.as_ref().is_some_and(|e| e.album.is_some());
+        if hearts.is_some() {
+            self.feed.step(&open.tracks, false, likes, player);
+        }
+        let save = (save_albums && named).then(|| {
+            likes.want([uri.as_str()], player);
+            Save {
+                saved: likes.state(uri),
+                writable: hearts == Some(true),
+            }
+        });
+        if self.filter_for.as_ref() != Some(route) {
+            self.filter.clear();
+            self.filter_for = Some(route.clone());
+        }
+        let visible = self.visible.get(
+            route,
+            &self.filter,
+            open.tracks.serial(),
+            open.tracks.items(),
+        );
+        let typed = self.filter.clone();
+        let args = AlbumArgs {
+            prev: &prev,
+            window_w: sheet.w + 2.0 * layout::SHEET_X,
+            save,
+            route_artist: artist,
+            visible,
+        };
+        let out = artist::album_page(
+            ui,
+            sheet,
+            open,
+            &args,
+            on,
+            covers,
+            likes,
+            (&mut self.pane, &mut self.filter),
+        );
+        self.filter_focused = out.filter_focused;
+        // The rows follow the text a frame late (the field is drawn inside the page): draw again.
+        if self.filter != typed {
+            ui.request_repaint_at(ui.time());
+        }
+        let slot = &open.tracks;
+        let visible = self
+            .visible
+            .get(route, &self.filter, slot.serial(), slot.items());
+        if let Some(pos) = out.pane.play {
+            play_visible(player, slot, visible, pos);
+        }
+        let n = slot.items().len();
+        if out.hero.play && n > 0 {
+            play_from(player, slot, 0);
+        }
+        if out.hero.shuffle && n > 0 {
+            player.dispatch(PlayerAction::SetShuffle(true));
+            player.dispatch(PlayerAction::PlayItem {
+                context: slot.items().to_vec(),
+                index: pick(ui.time(), n),
+            });
+        }
+        let more = artist::more_by(open);
+        let opened = out.open.and_then(|i| more.get(i)).map(|a| release_route(a));
+        let played = out
+            .play_release
+            .and_then(|i| more.get(i))
+            .map(|a| a.uri.clone());
+        let (retry, want_more) = (out.pane.retry, out.pane.more);
+        if out.hero.crumb {
+            if prev.is_empty() {
+                self.navigate(Route::Albums);
+            } else {
+                self.history.back();
+            }
+        }
+        if out.hero.save {
+            let writable = hearts == Some(true);
+            likes.click(uri, writable, player);
+            self.album_saved = writable;
+        }
+        if let Some(uri) = played {
+            self.library.play_release(&uri, false, player);
+        }
+        if let Some(route) = opened {
+            self.navigate(route);
+        }
+        if retry {
+            self.library.retry(ListKind::OpenAlbum, player);
+        } else if want_more {
+            self.library.request(ListKind::OpenAlbum, player);
         }
     }
 
@@ -896,11 +1187,11 @@ impl Browse {
                 .as_ref()
                 .filter(|o| &o.id == id)
                 .map(|_| ListKind::OpenPlaylist),
-            Route::Album { id, .. } => self
+            Route::Album { .. } => self
                 .library
                 .open_album
                 .as_ref()
-                .filter(|o| &o.id == id)
+                .filter(|o| route.album_key() == Some(o.id.as_str()))
                 .map(|_| ListKind::OpenAlbum),
             _ => None,
         };
@@ -984,6 +1275,92 @@ fn page_header(route: &Route, count: Option<u32>) -> (String, Option<String>) {
     }
 }
 
+/// The route a clicked link opens: an artist page or an explored album, addressed by the link's
+/// uri; `None` for a uri that names neither.
+fn link_route(r: &EntityRef) -> Option<Route> {
+    let (_, rest) = r.uri.split_once(':')?;
+    match rest.split(':').next()? {
+        "artist" => Some(Route::Artist {
+            uri: r.uri.clone(),
+            name: r.name.clone(),
+            images: Vec::new(),
+        }),
+        "album" => Some(Route::Album {
+            id: String::new(),
+            uri: r.uri.clone(),
+            name: r.name.clone(),
+            artist: String::new(),
+            images: Vec::new(),
+            year: None,
+        }),
+        _ => None,
+    }
+}
+
+/// What a Play or Shuffle on the artist page does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArtistPlay {
+    /// Play the popular list from `index` (shuffle: turn shuffle on first).
+    Tracks {
+        index: usize,
+        shuffle: bool,
+    },
+    /// The artist has no popular list: play its first release.
+    Release {
+        uri: String,
+        shuffle: bool,
+    },
+    Nothing,
+}
+
+/// Play and Shuffle play the popular list when there is one (shuffle starts at a position taken
+/// from the clock), else the first release.
+fn artist_play(popular: usize, first: Option<&str>, shuffle: bool, now: Duration) -> ArtistPlay {
+    if popular > 0 {
+        let index = if shuffle { pick(now, popular) } else { 0 };
+        ArtistPlay::Tracks { index, shuffle }
+    } else if let Some(uri) = first {
+        ArtistPlay::Release {
+            uri: uri.to_owned(),
+            shuffle,
+        }
+    } else {
+        ArtistPlay::Nothing
+    }
+}
+
+/// The release Play falls back to: the first of the artist's own, else any with a uri.
+fn first_release(open: &crate::library::ArtistOpen) -> Option<&Album> {
+    let all = open
+        .releases(whipspot_core::provider::ReleaseGroup::All)
+        .items();
+    all.iter()
+        .find(|a| !a.uri.is_empty() && a.kind != whipspot_core::provider::AlbumKind::AppearsOn)
+        .or_else(|| all.iter().find(|a| !a.uri.is_empty()))
+}
+
+/// The route that opens `a`: by its uri when it has one (the explored page), else by its id.
+fn release_route(a: &Album) -> Route {
+    Route::Album {
+        id: a.id.clone(),
+        uri: a.uri.clone(),
+        name: a.name.clone(),
+        artist: a.artist.clone(),
+        images: a.images.clone(),
+        year: a.year,
+    }
+}
+
+/// A position in `n` items chosen from the clock: no random source in the view, and no one to
+/// reproduce it for.
+fn pick(now: Duration, n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        now.as_millis() as usize % n
+    }
+}
+
 /// "N songs" ("1 song").
 fn songs(n: u32) -> String {
     if n == 1 {
@@ -1020,7 +1397,7 @@ fn slot_of(library: &LibraryModel, kind: ListKind) -> Option<&Slot<Track>> {
         ListKind::OpenPlaylist => library.open_playlist.as_ref().map(|o| &o.tracks),
         ListKind::OpenAlbum => library.open_album.as_ref().map(|o| &o.tracks),
         ListKind::Search => library.search.as_ref().map(|o| &o.tracks),
-        ListKind::Playlists | ListKind::Albums => None,
+        ListKind::Playlists | ListKind::Albums | ListKind::Releases(_) => None,
     }
 }
 
@@ -1038,5 +1415,126 @@ mod tests {
         }
         sheet.navigate(Route::Albums);
         assert!(sheet.escape_free());
+    }
+
+    use whipspot_core::provider::model::{Capabilities, ProviderInfo};
+
+    fn entry(id: &'static str, explore: bool) -> ProviderEntry {
+        ProviderEntry {
+            info: ProviderInfo {
+                id,
+                name: id,
+                glyph: Default::default(),
+                caps: Capabilities {
+                    library: true,
+                    pcm_tap: true,
+                    eq: true,
+                    search: true,
+                    likes: true,
+                    explore,
+                    save_albums: false,
+                },
+                auth_steps: Vec::new(),
+            },
+            auth: None,
+            likes_writable: true,
+        }
+    }
+
+    fn link(uri: &str, name: &str) -> EntityRef {
+        EntityRef {
+            uri: uri.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn a_link_opens_its_page_and_switches_the_library_to_its_provider_first() {
+        let providers = [entry("one", true), entry("two", true)];
+        let mut sheet = Browse::new(Tab::Home);
+        // The library shows "one" (the first with a library); a link of "two" switches it.
+        sheet.open_ref(&link("two:artist:9", "Ann"), &providers);
+        assert_eq!(sheet.choice.get().as_deref(), Some("two"));
+        assert!(
+            matches!(sheet.history.current(), Route::Artist { uri, name, .. } if uri == "two:artist:9" && name == "Ann")
+        );
+        // A link of the provider on show does not touch the choice and opens an album by uri.
+        sheet.open_ref(&link("two:album:3", "Low Tide"), &providers);
+        assert_eq!(sheet.history.current().album_key(), Some("two:album:3"));
+        assert_eq!(
+            sheet.history.previous().map(Route::label),
+            Some("Ann".into())
+        );
+        // The page already on show is not pushed again.
+        sheet.open_ref(&link("two:album:3", "Low Tide"), &providers);
+        assert!(sheet.back() && matches!(sheet.history.current(), Route::Artist { .. }));
+        sheet.open_ref(&link("two:artist:9", "Ann"), &providers);
+        assert!(
+            sheet.forward(),
+            "the artist page on show is not pushed again"
+        );
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_followed_does_nothing() {
+        let providers = [entry("one", true), entry("plain", false)];
+        let mut sheet = Browse::new(Tab::Home);
+        for bad in [
+            link("plain:artist:1", "x"), // a provider that cannot explore
+            link("gone:artist:1", "x"),  // no such provider
+            link("one:track:1", "x"),    // neither an artist nor an album
+            link("nocolon", "x"),
+            link("", "x"),
+        ] {
+            sheet.open_ref(&bad, &providers);
+            assert_eq!(*sheet.history.current(), Route::Home, "{bad:?}");
+            assert_eq!(sheet.choice.get(), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn play_and_shuffle_on_an_artist_use_the_popular_list_else_the_first_release() {
+        let now = Duration::from_millis(7_003);
+        assert_eq!(
+            artist_play(5, Some("p:album:1"), false, now),
+            ArtistPlay::Tracks {
+                index: 0,
+                shuffle: false
+            }
+        );
+        // Shuffle starts somewhere in the list, chosen from the clock.
+        assert_eq!(
+            artist_play(5, None, true, now),
+            ArtistPlay::Tracks {
+                index: 7_003 % 5,
+                shuffle: true
+            }
+        );
+        assert_eq!(
+            artist_play(0, Some("p:album:1"), true, now),
+            ArtistPlay::Release {
+                uri: "p:album:1".into(),
+                shuffle: true
+            }
+        );
+        assert_eq!(artist_play(0, None, false, now), ArtistPlay::Nothing);
+    }
+
+    #[test]
+    fn a_release_opens_by_uri_when_it_has_one_and_by_id_when_not() {
+        let mut a = Album {
+            id: "id".into(),
+            uri: "p:album:1".into(),
+            name: "N".into(),
+            artist: "A".into(),
+            track_count: None,
+            images: vec![],
+            year: Some(1999),
+            artists: vec![],
+            kind: Default::default(),
+        };
+        assert_eq!(release_route(&a).album_key(), Some("p:album:1"));
+        a.uri.clear();
+        assert_eq!(release_route(&a).album_key(), Some("id"));
     }
 }

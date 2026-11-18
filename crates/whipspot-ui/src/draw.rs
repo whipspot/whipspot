@@ -13,6 +13,67 @@ use crate::theme::Look;
 
 pub(crate) type P<'a> = Painter<'a, WidgetId>;
 
+/// What a recorded page box is: text, or a control or picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxKind {
+    Text,
+    Control,
+}
+
+/// The boxes of what an artist or album page draws (the demo's layout check reads them).
+#[derive(Default)]
+struct PageBoxes {
+    enabled: bool,
+    active: bool,
+    boxes: Vec<(BoxKind, Rect)>,
+}
+
+thread_local! {
+    static PAGE: std::cell::RefCell<PageBoxes> = std::cell::RefCell::new(PageBoxes::default());
+}
+
+/// Starts or stops recording the boxes a page draws (off by default: drawing pays one flag test).
+pub(crate) fn page_boxes_enable(on: bool) {
+    PAGE.with(|p| {
+        let mut p = p.borrow_mut();
+        p.enabled = on;
+        p.active = false;
+        p.boxes.clear();
+    });
+}
+
+/// A frame starts: the recorded boxes of the last one go.
+pub(crate) fn page_boxes_frame() {
+    PAGE.with(|p| {
+        let mut p = p.borrow_mut();
+        p.active = false;
+        p.boxes.clear();
+    });
+}
+
+/// A page starts (`true`) or stops drawing: only what it draws is recorded.
+pub(crate) fn page_boxes_scope(on: bool) {
+    PAGE.with(|p| {
+        let mut p = p.borrow_mut();
+        p.active = on && p.enabled;
+    });
+}
+
+/// Records a box while a page is drawing.
+pub(crate) fn page_box(kind: BoxKind, r: Rect) {
+    PAGE.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.active {
+            p.boxes.push((kind, r));
+        }
+    });
+}
+
+/// The boxes recorded in the last frame.
+pub(crate) fn page_boxes() -> Vec<(BoxKind, Rect)> {
+    PAGE.with(|p| p.borrow().boxes.clone())
+}
+
 /// The measuring colour (any opaque colour; widths do not depend on it).
 const INK: Rgba = [0xFF, 0xFF, 0xFF, 0xFF];
 
@@ -43,7 +104,9 @@ pub(crate) fn text(
     } else {
         spec
     };
-    p.text(&spec, x, y).0
+    let w = p.text(&spec, x, y).0;
+    page_box(BoxKind::Text, Rect::new(x, y, w, size * 1.25));
+    w
 }
 
 /// The idle view's text shadow: copies of the text in black, each as `(dx, dy, share of the full

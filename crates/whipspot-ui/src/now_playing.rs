@@ -20,6 +20,7 @@ use crate::draw::{
     text_shadowed as text, width,
 };
 use crate::likes::{self, LikeBook};
+use crate::link::{self, Face, Place};
 use crate::lyrics as lyric_view;
 use crate::theme::{Decor, Labels, Look, Rule};
 
@@ -349,26 +350,51 @@ fn side(
         text(p, line, SIDE_TITLE_SIZE, c, medium, rx - 3.0, y, w);
     }
     let (hi, w) = (look.hi_or_text(), m.rw);
-    text(p, &track.artist, 24.0, hi, false, rx, y0 + o.artist, w);
+    let face = Face {
+        size: 24.0,
+        medium: false,
+        color: hi,
+        shadow: true,
+    };
+    let at = Place {
+        x: rx,
+        y: y0 + o.artist,
+        centre: false,
+        max_w: w,
+    };
+    link::line(
+        ui,
+        "np-side-artist",
+        look,
+        &track.artist,
+        &track.artists,
+        face,
+        at,
+    );
     if let (Some(y), Some(line)) = (o.album, &album) {
-        text(
-            p,
-            line,
-            15.0,
-            idle_ink(look.ink.muted, look.ink.text),
-            false,
-            rx,
-            y0 + y,
-            m.rw,
-        );
+        let face = Face {
+            size: 15.0,
+            medium: false,
+            color: idle_ink(look.ink.muted, look.ink.text),
+            shadow: true,
+        };
+        let at = Place {
+            x: rx,
+            y: y0 + y,
+            centre: false,
+            max_w: m.rw,
+        };
+        let refs = track.album_ref.as_slice();
+        link::line(ui, "np-side-album", look, line, refs, face, at);
     }
+    let p = ui.painter();
     if let Some(r) = o.rule {
         rule_at(p, look, rx, y0 + r);
     }
     if let (Some(nl), Some(next)) = (o.next_label, next) {
         label_at(p, look, "NEXT UP", rx, y0 + nl, false);
         let thumb = next_thumb(art, player, next, scale);
-        next_card(ui.painter(), look, rx, y0 + nl + 22.0, next, thumb);
+        next_card(ui, look, rx, y0 + nl + 22.0, next, thumb);
     }
 
     // Theme A's action row: the heart alone (MD75).
@@ -438,30 +464,44 @@ fn centred(
         let y = y0 + o.title + TITLE_PITCH * i as f32;
         text_c(p, line, TITLE_SIZE, look.ink.text, medium, cx, y, limit);
     }
-    let artist = y0 + o.artist;
-    text_c(
-        p,
+    let face = Face {
+        size: 24.0,
+        medium: false,
+        color: look.hi_or_text(),
+        shadow: true,
+    };
+    let at = Place {
+        x: cx,
+        y: y0 + o.artist,
+        centre: true,
+        max_w: limit,
+    };
+    link::line(
+        ui,
+        "np-artist",
+        look,
         &track.artist,
-        24.0,
-        look.hi_or_text(),
-        false,
-        cx,
-        artist,
-        limit,
+        &track.artists,
+        face,
+        at,
     );
     if album {
-        let y = y0 + o.album;
-        text_c(
-            p,
-            &track.album,
-            15.0,
-            idle_ink(look.ink.muted, look.ink.text),
-            false,
-            cx,
-            y,
-            limit,
-        );
+        let face = Face {
+            size: 15.0,
+            medium: false,
+            color: idle_ink(look.ink.muted, look.ink.text),
+            shadow: true,
+        };
+        let at = Place {
+            x: cx,
+            y: y0 + o.album,
+            centre: true,
+            max_w: limit,
+        };
+        let refs = track.album_ref.as_slice();
+        link::line(ui, "np-album", look, &track.album, refs, face, at);
     }
+    let p = ui.painter();
     if let Some(r) = o.rule {
         rule(p, look, cx, y0 + r);
     }
@@ -470,7 +510,7 @@ fn centred(
         let thumb = next_thumb(art, player, next, scale);
         let w = next_card_width(p, look, next);
         let x = (cx - w / 2.0).round();
-        next_card(p, look, x, y0 + nl + 24.0, next, thumb);
+        next_card(ui, look, x, y0 + nl + 24.0, next, thumb);
     }
 }
 
@@ -720,8 +760,9 @@ fn next_card_width(p: &mut P<'_>, k: &Look, next: &Track) -> f32 {
 /// The next-up card with its left edge at `x` and its top at `y`: a capsule (a bare sleeve and
 /// its lines in the hardware theme) with the cover (the no-art placeholder without it), the title
 /// and the artist.
-fn next_card(p: &mut P<'_>, k: &Look, x: f32, y: f32, next: &Track, thumb_art: Option<Art>) {
+fn next_card(ui: &mut Ui<'_>, k: &Look, x: f32, y: f32, next: &Track, thumb_art: Option<Art>) {
     let rad = k.radii();
+    let p = ui.painter();
     if k.decor().labels == Labels::Tracked {
         let sleeve = Rect::new(x, y + 6.0, 52.0, 52.0);
         shadow(p, sleeve, rad.thumb, 6.0, 0.8);
@@ -729,15 +770,26 @@ fn next_card(p: &mut P<'_>, k: &Look, x: f32, y: f32, next: &Track, thumb_art: O
         let tx = sleeve.right() + 16.0;
         let (ty, ay) = (sleeve.y + 7.0, sleeve.y + 28.0);
         text(p, &next.name, 14.5, k.ink.text, true, tx, ty, NEXT_TEXT_MAX);
-        text(
-            p,
+        let face = Face {
+            size: 13.0,
+            medium: false,
+            color: idle_ink(k.ink.muted, k.ink.text),
+            shadow: true,
+        };
+        let at = Place {
+            x: tx,
+            y: ay,
+            centre: false,
+            max_w: NEXT_TEXT_MAX,
+        };
+        link::line(
+            ui,
+            "np-next-artist",
+            k,
             &next.artist,
-            13.0,
-            idle_ink(k.ink.muted, k.ink.text),
-            false,
-            tx,
-            ay,
-            NEXT_TEXT_MAX,
+            &next.artists,
+            face,
+            at,
         );
     } else {
         let w = next_card_width(p, k, next);
@@ -760,15 +812,26 @@ fn next_card(p: &mut P<'_>, k: &Look, x: f32, y: f32, next: &Track, thumb_art: O
             ty,
             NEXT_TEXT_MAX,
         );
-        text(
-            p,
+        let face = Face {
+            size: 13.0,
+            medium: false,
+            color: idle_ink(k.ink.muted, k.ink.text),
+            shadow: true,
+        };
+        let at = Place {
+            x: tx,
+            y: ay,
+            centre: false,
+            max_w: NEXT_TEXT_MAX,
+        };
+        link::line(
+            ui,
+            "np-next-artist",
+            k,
             &next.artist,
-            13.0,
-            idle_ink(k.ink.muted, k.ink.text),
-            false,
-            tx,
-            ay,
-            NEXT_TEXT_MAX,
+            &next.artists,
+            face,
+            at,
         );
     }
 }
@@ -818,6 +881,8 @@ mod tests {
             duration_ms: 1000,
             images: vec![],
             year: None,
+            album_ref: None,
+            artists: vec![],
         }
     }
 

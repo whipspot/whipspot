@@ -4,6 +4,8 @@
 pub mod host;
 pub mod logging;
 pub mod paths;
+#[cfg(target_os = "macos")]
+pub(crate) mod platform_macos;
 #[cfg(windows)]
 pub mod platform_windows;
 pub mod selftest;

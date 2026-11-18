@@ -21,7 +21,7 @@ pub type Time = Duration;
 pub const IDLE_AFTER_LEAVE: Duration = Duration::from_secs(2);
 /// How long with no input at all (the pointer resting inside the window included) before the view
 /// goes idle.
-pub const IDLE_AFTER_STILL: Duration = Duration::from_secs(4);
+pub const IDLE_AFTER_STILL: Duration = Duration::from_secs(12);
 /// The cross-fade between the two views.
 pub const FADE: Duration = Duration::from_millis(250);
 
@@ -217,9 +217,10 @@ mod tests {
     }
 
     #[test]
-    fn i1_the_delays_are_a_few_seconds() {
-        // "A few seconds" with the pointer resting inside; leaving is quicker still.
-        assert!(IDLE_AFTER_STILL >= S(3) && IDLE_AFTER_STILL <= S(6));
+    fn i1_the_delays_are_twelve_and_two_seconds() {
+        // Twelve seconds with the pointer resting inside; leaving is quicker still.
+        assert_eq!(IDLE_AFTER_STILL, S(12));
+        assert_eq!(IDLE_AFTER_LEAVE, S(2));
         assert!(IDLE_AFTER_LEAVE < IDLE_AFTER_STILL);
         assert_eq!(
             IDLE_AFTER_STILL.subsec_nanos(),

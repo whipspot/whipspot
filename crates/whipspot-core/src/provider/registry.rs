@@ -9,7 +9,8 @@ use super::Provider;
 pub enum RegisterError {
     InvalidId,
     Duplicate,
-    /// `caps.library` disagrees with `library().is_some()`, or `caps.likes` is set without one.
+    /// `caps.library` disagrees with `library().is_some()`, or `caps.likes` or `caps.explore` is
+    /// set without one, or `caps.save_albums` without `likes`.
     LibraryMismatch,
 }
 
@@ -54,7 +55,11 @@ impl ProviderRegistry {
         if self.by_id.iter().any(|q| q.info().id == info.id) {
             return Err(RegisterError::Duplicate);
         }
-        if info.caps.library != p.library().is_some() || (info.caps.likes && !info.caps.library) {
+        let c = info.caps;
+        if c.library != p.library().is_some()
+            || ((c.likes || c.explore || c.save_albums) && !c.library)
+            || (c.save_albums && !c.likes)
+        {
             return Err(RegisterError::LibraryMismatch);
         }
         self.by_id.push(p);
@@ -162,6 +167,32 @@ mod tests {
             RegisterError::LibraryMismatch
         );
         let ok = FakeProvider::new("y", true).with_caps_likes(true);
+        r.register(Arc::new(ok)).unwrap();
+    }
+
+    #[test]
+    fn register_refuses_explore_and_save_albums_without_their_base() {
+        let mut r = ProviderRegistry::new();
+        let no_lib = FakeProvider::new("a", false).with_caps_explore(true);
+        assert_eq!(
+            r.register(Arc::new(no_lib)).unwrap_err(),
+            RegisterError::LibraryMismatch
+        );
+        let no_lib = FakeProvider::new("b", false).with_caps_save_albums(true);
+        assert_eq!(
+            r.register(Arc::new(no_lib)).unwrap_err(),
+            RegisterError::LibraryMismatch
+        );
+        // save_albums needs likes.
+        let no_likes = FakeProvider::new("c", true).with_caps_save_albums(true);
+        assert_eq!(
+            r.register(Arc::new(no_likes)).unwrap_err(),
+            RegisterError::LibraryMismatch
+        );
+        let ok = FakeProvider::new("d", true)
+            .with_caps_likes(true)
+            .with_caps_save_albums(true)
+            .with_caps_explore(true);
         r.register(Arc::new(ok)).unwrap();
     }
 

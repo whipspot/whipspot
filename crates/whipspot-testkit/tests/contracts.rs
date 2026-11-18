@@ -50,6 +50,21 @@ fn provider_contract_on_fake() {
 }
 
 #[test]
+fn provider_contract_on_fake_with_explore() {
+    block_on(run_provider_contract(Arc::new(
+        FakeProvider::new("fake", true).with_caps_explore(true),
+    )));
+}
+
+#[test]
+#[should_panic(expected = "caps.explore needs caps.library")]
+fn provider_contract_fails_explore_without_a_library() {
+    block_on(run_provider_contract(Arc::new(
+        FakeProvider::new("fake", false).with_caps_explore(true),
+    )));
+}
+
+#[test]
 fn remote_contract_on_fake() {
     block_on(run_remote_contract(Arc::new(
         FakeProvider::new("fake", true).with_remote("fake.remote"),

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use whipspot_core::provider::model::LoginState;
 use whipspot_core::provider::{
-    Album, ImageRef, LibErrorKind, Library, MAX_IMAGES, Playlist, Provider,
+    Album, AlbumKind, EntityRef, ImageRef, LibErrorKind, Library, MAX_ARTISTS, MAX_IMAGES,
+    MAX_POPULAR, Playlist, Provider, ReleaseGroup,
 };
 use whipspot_testkit::rng::{Case, SplitMix64, fuzz, mutate};
 use whipspot_testkit::{
@@ -80,6 +81,12 @@ async fn every_library_call_while_logged_out_is_the_fixed_error() {
         lib.search("", 0).await.unwrap_err(),
         lib.liked(&uris).await.unwrap_err(),
         lib.set_liked(&uris[0], true).await.unwrap_err(),
+        lib.artist(&artist_uri(ARTISTS[0].1)).await.unwrap_err(),
+        lib.album(&album_uri(ALBUM)).await.unwrap_err(),
+        lib.artist_releases(&artist_uri(ARTISTS[0].1), ReleaseGroup::All, 0)
+            .await
+            .unwrap_err(),
+        lib.set_liked(&album_uri(ALBUM), true).await.unwrap_err(),
     ];
     for e in &errors {
         assert_eq!(e.message, "Import your YouTube cookies first");
@@ -867,6 +874,637 @@ async fn a_ten_thousand_row_answer_gives_a_page_through_the_whole_stack() {
     assert_eq!(e.kind, LibErrorKind::UnexpectedShape);
 }
 
+// ---- exploring: refs, artists, albums, saving ----------------------------------------------------------------
+
+fn refs(items: &[EntityRef]) -> Vec<(&str, &str)> {
+    items
+        .iter()
+        .map(|r| (r.uri.as_str(), r.name.as_str()))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_provider_says_it_can_explore_and_save_albums() {
+    let rig = Rig::new();
+    let caps = rig.provider.info().caps;
+    assert!(caps.explore && caps.save_albums && caps.likes);
+}
+
+#[tokio::test]
+async fn tracks_name_their_artists_and_album_as_links() {
+    let rig = logged_in().await;
+    rig.yt.set_page_size(10);
+    let lib = lib(&rig);
+    // A playlist row: two linked artists and a linked album, in the order of the display text.
+    let page = lib
+        .playlist_items(&playlist_uri(PLAYLIST_ONE), 0)
+        .await
+        .unwrap();
+    let t = &page.items[1];
+    assert_eq!(t.artist, "Artist A, Artist B");
+    assert_eq!(
+        refs(&t.artists),
+        [
+            ("ytmusic:artist:UCartistA0000000000000001", "Artist A"),
+            ("ytmusic:artist:UCartistB0000000000000002", "Artist B"),
+        ]
+    );
+    assert_eq!(
+        t.album_ref
+            .as_ref()
+            .map(|r| (r.uri.as_str(), r.name.as_str())),
+        Some(("ytmusic:album:MPREb_other000001", "First Record"))
+    );
+    // A search row (one column of runs) too.
+    let found = lib.search("night", 0).await.unwrap();
+    assert_eq!(found.items[0].artists.len(), 1);
+    assert_eq!(
+        found.items[0].album_ref.as_ref().unwrap().uri,
+        "ytmusic:album:MPREb_other000002"
+    );
+    // An album page's rows take both from the header.
+    let tracks = lib.album_tracks(&album_uri(ALBUM), 0).await.unwrap();
+    for t in &tracks.items {
+        assert_eq!(
+            refs(&t.artists),
+            [("ytmusic:artist:UCalbumArtist00000000003", "Album Artist")]
+        );
+        assert_eq!(t.album_ref.as_ref().unwrap().uri, album_uri(ALBUM));
+    }
+    // The saved albums name theirs.
+    let albums = all_albums(lib).await;
+    assert_eq!(albums[0].uri, album_uri(ALBUM));
+    assert_eq!(
+        refs(&albums[0].artists),
+        [("ytmusic:artist:UCalbumArtist00000000003", "Album Artist")]
+    );
+    assert_eq!(albums[0].kind, AlbumKind::Album);
+}
+
+#[tokio::test]
+async fn an_artist_page_has_a_header_popular_songs_and_the_first_releases() {
+    for size in [1, 2, 100] {
+        let rig = logged_in().await;
+        rig.yt.set_page_size(size);
+        let lib = lib(&rig);
+        let uri = artist_uri(ARTISTS[1].1);
+        let page = lib.artist(&uri).await.unwrap();
+        assert_eq!(
+            (page.artist.uri.as_str(), page.artist.name.as_str()),
+            (uri.as_str(), "Artist B")
+        );
+        assert_images_clean(&page.artist.images);
+        assert!(!page.popular.is_empty() && page.popular.len() <= MAX_POPULAR);
+        assert!(
+            page.popular
+                .iter()
+                .all(|t| t.artists.iter().any(|a| a.uri == uri))
+        );
+        // The albums carousel shows two of the three; the "More" grid has all of them. Then the
+        // singles.
+        let names: Vec<&str> = page
+            .releases
+            .items
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "First Record",
+                "Second Record",
+                "Third Record",
+                "Fourth Record"
+            ],
+            "page size {size}"
+        );
+        let kinds: Vec<AlbumKind> = page.releases.items.iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                AlbumKind::Album,
+                AlbumKind::Album,
+                AlbumKind::Album,
+                AlbumKind::Single
+            ]
+        );
+        // Releases that name no artist belong to the page's own artist.
+        for a in &page.releases.items {
+            assert_eq!(refs(&a.artists), [(uri.as_str(), "Artist B")]);
+            assert_eq!(a.artist, "Artist B");
+            assert!(a.uri.starts_with("ytmusic:album:MPRE") && a.id == a.uri);
+        }
+        assert_eq!(page.releases.next_offset, None);
+        assert_eq!(page.releases.total, Some(4));
+    }
+}
+
+#[tokio::test]
+async fn an_artists_releases_come_by_group_and_page() {
+    let rig = logged_in().await;
+    rig.yt.set_page_size(1);
+    let lib = lib(&rig);
+    let uri = artist_uri(ARTISTS[1].1);
+    let name_of = |p: &whipspot_core::provider::AlbumPage| {
+        p.items.iter().map(|a| a.name.clone()).collect::<Vec<_>>()
+    };
+    let albums = lib
+        .artist_releases(&uri, ReleaseGroup::Albums, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        name_of(&albums),
+        ["First Record", "Second Record", "Third Record"]
+    );
+    assert!(albums.items.iter().all(|a| a.kind == AlbumKind::Album));
+    let singles = lib
+        .artist_releases(&uri, ReleaseGroup::Singles, 0)
+        .await
+        .unwrap();
+    assert_eq!(name_of(&singles), ["Fourth Record"]);
+    assert!(singles.items.iter().all(|a| a.kind == AlbumKind::Single));
+    // The YouTube Music page lists no guest releases.
+    let guest = lib
+        .artist_releases(&uri, ReleaseGroup::AppearsOn, 0)
+        .await
+        .unwrap();
+    assert!(guest.items.is_empty() && guest.next_offset.is_none());
+    // An offset past the end is an empty last page.
+    let past = lib
+        .artist_releases(&uri, ReleaseGroup::All, 10_000)
+        .await
+        .unwrap();
+    assert!(past.items.is_empty() && past.next_offset.is_none());
+    // The page is read once: the lists are kept.
+    rig.yt.clear_posts();
+    lib.artist(&uri).await.unwrap();
+    lib.artist_releases(&uri, ReleaseGroup::All, 0)
+        .await
+        .unwrap();
+    assert!(rig.yt.posts().is_empty(), "{:?}", rig.yt.posts());
+}
+
+#[tokio::test]
+async fn the_more_grid_is_followed_by_its_continuations_and_asked_for_by_params() {
+    let rig = logged_in().await;
+    rig.yt.set_page_size(1);
+    let lib = lib(&rig);
+    rig.yt.clear_posts();
+    lib.artist_releases(&artist_uri(ARTISTS[1].1), ReleaseGroup::Albums, 0)
+        .await
+        .unwrap();
+    let browse = rig.yt.posts_to("browse");
+    // The page, then the grid (3 albums at one a page: 3 requests).
+    assert_eq!(
+        browse.len(),
+        4,
+        "{:?}",
+        browse.iter().map(|p| &p.url).collect::<Vec<_>>()
+    );
+    assert_eq!(browse[0].body["browseId"], ARTISTS[1].1);
+    assert_eq!(browse[1].body["browseId"], format!("MPAD{}", ARTISTS[1].1));
+    assert_eq!(browse[1].body["params"], "pAlbums");
+    assert!(browse[2].url.contains("ctoken=rel."), "{}", browse[2].url);
+}
+
+#[tokio::test]
+async fn a_more_grid_that_fails_leaves_the_carousel_and_is_asked_again_next_time() {
+    let rig = logged_in().await;
+    rig.yt.set_page_size(100);
+    let lib = lib(&rig);
+    let uri = artist_uri(ARTISTS[1].1);
+    // The artist page answers, the grid does not.
+    rig.yt.script_after(1, Script::Status(500));
+    let page = lib
+        .artist_releases(&uri, ReleaseGroup::Albums, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["First Record", "Second Record"]
+    );
+    // Not kept: the next call reads the grid and has all three.
+    let page = lib
+        .artist_releases(&uri, ReleaseGroup::Albums, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 3);
+}
+
+#[tokio::test]
+async fn an_album_page_names_its_artists_year_kind_and_tracks() {
+    let rig = logged_in().await;
+    rig.yt.set_page_size(2);
+    let lib = lib(&rig);
+    let d = lib.album(&album_uri("MPREb_other000004")).await.unwrap();
+    assert_eq!(d.album.uri, "ytmusic:album:MPREb_other000004");
+    assert_eq!(d.album.id, d.album.uri);
+    assert_eq!(
+        (
+            d.album.name.as_str(),
+            d.album.artist.as_str(),
+            d.album.year,
+            d.album.kind
+        ),
+        ("Fourth Record", "Artist B", Some(2023), AlbumKind::Single)
+    );
+    assert_eq!(
+        refs(&d.album.artists),
+        [("ytmusic:artist:UCartistB0000000000000002", "Artist B")]
+    );
+    assert_images_clean(&d.album.images);
+    assert_eq!(names(&d.tracks.items), ["Liked Only"]);
+    assert_eq!(
+        d.tracks.items[0].album_ref.as_ref().unwrap().uri,
+        d.album.uri
+    );
+    // Its tracks continue by offset as before.
+    let big = lib.album(&album_uri(ALBUM)).await.unwrap();
+    assert_eq!(big.tracks.items.len(), 2);
+    let rest = lib
+        .album_tracks(&album_uri(ALBUM), big.tracks.next_offset.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(names(&rest.items), ["Album Closer"]);
+    assert_eq!(big.album.year, Some(2019));
+}
+
+#[tokio::test]
+async fn a_bad_artist_or_album_uri_never_reaches_the_service() {
+    let rig = logged_in().await;
+    let lib = lib(&rig);
+    rig.yt.clear_posts();
+    let long = format!("ytmusic:artist:UC{}", "9".repeat(5000));
+    for bad in [
+        "",
+        "no-such-id",
+        "spotify:artist:abc",
+        "ytmusic:artist:",
+        "ytmusic:artist:abc",
+        "ytmusic:artist:UC a",
+        "ytmusic:artist:UC../x",
+        "ytmusic:album:",
+        "ytmusic:album:abc",
+        "ytmusic:album:MPRE/x",
+        "ytmusic:track:trackAAAA01",
+        "ytmusic:artist:MPREb_other000001",
+        "ytmusic:album:UCartistA0000000000000001",
+        long.as_str(),
+    ] {
+        for e in [
+            lib.artist(bad).await.unwrap_err(),
+            lib.album(bad).await.unwrap_err(),
+            lib.artist_releases(bad, ReleaseGroup::All, 0)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(e.kind, LibErrorKind::InvalidArgument, "{bad:?}");
+        }
+    }
+    assert!(rig.yt.posts().is_empty());
+    // A valid id the service does not know is the service's error.
+    let e = lib
+        .artist(&artist_uri("UCunknown00000000000000"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind, LibErrorKind::Http);
+}
+
+#[tokio::test]
+async fn an_album_is_saved_through_its_audio_playlist_and_reads_back() {
+    let rig = logged_in().await;
+    rig.yt.set_page_size(100);
+    let lib = lib(&rig);
+    let uri = album_uri("MPREb_other000002");
+    // Unseen: read from the album's own page.
+    rig.yt.clear_posts();
+    assert_eq!(
+        lib.liked(std::slice::from_ref(&uri)).await.unwrap(),
+        vec![false]
+    );
+    assert_eq!(rig.yt.posts_to("browse").len(), 1);
+    // Seen: kept, no request.
+    lib.liked(std::slice::from_ref(&uri)).await.unwrap();
+    assert_eq!(rig.yt.posts_to("browse").len(), 1);
+
+    lib.set_liked(&uri, true).await.unwrap();
+    let post = rig.yt.posts_to("like/like").pop().unwrap();
+    assert_eq!(
+        post.body["target"],
+        json!({"playlistId": "OLAK5uy_other000002"})
+    );
+    assert_eq!(rig.yt.saved_albums(), ["OLAK5uy_other000002"]);
+    assert_eq!(
+        lib.liked(std::slice::from_ref(&uri)).await.unwrap(),
+        vec![true]
+    );
+    // The service says so too, when the page is read again.
+    let again = rig.yt.posts_to("browse").len();
+    lib.album(&uri).await.unwrap();
+    assert_eq!(rig.yt.posts_to("browse").len(), again + 1);
+    assert_eq!(
+        lib.liked(std::slice::from_ref(&uri)).await.unwrap(),
+        vec![true]
+    );
+
+    lib.set_liked(&uri, false).await.unwrap();
+    assert_eq!(rig.yt.posts_to("like/removelike").len(), 1);
+    assert!(rig.yt.saved_albums().is_empty());
+    assert_eq!(
+        lib.liked(std::slice::from_ref(&uri)).await.unwrap(),
+        vec![false]
+    );
+    // A track and an album in one call: one answer each, in order.
+    let track = track_uri("trackAAAA10");
+    lib.liked_tracks(0).await.unwrap();
+    assert_eq!(
+        lib.liked(&[track, uri.clone(), "x".into()]).await.unwrap(),
+        vec![true, false, false]
+    );
+}
+
+#[tokio::test]
+async fn an_album_whose_page_names_no_audio_playlist_cannot_be_saved() {
+    let rig = logged_in().await;
+    let lib = lib(&rig);
+    let uri = album_uri("MPREb_other000003");
+    rig.yt.clear_posts();
+    let e = lib.set_liked(&uri, true).await.unwrap_err();
+    assert_eq!(e.kind, LibErrorKind::InvalidArgument);
+    assert_eq!(e.message, "This album cannot be saved");
+    assert!(rig.yt.posts_to("like/like").is_empty());
+    assert!(rig.yt.saved_albums().is_empty());
+    // It reads as not saved, and still opens.
+    assert_eq!(
+        lib.liked(std::slice::from_ref(&uri)).await.unwrap(),
+        vec![false]
+    );
+    lib.album(&uri).await.unwrap();
+    // Only an album's own audio playlist is a target: a page that names another kind is not used.
+    let mut page = json!({
+        "title": {"runs": [{"text": "T"}]},
+        "buttons": [{"musicPlayButtonRenderer": {"playNavigationEndpoint": {
+            "watchEndpoint": {"playlistId": "RDAMPLxyz"}}}}],
+    });
+    let wrap = |h: &Value| {
+        json!({"contents": {"twoColumnBrowseResultsRenderer": {"tabs": [{
+        "tabRenderer": {"content": {"sectionListRenderer": {"contents": [
+            {"musicResponsiveHeaderRenderer": h}]}}}}]}}})
+    };
+    assert_eq!(
+        parse::album_header(&wrap(&page)).unwrap().audio_playlist_id,
+        None
+    );
+    page["buttons"][0]["musicPlayButtonRenderer"]["playNavigationEndpoint"]["watchEndpoint"]["playlistId"] =
+        json!("OLAK5uy_ok");
+    assert_eq!(
+        parse::album_header(&wrap(&page)).unwrap().audio_playlist_id,
+        Some("OLAK5uy_ok".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn the_albums_a_liked_call_probes_are_bounded() {
+    let rig = logged_in().await;
+    let lib = lib(&rig);
+    let uris: Vec<String> = (0..30)
+        .map(|i| album_uri(&format!("MPREb_nothere{i:02}")))
+        .collect();
+    // Each unseen album is one page; the service refuses these, so the first is the error.
+    rig.yt.clear_posts();
+    assert!(lib.liked(&uris).await.is_err());
+    assert_eq!(rig.yt.posts().len(), 1);
+}
+
+#[test]
+fn only_uc_ids_are_artists_and_only_mpre_ids_are_albums() {
+    assert_eq!(
+        ids::artist_uri("UCabc"),
+        Some("ytmusic:artist:UCabc".to_owned())
+    );
+    assert_eq!(ids::parse_artist_uri("ytmusic:artist:UCabc"), Some("UCabc"));
+    for bad in [
+        "",
+        "abc",
+        "MPREb_x",
+        "UC a",
+        "UC/x",
+        &format!("UC{}", "a".repeat(64)),
+    ] {
+        assert!(ids::artist_uri(bad).is_none(), "{bad:?}");
+    }
+    for bad in [
+        "ytmusic:artist:",
+        "ytmusic:artist:abc",
+        "ytmusic:album:UCabc",
+        "x",
+    ] {
+        assert!(ids::parse_artist_uri(bad).is_none(), "{bad:?}");
+    }
+    assert_eq!(
+        ids::parse_album_uri("ytmusic:album:MPREb_x"),
+        Some("MPREb_x")
+    );
+    for bad in [
+        "ytmusic:album:abc",
+        "ytmusic:album:UCabc",
+        "ytmusic:album:MPRE/x",
+    ] {
+        assert!(ids::parse_album_uri(bad).is_none(), "{bad:?}");
+    }
+    assert!(ids::album_uri("abc").is_none());
+    assert_eq!(ids::audio_playlist_id("OLAK5uy_abc"), Some("OLAK5uy_abc"));
+    for bad in ["", "PLabc", "RDAMPL1", "OLAK5uy_a b", "LM"] {
+        assert!(ids::audio_playlist_id(bad).is_none(), "{bad:?}");
+    }
+}
+
+fn linked(text: &str, browse_id: &str, page_type: Option<&str>) -> Value {
+    let mut ep = json!({"browseId": browse_id});
+    if let Some(t) = page_type {
+        ep["browseEndpointContextSupportedConfigs"] =
+            json!({"browseEndpointContextMusicConfig": {"pageType": t}});
+    }
+    json!({"text": text, "navigationEndpoint": {"browseEndpoint": ep}})
+}
+
+fn row_with(runs: Vec<Value>) -> Value {
+    let mut v = row(&SONGS[0], Layout::Playlist, false);
+    v["musicResponsiveListItemRenderer"]["flexColumns"][1]["musicResponsiveListItemFlexColumnRenderer"]
+        ["text"]["runs"] = Value::Array(runs);
+    v
+}
+
+#[test]
+fn a_run_is_a_link_only_for_the_kind_of_id_it_names() {
+    let parse_one = |v: Value| {
+        parse::track_page(&playlist_response(vec![v]), None)
+            .unwrap()
+            .items
+            .remove(0)
+            .track
+    };
+    let t = parse_one(row_with(vec![
+        linked("Good", "UCgood", Some("MUSIC_PAGE_TYPE_ARTIST")),
+        json!({"text": " & "}),
+        // A channel of a user, a video's uploader, a made-up page, a bad id, an album id: shown
+        // in the text, never a link.
+        linked("Chan", "UCchan", Some("MUSIC_PAGE_TYPE_USER_CHANNEL")),
+        linked("Odd", "UCodd", Some("MUSIC_PAGE_TYPE_PLAYLIST")),
+        linked("Bad id", "UC a/b", Some("MUSIC_PAGE_TYPE_ARTIST")),
+        linked("Album id", "MPREb_x", Some("MUSIC_PAGE_TYPE_ARTIST")),
+        linked("", "UCnoname", Some("MUSIC_PAGE_TYPE_ARTIST")),
+        // No page type stated: a UC id is an artist.
+        linked("Plain", "UCplain", None),
+        // The same artist twice is one link.
+        linked("Good", "UCgood", Some("MUSIC_PAGE_TYPE_ARTIST")),
+    ]));
+    assert_eq!(
+        refs(&t.artists),
+        [
+            ("ytmusic:artist:UCgood", "Good"),
+            ("ytmusic:artist:UCplain", "Plain")
+        ]
+    );
+    // At most MAX_ARTISTS links; the display text keeps the rest.
+    let runs: Vec<Value> = (0..20)
+        .map(|i| linked(&format!("A{i}"), &format!("UC{i}"), None))
+        .collect();
+    let t = parse_one(row_with(runs));
+    assert_eq!(t.artists.len(), MAX_ARTISTS);
+    assert!(t.artist.contains("A19"));
+    // An album run: only an MPRE id on an album page.
+    let mut v = row(&SONGS[0], Layout::Playlist, false);
+    v["musicResponsiveListItemRenderer"]["flexColumns"][2]["musicResponsiveListItemFlexColumnRenderer"]
+        ["text"]["runs"] = json!([linked("Not an album", "UCx", Some("MUSIC_PAGE_TYPE_ALBUM"))]);
+    assert!(parse_one(v).album_ref.is_none());
+}
+
+fn artist_response(sections: Vec<Value>) -> Value {
+    json!({
+        "header": {"musicImmersiveHeaderRenderer": {"title": {"runs": [{"text": "Name"}]}}},
+        "contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {
+            "content": {"sectionListRenderer": {"contents": sections}}}}]}},
+    })
+}
+
+fn carousel(title: &str, more: Option<(&str, &str)>, items: Vec<Value>) -> Value {
+    let mut run = json!({"text": title});
+    if let Some((id, params)) = more {
+        run["navigationEndpoint"] = json!({"browseEndpoint": {"browseId": id, "params": params}});
+    }
+    json!({"musicCarouselShelfRenderer": {
+        "header": {"musicCarouselShelfBasicHeaderRenderer": {"title": {"runs": [run]}}},
+        "contents": items}})
+}
+
+#[test]
+fn an_artist_page_is_read_by_what_it_has_and_not_by_what_it_lacks() {
+    let uri = "ytmusic:artist:UCme";
+    // No header with a name: not an artist page.
+    assert!(parse::artist_page(&json!({}), uri).is_none());
+    assert!(
+        parse::artist_page(
+            &json!({"header": {"musicImmersiveHeaderRenderer": {}}}),
+            uri
+        )
+        .is_none()
+    );
+    // A header alone is an artist with nothing else.
+    let p = parse::artist_page(&artist_response(vec![]), uri).unwrap();
+    assert_eq!(p.name, "Name");
+    assert!(p.popular.is_empty() && p.albums.items.is_empty() && p.singles.items.is_empty());
+    // The older header shape works too, and the foreground picture is its portrait.
+    let visual = json!({"header": {"musicVisualHeaderRenderer": {
+        "title": {"runs": [{"text": "V"}]},
+        "foregroundThumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+            {"url": "https://lh3.googleusercontent.com/x=w226", "width": 226, "height": 226}]}}}}}});
+    let p = parse::artist_page(&visual, uri).unwrap();
+    assert_eq!((p.name.as_str(), p.images.len()), ("V", 1));
+
+    // The "More" endpoint is an MPAD id with params, and nothing else.
+    let item = row_release("Rel", "MPREb_r");
+    let with = |more| {
+        parse::artist_page(
+            &artist_response(vec![carousel("Albums", more, vec![item.clone()])]),
+            uri,
+        )
+        .unwrap()
+        .albums
+    };
+    let shelf = with(Some(("MPADUCme", "ggMI%3D")));
+    assert_eq!(shelf.items.len(), 1);
+    assert_eq!(
+        shelf.more,
+        Some(parse::More {
+            browse_id: "MPADUCme".into(),
+            params: "ggMI%3D".into()
+        })
+    );
+    for bad in [
+        ("FEmusic_home", "ggMI"),
+        ("MPAD a", "ggMI"),
+        ("MPADUCme", "has space"),
+        ("MPADUCme", "a&b"),
+        ("MPADUCme", ""),
+    ] {
+        assert!(with(Some(bad)).more.is_none(), "{bad:?}");
+    }
+    assert!(with(None).more.is_none());
+    // A release that is not an MPRE album is dropped, an unknown carousel is ignored, and only the
+    // first carousel of a title counts.
+    let p = parse::artist_page(
+        &artist_response(vec![
+            carousel(
+                "Albums",
+                None,
+                vec![
+                    row_release("Real", "MPREb_a"),
+                    row_release("Fake", "UCx"),
+                    json!(5),
+                ],
+            ),
+            carousel("Albums", None, vec![row_release("Second", "MPREb_b")]),
+            carousel("Videos", None, vec![row_release("Video", "MPREb_v")]),
+            carousel("Singles & EPs", None, vec![row_release("One", "MPREb_s")]),
+        ]),
+        uri,
+    )
+    .unwrap();
+    assert_eq!(
+        p.albums
+            .items
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Real"]
+    );
+    assert_eq!(p.singles.items[0].kind, AlbumKind::Single);
+    assert_eq!(p.albums.items[0].artists[0].uri, uri);
+    // Popular songs: at most MAX_POPULAR, and a song that names no artist gets the page's.
+    let many: Vec<Value> = (0..30)
+        .map(|_| row(&SONGS[0], Layout::Album, false))
+        .collect();
+    let p = parse::artist_page(
+        &artist_response(vec![json!({"musicShelfRenderer": {"contents": many}})]),
+        uri,
+    )
+    .unwrap();
+    assert_eq!(p.popular.len(), MAX_POPULAR);
+    assert_eq!(p.popular[0].artist, "Name");
+    assert_eq!(refs(&p.popular[0].artists), [(uri, "Name")]);
+}
+
+fn row_release(title: &str, id: &str) -> Value {
+    json!({"musicTwoRowItemRenderer": {
+        "title": {"runs": [{"text": title, "navigationEndpoint": {"browseEndpoint": {"browseId": id}}}]},
+        "subtitle": {"runs": [{"text": "Album"}, {"text": " • "}, {"text": "2020"}]},
+    }})
+}
+
 // ---- contract 2: fuzz ---------------------------------------------------------------------------------------------------
 
 fn junk(rng: &mut SplitMix64) -> Value {
@@ -948,6 +1586,14 @@ fn check_tracks(page: &Page<TrackRow>) {
             assert!(s.chars().count() <= MAX_TEXT && !s.chars().any(char::is_control));
         }
         assert!(t.images.len() <= MAX_IMAGES);
+        assert!(t.artists.len() <= MAX_ARTISTS);
+        for a in &t.artists {
+            assert!(ids::parse_artist_uri(&a.uri).is_some());
+            assert!(!a.name.is_empty() && a.name.chars().count() <= MAX_TEXT);
+        }
+        if let Some(a) = &t.album_ref {
+            assert!(ids::parse_album_uri(&a.uri).is_some() && !a.name.is_empty());
+        }
         for i in &t.images {
             assert!(i.url.starts_with("https://"));
             assert!(
@@ -984,9 +1630,53 @@ fn run_parsers(v: &Value) {
             assert!(ids::parse_album_uri(&i.id).is_some());
             assert!(i.name.chars().count() <= MAX_TEXT && i.artist.chars().count() <= MAX_TEXT);
         }
+        check_albums(&p.items);
     }
     if let Some(h) = parse::album_header(v) {
         assert!(h.title.chars().count() <= MAX_TEXT && h.images.len() <= MAX_IMAGES);
+        assert!(h.artists.len() <= MAX_ARTISTS);
+        for a in &h.artists {
+            assert!(ids::parse_artist_uri(&a.uri).is_some());
+        }
+        for id in h.audio_playlist_id.iter() {
+            assert!(ids::audio_playlist_id(id).is_some());
+        }
+    }
+    let owner = EntityRef {
+        uri: "ytmusic:artist:UCme".into(),
+        name: "Me".into(),
+    };
+    if let Some(a) = parse::artist_page(v, &owner.uri) {
+        assert!(a.name.chars().count() <= MAX_TEXT && a.images.len() <= MAX_IMAGES);
+        assert!(a.popular.len() <= MAX_POPULAR);
+        for t in &a.popular {
+            assert!(t.artists.len() <= MAX_ARTISTS);
+        }
+        for shelf in [&a.albums, &a.singles] {
+            assert!(shelf.items.len() <= MAX_ITEMS);
+            check_albums(&shelf.items);
+            if let Some(m) = &shelf.more {
+                assert!(m.browse_id.starts_with("MPAD") && ids::valid_id(&m.browse_id));
+            }
+        }
+    }
+    for group in [ReleaseGroup::Albums, ReleaseGroup::Singles] {
+        if let Some(p) = parse::releases_page(v, group, &owner) {
+            assert!(p.items.len() <= MAX_ITEMS);
+            check_albums(&p.items);
+        }
+    }
+}
+
+fn check_albums(items: &[Album]) {
+    for a in items {
+        assert!(ids::parse_album_uri(&a.uri).is_some() && a.id == a.uri);
+        assert!(a.name.chars().count() <= MAX_TEXT && a.images.len() <= MAX_IMAGES);
+        assert!(a.artists.len() <= MAX_ARTISTS);
+        for r in &a.artists {
+            assert!(ids::parse_artist_uri(&r.uri).is_some());
+            assert!(!r.name.is_empty() && r.name.chars().count() <= MAX_TEXT);
+        }
     }
 }
 
@@ -1025,6 +1715,13 @@ fn bases() -> Vec<Value> {
             "",
         ),
         ask("browse", json!({"browseId": ALBUM}), ""),
+        ask("browse", json!({"browseId": ARTISTS[1].1}), ""),
+        ask("browse", json!({"browseId": ARTISTS[2].1}), ""),
+        ask(
+            "browse",
+            json!({"browseId": format!("MPAD{}", ARTISTS[1].1), "params": "pAlbums"}),
+            "",
+        ),
         ask("search", json!({"query": "night"}), ""),
         ask(
             "search",

@@ -6,12 +6,13 @@ use lune_ui::input::CursorIcon;
 use lune_ui::paint::Rect;
 use lune_ui::ui::{Sense, Ui};
 use lune_ui::widgets::filter_bar::FilterOptions;
-use whipspot_core::provider::Track;
+use whipspot_core::provider::{EntityRef, Track};
 
 use crate::art::{Art, NoArt, cover};
-use crate::draw::{disc, glow, knob, shadow, text, width};
+use crate::draw::{BoxKind, alpha, disc, glow, knob, page_box, shadow, text, width};
 use crate::history::Route;
 use crate::icons::{Icon, icon, play_filled};
+use crate::link::{self, Face, Place};
 use crate::theme::{Look, PlayButton};
 
 /// The window width from which the hero column has its full size, and under which it hides.
@@ -141,7 +142,27 @@ pub fn meta_text(
     loaded: &[Track],
     complete: bool,
 ) -> String {
-    let mut parts = vec![(if album { "Album" } else { "Playlist" }).to_owned()];
+    meta_with(
+        if album { "Album" } else { "Playlist" },
+        album,
+        year,
+        songs,
+        loaded,
+        complete,
+    )
+}
+
+/// [`meta_text`] with the first word given (an explored album says Single, EP or Compilation);
+/// `album` turns the year and the minutes on.
+pub fn meta_with(
+    word: &str,
+    album: bool,
+    year: Option<u16>,
+    songs: Option<u32>,
+    loaded: &[Track],
+    complete: bool,
+) -> String {
+    let mut parts = vec![word.to_owned()];
     if let Some(y) = year.filter(|_| album) {
         parts.push(y.to_string());
     }
@@ -167,10 +188,23 @@ pub struct Hero<'a> {
     pub name: &'a str,
     /// The artist (album) or owner (playlist), when known.
     pub by: Option<&'a str>,
+    /// The artists in `by` that are links.
+    pub by_refs: &'a [EntityRef],
     pub meta: &'a str,
     pub side: f32,
     /// The registered cover, when it is there; the placeholder otherwise.
     pub art: Option<Art>,
+    /// The Save to library button (explored albums with `save_albums`), when the page has one.
+    pub save: Option<Save>,
+}
+
+/// The Save to library button's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Save {
+    /// Whether the album is saved; `None` while the answer is not in.
+    pub saved: Option<bool>,
+    /// The login can change what is saved (else the button is dimmed and a click gives the hint).
+    pub writable: bool,
 }
 
 /// What the hero column reported in a frame.
@@ -179,6 +213,7 @@ pub struct HeroOut {
     pub crumb: bool,
     pub play: bool,
     pub shuffle: bool,
+    pub save: bool,
 }
 
 /// Draws the hero column of content rect `c`: the breadcrumb, the cover, the name, the
@@ -207,11 +242,27 @@ pub fn hero(ui: &mut Ui<'_>, c: Rect, k: &Look, h: &Hero<'_>) -> HeroOut {
     };
     let crumb_r = Rect::new(c.x - 4.0, c.y - 4.0, bw + 8.0, 26.0);
     let crumb = ui.interact(ui.id(("crumb",)), crumb_r, Sense::CLICK_FOCUS);
+    page_box(BoxKind::Control, art);
     let play_r = Rect::new(play_c.0 - 26.0, play_c.1 - 26.0, 52.0, 52.0);
     let play = ui.interact(ui.id(("hero-play",)), play_r, Sense::CLICK_FOCUS);
     let shuffle_r = Rect::new(shuffle_c.0 - 18.0, shuffle_c.1 - 18.0, 36.0, 36.0);
     let shuffle = ui.interact(ui.id(("hero-shuffle",)), shuffle_r, Sense::CLICK_FOCUS);
-    if crumb.hovered || play.hovered || shuffle.hovered {
+    let save_r = h.save.map(|sv| {
+        let w = save_width(ui.painter(), sv);
+        // Beside the shuffle button when it fits, else on a row of its own under the buttons.
+        let beside = shuffle_r.right() + 14.0;
+        if beside + w <= c.x + side + SAVE_OVERHANG {
+            Rect::new(beside, btn_y - SAVE_H / 2.0, w, SAVE_H)
+        } else {
+            Rect::new(c.x, btn_y + 34.0, w, SAVE_H)
+        }
+    });
+    let save = save_r.map(|r| ui.interact(ui.id(("hero-save",)), r, Sense::CLICK_FOCUS));
+    for r in [play_r, shuffle_r].into_iter().chain(save_r) {
+        page_box(BoxKind::Control, r);
+    }
+    if crumb.hovered || play.hovered || shuffle.hovered || save.as_ref().is_some_and(|r| r.hovered)
+    {
         ui.set_cursor(CursorIcon::Pointer);
     }
 
@@ -262,8 +313,21 @@ pub fn hero(ui: &mut Ui<'_>, c: Rect, k: &Look, h: &Hero<'_>) -> HeroOut {
         side,
     );
     if let Some(by) = h.by {
-        text(p, by, 17.0, k.hi_or_text(), false, c.x, by_y, side);
+        let face = Face {
+            size: 17.0,
+            medium: false,
+            color: k.hi_or_text(),
+            shadow: false,
+        };
+        let at = Place {
+            x: c.x,
+            y: by_y,
+            centre: false,
+            max_w: side,
+        };
+        link::line(ui, "hero-by", k, by, h.by_refs, face, at);
     }
+    let p = ui.painter();
     text(p, h.meta, 13.0, ink.muted, false, c.x, meta_y, side);
 
     if k.decor().play == PlayButton::Knob {
@@ -274,6 +338,12 @@ pub fn hero(ui: &mut Ui<'_>, c: Rect, k: &Look, h: &Hero<'_>) -> HeroOut {
         play_filled(p, (play_c.0 + 2.0, play_c.1), 17.0, k.on);
     }
     icon(p, Icon::Shuffle, shuffle_c, 19.0, ink.text2, HAIR);
+    if let (Some(sv), Some(r), Some(resp)) = (h.save, save_r, &save) {
+        save_button(p, k, r, sv, resp.hovered);
+        if resp.focus_visible {
+            p.ring(r, SAVE_H / 2.0, 1.5, k.a, true);
+        }
+    }
     for (r, resp, radius) in [
         (play_r, &play, 26.0),
         (shuffle_r, &shuffle, 18.0),
@@ -287,7 +357,157 @@ pub fn hero(ui: &mut Ui<'_>, c: Rect, k: &Look, h: &Hero<'_>) -> HeroOut {
         crumb: crumb.clicked,
         play: play.clicked,
         shuffle: shuffle.clicked,
+        save: save.is_some_and(|r| r.clicked),
     }
+}
+
+/// A breadcrumb at `(x, y)`: the previous page's name as a link, a chevron, then the current
+/// page's name. `max_w` is the width both may take together; without a previous page only the
+/// current name shows. Returns whether the link was clicked.
+pub(crate) fn crumb(
+    ui: &mut Ui<'_>,
+    k: &Look,
+    key: &'static str,
+    (x, y): (f32, f32),
+    (prev, current): (&str, &str),
+    max_w: f32,
+) -> bool {
+    let ink = k.ink;
+    if prev.is_empty() {
+        let p = ui.painter();
+        text(p, current, 13.5, ink.text2, false, x, y, max_w);
+        return false;
+    }
+    let bw = {
+        let p = ui.painter();
+        width(p, prev, 13.5, false).min((max_w * 0.5).max(40.0))
+    };
+    let r = Rect::new(x - 4.0, y - 4.0, bw + 8.0, 26.0);
+    let resp = ui.interact(ui.id((key,)), r, Sense::CLICK_FOCUS);
+    if resp.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    let p = ui.painter();
+    let c = if resp.hovered { ink.text2 } else { ink.muted };
+    text(p, prev, 13.5, c, false, x, y, bw);
+    icon(
+        p,
+        Icon::ChevR,
+        (x + bw + 14.0, y + 9.0),
+        10.0,
+        ink.faint,
+        1.2,
+    );
+    text(
+        p,
+        current,
+        13.5,
+        ink.text2,
+        false,
+        x + bw + 28.0,
+        y,
+        (max_w - bw - 28.0).max(40.0),
+    );
+    if resp.focus_visible {
+        p.ring(r, 6.0, 1.5, k.a, true);
+    }
+    resp.clicked
+}
+
+/// The round Play button centred on `play_c` and the Shuffle icon button centred on `shuffle_c`,
+/// as the hero column draws them; returns (play, shuffle) clicked.
+pub(crate) fn play_buttons(
+    ui: &mut Ui<'_>,
+    k: &Look,
+    key: &'static str,
+    play_c: (f32, f32),
+    shuffle_c: (f32, f32),
+) -> (bool, bool) {
+    let ink = k.ink;
+    let play_r = Rect::new(play_c.0 - 26.0, play_c.1 - 26.0, 52.0, 52.0);
+    let play = ui.interact(ui.id((key, "play")), play_r, Sense::CLICK_FOCUS);
+    let shuffle_r = Rect::new(shuffle_c.0 - 18.0, shuffle_c.1 - 18.0, 36.0, 36.0);
+    page_box(BoxKind::Control, play_r);
+    page_box(BoxKind::Control, shuffle_r);
+    let shuffle = ui.interact(ui.id((key, "shuffle")), shuffle_r, Sense::CLICK_FOCUS);
+    if play.hovered || shuffle.hovered {
+        ui.set_cursor(CursorIcon::Pointer);
+    }
+    let p = ui.painter();
+    if k.decor().play == PlayButton::Knob {
+        knob(p, play_c, 52.0);
+        play_filled(p, (play_c.0 + 2.0, play_c.1), 17.0, k.a);
+    } else {
+        disc(p, play_c, 52.0, k.a);
+        play_filled(p, (play_c.0 + 2.0, play_c.1), 17.0, k.on);
+    }
+    icon(p, Icon::Shuffle, shuffle_c, 19.0, ink.text2, HAIR);
+    for (r, resp, radius) in [(play_r, &play, 26.0), (shuffle_r, &shuffle, 18.0)] {
+        if resp.focus_visible {
+            p.ring(r, radius, 1.5, k.a, true);
+        }
+    }
+    (play.clicked, shuffle.clicked)
+}
+
+/// The Save to library button's height, and how far past the hero column's width it may reach to
+/// sit beside the shuffle button.
+const SAVE_H: f32 = 36.0;
+const SAVE_OVERHANG: f32 = 24.0;
+/// The button's padding each side, its glyph and the gap after it.
+const SAVE_PAD: f32 = 16.0;
+const SAVE_GLYPH: f32 = 12.0;
+const SAVE_GAP: f32 = 8.0;
+
+fn save_label(sv: Save) -> &'static str {
+    if sv.saved == Some(true) {
+        "Saved"
+    } else {
+        "Save to library"
+    }
+}
+
+fn save_width(p: &mut crate::draw::P<'_>, sv: Save) -> f32 {
+    2.0 * SAVE_PAD + SAVE_GLYPH + SAVE_GAP + width(p, save_label(sv), 13.0, true)
+}
+
+/// The Save to library pill in `r`: an outline with a plus, or when saved the accent tint with a
+/// check; dimmed when the login cannot change what is saved.
+fn save_button(p: &mut crate::draw::P<'_>, k: &Look, r: Rect, sv: Save, hovered: bool) {
+    let saved = sv.saved == Some(true);
+    let dim = if sv.writable { 0xFF } else { 0x80 };
+    let fade = |c: lune_ui::color::Rgba| alpha(c, ((u16::from(c[3]) * dim) / 0xFF) as u8);
+    let radius = SAVE_H / 2.0;
+    let ink = k.ink;
+    let (fg, rim) = if saved {
+        p.fill(r, radius, fade(alpha(k.a, 0x26)));
+        (k.hi_or_text(), alpha(k.a, 0x99))
+    } else {
+        if hovered {
+            p.fill(r, radius, fade(alpha(ink.light, 0x12)));
+        }
+        (ink.text, ink.line)
+    };
+    p.ring(r, radius, 1.0, fade(rim), false);
+    let gc = (r.x + SAVE_PAD + SAVE_GLYPH / 2.0, r.y + r.h / 2.0);
+    if saved {
+        icon(p, Icon::Check, gc, SAVE_GLYPH + 2.0, fade(fg), 1.6);
+    } else {
+        let h = SAVE_GLYPH / 2.0;
+        let st = lune_ui::paint::StrokeStyle::solid(fade(fg), 1.6);
+        p.stroke(&[[gc.0 - h, gc.1], [gc.0 + h, gc.1]], false, st);
+        p.stroke(&[[gc.0, gc.1 - h], [gc.0, gc.1 + h]], false, st);
+    }
+    text(
+        p,
+        save_label(sv),
+        13.0,
+        fade(fg),
+        true,
+        gc.0 + SAVE_GLYPH / 2.0 + SAVE_GAP,
+        r.y + (r.h - 17.0) / 2.0,
+        0.0,
+    );
 }
 
 /// The filter bar in `rect` editing `query`; whether it has keyboard focus.
@@ -315,6 +535,8 @@ mod tests {
             duration_ms: ms,
             images: vec![],
             year: None,
+            album_ref: None,
+            artists: vec![],
         }
     }
 

@@ -47,6 +47,23 @@ impl ImageRef {
     }
 }
 
+/// Most artists a track or an album names as links; the rest stay in the display string.
+pub const MAX_ARTISTS: usize = 8;
+
+/// Most popular tracks an artist page carries.
+pub const MAX_POPULAR: usize = 10;
+
+/// A named thing a link opens: an artist or an album. `uri` has the provider's own scheme
+/// (`spotify:artist:<id>`, `local:album:<hex>`), so `ProviderRegistry::resolve_uri` finds the
+/// provider that made it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityRef {
+    pub uri: String,
+    /// Display-clean (see [`Track::name`]).
+    pub name: String,
+}
+
 /// A track that passed validation. `uri` is the provider's own track URI (Spotify: exactly `spotify:track:<22 base62>`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +80,13 @@ pub struct Track {
     pub images: Vec<ImageRef>,
     /// Its album's release year.
     pub year: Option<u16>,
+    /// The artists as links, at most [`MAX_ARTISTS`], in the order of `artist`. Empty when the
+    /// provider cannot name them (no `explore`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artists: Vec<EntityRef>,
+    /// The album as a link; `None` when the provider cannot name it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_ref: Option<EntityRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,11 +133,33 @@ pub struct PlaylistPage {
     pub total: Option<u32>,
 }
 
+/// What kind of release an album is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AlbumKind {
+    Album,
+    Single,
+    Compilation,
+    /// A release that lists the artist as a guest.
+    AppearsOn,
+    #[default]
+    Unknown,
+}
+
+impl AlbumKind {
+    fn is_unknown(&self) -> bool {
+        *self == AlbumKind::Unknown
+    }
+}
+
 /// A saved album, as a tree entry. `id` is 22 base62 characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Album {
     pub id: String,
+    /// The album's own URI (`<scheme>:album:<id>`); empty when the provider cannot name it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub uri: String,
     /// Display-clean (see [`Track::name`]).
     pub name: String,
     /// Artist names joined with ", ", display-clean.
@@ -122,6 +168,11 @@ pub struct Album {
     /// Covers, at most [`MAX_IMAGES`].
     pub images: Vec<ImageRef>,
     pub year: Option<u16>,
+    /// The artists as links, at most [`MAX_ARTISTS`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artists: Vec<EntityRef>,
+    #[serde(skip_serializing_if = "AlbumKind::is_unknown")]
+    pub kind: AlbumKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -131,6 +182,46 @@ pub struct AlbumPage {
     pub skipped: u32,
     pub next_offset: Option<u32>,
     pub total: Option<u32>,
+}
+
+/// An artist, as a page header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artist {
+    pub uri: String,
+    /// Display-clean (see [`Track::name`]).
+    pub name: String,
+    /// Portraits, at most [`MAX_IMAGES`].
+    pub images: Vec<ImageRef>,
+}
+
+/// An artist page: the header, the popular tracks and the first page of releases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistPage {
+    pub artist: Artist,
+    /// At most [`MAX_POPULAR`]; empty when the provider has no such list.
+    pub popular: Vec<Track>,
+    /// The first page of releases, all groups together.
+    pub releases: AlbumPage,
+}
+
+/// An album opened by its URI: the album and its first page of tracks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumDetail {
+    pub album: Album,
+    pub tracks: TrackPage,
+}
+
+/// Which releases of an artist a page lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReleaseGroup {
+    All,
+    Albums,
+    Singles,
+    AppearsOn,
 }
 
 /// What a provider can do; the UI hides what is off.
@@ -147,6 +238,13 @@ pub struct Capabilities {
     pub search: bool,
     /// The library can say which tracks are saved and change that (needs `library`).
     pub likes: bool,
+    /// The library opens artists and albums by URI (`Library::artist`, `album`,
+    /// `artist_releases`) and names them on its tracks and albums (needs `library`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub explore: bool,
+    /// `Library::liked` and `set_liked` also take album URIs (needs `likes`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub save_albums: bool,
 }
 
 /// One text input of a login step.
@@ -335,12 +433,22 @@ mod tests {
                 eq: false,
                 search: true,
                 likes: false,
+                explore: false,
+                save_albums: false,
             },
             auth_steps: vec![],
         };
         assert_eq!(
             serde_json::to_string(&i).unwrap(),
             r#"{"id":"p","name":"P","glyph":"other","caps":{"library":true,"pcmTap":false,"eq":false,"search":true,"likes":false},"authSteps":[]}"#
+        );
+        let mut on = i.clone();
+        on.caps.explore = true;
+        on.caps.save_albums = true;
+        assert!(
+            serde_json::to_string(&on)
+                .unwrap()
+                .contains(r#""likes":false,"explore":true,"saveAlbums":true}"#)
         );
     }
 }

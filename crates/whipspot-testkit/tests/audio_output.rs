@@ -380,6 +380,8 @@ async fn pause_rig_with(mode: OutputMode, uris: &[&str]) -> PlayerRig {
                 duration_ms: 180_000,
                 images: vec![],
                 year: None,
+                album_ref: None,
+                artists: vec![],
             })
             .collect(),
         index: 0,

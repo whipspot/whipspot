@@ -4,16 +4,16 @@
 //!
 //! A check asks for a [`Fingerprint`] (playlist version stamps, liked total and newest
 //! `added_at`) and compares it with the last one. The first check only stores it. A failed or
-//! malformed answer changes nothing. Checks are asked for by
+//! malformed answer changes nothing, and while Spotify's rate limit holds no request is sent. Checks are asked for by
 //!
-//! * the front-end, on window focus ([`LibraryWatch::check`], at most one per 30 s),
-//! * a 5-minute timer ([`LibraryWatch::spawn_timer`]),
+//! * the front-end, on window focus ([`LibraryWatch::check`], at most one per 15 min),
+//! * a 30-minute timer ([`LibraryWatch::spawn_timer`]),
 //! * the Connect session's dealer, on any message under `hm://playlist/` or `hm://collection/`
 //!   ([`LibraryWatch::hint`], coalesced for 2 s; the message itself is never read).
 //!
 //! At most one check runs at a time. A Library login or logout ([`LibraryWatch::reset`]) drops
 //! the stored fingerprint, and a check that was in flight across it is discarded (it may have
-//! been another account's): the MD137 rule. Nothing here logs.
+//! been another account's): the MD137 rule. Each check logs one debug line with its trigger.
 
 use std::{
     sync::{
@@ -32,9 +32,10 @@ use crate::{
 use whipspot_core::{events::UiEvent, provider::BoxFuture};
 
 /// The least time between two checks asked for by the front-end (window focus).
-pub(crate) const FOCUS_GAP: Duration = Duration::from_secs(30);
+/// Every check costs at least two Web API requests from a Development Mode quota (MD199).
+pub(crate) const FOCUS_GAP: Duration = Duration::from_secs(15 * 60);
 /// The time between the timer's checks.
-pub(crate) const TIMER_PERIOD: Duration = Duration::from_secs(300);
+pub(crate) const TIMER_PERIOD: Duration = Duration::from_secs(30 * 60);
 /// Dealer messages that arrive within this time of the first one make one check.
 pub(crate) const HINT_WINDOW: Duration = Duration::from_secs(2);
 
@@ -108,6 +109,7 @@ impl LibraryWatch {
             }
             s.started = Some(now);
         }
+        log::debug!("library watch: check on window focus");
         self.compare().await;
     }
 
@@ -115,6 +117,7 @@ impl LibraryWatch {
     async fn check_now(&self) {
         let _running = self.running.lock().await;
         self.lock().started = Some(Instant::now());
+        log::debug!("library watch: check on the timer or a Connect hint");
         self.compare().await;
     }
 
@@ -134,6 +137,7 @@ impl LibraryWatch {
             changed
         };
         if changed {
+            log::info!("library watch: the library changed, lists reload");
             // No receivers is fine.
             let _ = self.events.send(UiEvent::LibraryChanged {
                 provider: ID.to_owned(),
@@ -342,23 +346,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_focus_check_waits_thirty_seconds_but_a_forced_one_does_not() {
+    async fn the_focus_check_waits_the_gap_but_a_forced_one_does_not() {
+        let just_under = FOCUS_GAP - Duration::from_secs(1);
         let (w, fake, _rx) = rig();
         w.check_limited().await;
         w.check_limited().await;
         assert_eq!(fake.asks(), 1);
-        advance(Duration::from_secs(29)).await;
+        advance(just_under).await;
         w.check_limited().await;
         assert_eq!(fake.asks(), 1);
         w.check_now().await;
         assert_eq!(fake.asks(), 2);
         // The forced one restarted the gap.
-        advance(Duration::from_secs(29)).await;
+        advance(just_under).await;
         w.check_limited().await;
         assert_eq!(fake.asks(), 2);
         advance(Duration::from_secs(2)).await;
         w.check_limited().await;
         assert_eq!(fake.asks(), 3);
+    }
+
+    #[test]
+    fn checks_are_rare_enough_for_the_quota() {
+        assert_eq!(FOCUS_GAP, Duration::from_secs(900));
+        assert_eq!(TIMER_PERIOD, Duration::from_secs(1800));
     }
 
     #[tokio::test(start_paused = true)]

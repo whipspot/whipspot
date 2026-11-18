@@ -1,10 +1,12 @@
 //! The log sink (MD15): the `log` facade (librespot logs through it) into `whipspot.log` in the
 //! log directory, the previous run's file kept as `whipspot.1.log`.
 //!
-//! Levels: targets `whipspot*` at info, everything else (librespot included) at warn. Each line
-//! is `<UTC time> <level> <target> <message>`. Our crates log fixed texts only: no `Secret`, login
-//! input, client id, library data or provider error text ever reaches a log line. The panic hook
-//! logs the place of a panic and never its payload.
+//! Levels (MD198, verbose by the user's choice): targets `whipspot*` at debug, `librespot*` at
+//! info, everything else (GPU, windowing, HTTP internals) at warn. Each line is `<UTC time> <level> <target> <message>`. Our crates
+//! log fixed texts plus ids, uris, request paths, HTTP statuses, timings and granted scopes; never
+//! a `Secret`, token, client id, header, response body or library error text. librespot's info
+//! lines are its own wording (they can name tracks and the account). The panic hook logs the
+//! place of a panic and never its payload.
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -23,8 +25,11 @@ const PREVIOUS_FILE: &str = "whipspot.1.log";
 /// The most verbose level logged for `target`.
 fn level_for(target: &str) -> LevelFilter {
     if target.starts_with("whipspot") {
+        LevelFilter::Debug
+    } else if target.starts_with("librespot") {
         LevelFilter::Info
     } else {
+        // GPU, windowing and HTTP internals stay quiet: they can log every frame.
         LevelFilter::Warn
     }
 }
@@ -52,11 +57,49 @@ fn utc(secs: u64) -> String {
 }
 
 /// One log line without its newline; line breaks inside the message become spaces, so a message
-/// cannot pose as another line.
+/// cannot pose as another line, and every URL loses its query and fragment (`?<redacted>`): a
+/// library's line can carry a signed CDN or login URL whose query is a token (hard rule 1).
 fn line(secs: u64, level: Level, target: &str, message: &str) -> String {
     let mut out = format!("{} {level} {target} ", utc(secs));
-    for c in message.chars() {
+    for c in redact_urls(message).chars() {
         out.push(if c == '\n' || c == '\r' { ' ' } else { c });
+    }
+    out
+}
+
+/// `message` with the query and fragment of each `http://` or `https://` URL (case-insensitive)
+/// replaced by `?<redacted>`; the URL ends at whitespace or a quote.
+fn redact_urls(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < message.len() {
+        let rest = &lower[i..];
+        let scheme = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            0
+        };
+        if scheme == 0 {
+            let c = message[i..].chars().next().unwrap_or(' ');
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+        let end = message[i..]
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`')
+            .map_or(message.len(), |n| i + n);
+        let url = &message[i..end];
+        match url.find(['?', '#']) {
+            Some(q) => {
+                out.push_str(&url[..q]);
+                out.push_str("?<redacted>");
+            }
+            None => out.push_str(url),
+        }
+        i = end;
     }
     out
 }
@@ -120,7 +163,7 @@ pub fn init(paths: Option<&AppPaths>) {
     if log::set_logger(logger).is_err() {
         return;
     }
-    log::set_max_level(LevelFilter::Info);
+    log::set_max_level(LevelFilter::Debug);
     install_panic_hook();
     log::info!("log started");
 }
@@ -155,10 +198,37 @@ mod tests {
 
     #[test]
     fn levels_follow_the_target() {
-        assert_eq!(level_for("whipspot_app"), LevelFilter::Info);
-        assert_eq!(level_for("whipspot_spotify::session"), LevelFilter::Info);
-        assert_eq!(level_for("librespot_playback::player"), LevelFilter::Warn);
+        assert_eq!(level_for("whipspot_app"), LevelFilter::Debug);
+        assert_eq!(level_for("whipspot_spotify::session"), LevelFilter::Debug);
+        assert_eq!(level_for("librespot_playback::player"), LevelFilter::Info);
         assert_eq!(level_for("wgpu_core"), LevelFilter::Warn);
+    }
+
+    #[test]
+    fn url_queries_and_fragments_are_redacted() {
+        assert_eq!(
+            redact_urls("Fetching https://audio.example/a/b?__token__=exp=1~hmac=ff failed"),
+            "Fetching https://audio.example/a/b?<redacted> failed"
+        );
+        assert_eq!(
+            redact_urls("go \"HTTP://x.example/cb#code=abc\" now"),
+            "go \"HTTP://x.example/cb?<redacted>\" now"
+        );
+        assert_eq!(
+            redact_urls("web api GET /me/playlists?limit=50 -> 200"),
+            "web api GET /me/playlists?limit=50 -> 200"
+        );
+        assert_eq!(
+            redact_urls("é https://a.example/p"),
+            "é https://a.example/p"
+        );
+        let text = line(
+            0,
+            Level::Warn,
+            "librespot_audio",
+            "x https://c.example/f?t=1",
+        );
+        assert!(!text.contains("t=1"));
     }
 
     #[test]

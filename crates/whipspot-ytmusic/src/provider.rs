@@ -116,6 +116,8 @@ impl Provider for YtMusicProvider {
                 eq: true,
                 search: true,
                 likes: true,
+                explore: true,
+                save_albums: true,
             },
             auth_steps: auth_steps(),
         }

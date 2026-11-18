@@ -6,6 +6,10 @@ use std::path::{Component, Path, PathBuf};
 
 pub const TRACK_PREFIX: &str = "local:track:";
 pub const ALBUM_PREFIX: &str = "album:";
+/// The uri of an album: `local:album:<16 hex>` (the hex of its [`ALBUM_PREFIX`] id).
+pub const ALBUM_URI_PREFIX: &str = "local:album:";
+/// The uri of an artist: `local:artist:<16 hex>`, minted from the normalised name.
+pub const ARTIST_URI_PREFIX: &str = "local:artist:";
 pub const PLAYLIST_PREFIX: &str = "playlist:";
 /// The art ref of a track: `local-art:<track uri>` (D9).
 pub const ART_PREFIX: &str = "local-art:";
@@ -51,6 +55,23 @@ impl IdMinter {
 /// Whether `uri` has the shape `local:track:<16 lowercase hex>`.
 pub fn is_track_uri(uri: &str) -> bool {
     uri.strip_prefix(TRACK_PREFIX).is_some_and(is_hex16)
+}
+
+/// Whether `uri` has the shape `local:artist:<16 lowercase hex>`.
+pub fn is_artist_uri(uri: &str) -> bool {
+    uri.strip_prefix(ARTIST_URI_PREFIX).is_some_and(is_hex16)
+}
+
+/// The album id (`album:<16 hex>`) of the album uri `local:album:<16 hex>`; `None` for any other
+/// shape.
+pub fn album_id_of_uri(uri: &str) -> Option<String> {
+    let hex = uri.strip_prefix(ALBUM_URI_PREFIX).filter(|h| is_hex16(h))?;
+    Some(format!("{ALBUM_PREFIX}{hex}"))
+}
+
+/// The album uri of the album id `album:<hex>`.
+pub fn album_uri_of_id(id: &str) -> String {
+    format!("local:{id}")
 }
 
 fn is_hex16(s: &str) -> bool {

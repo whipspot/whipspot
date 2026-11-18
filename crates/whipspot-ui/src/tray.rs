@@ -592,6 +592,8 @@ mod tests {
             duration_ms: 1000,
             images: vec![],
             year: None,
+            album_ref: None,
+            artists: vec![],
         }
     }
 

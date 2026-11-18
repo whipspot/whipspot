@@ -292,7 +292,10 @@ impl QueuePane {
             ui,
             geo.table,
             look,
-            Form { album_page: false },
+            Form {
+                album_page: false,
+                ..Form::default()
+            },
             slot,
             visible,
             "The queue is empty.",

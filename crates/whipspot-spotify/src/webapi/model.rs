@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::uri::{is_spotify_id, parse_track_uri};
+use crate::uri::{album_uri_id, artist_uri_id, is_spotify_id, parse_track_uri};
 
 /// Longest string kept for a name, artist or album.
 pub const MAX_TEXT_CHARS: usize = 200;
@@ -17,7 +17,8 @@ pub const MAX_ROWS: u32 = 2000;
 pub const SEARCH_MAX_ROWS: u32 = 1000;
 
 pub use whipspot_core::provider::model::{
-    Album, AlbumPage, ImageRef, MAX_IMAGES, Playlist, PlaylistPage, Readable, Track, TrackPage,
+    Album, AlbumDetail, AlbumKind, AlbumPage, Artist, ArtistPage, EntityRef, ImageRef, MAX_ARTISTS,
+    MAX_IMAGES, MAX_POPULAR, Playlist, PlaylistPage, Readable, ReleaseGroup, Track, TrackPage,
 };
 use whipspot_core::text::display_text;
 
@@ -97,6 +98,49 @@ fn strict_track_uri(v: Option<&Value>) -> Option<String> {
     parse_track_uri(s).filter(|canon| canon == s)
 }
 
+/// The artists of an `artists` array as links: entries with an exact `spotify:artist:<id>` uri
+/// and a non-empty name, at most [`MAX_ARTISTS`], in order. Anything else gives an empty list.
+fn artist_refs(v: Option<&Value>) -> Vec<EntityRef> {
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return vec![];
+    };
+    arr.iter()
+        .filter_map(|x| {
+            let uri = x.get("uri")?.as_str()?;
+            artist_uri_id(uri)?;
+            let name = text(x.get("name"));
+            (!name.is_empty()).then(|| EntityRef {
+                uri: uri.to_owned(),
+                name,
+            })
+        })
+        .take(MAX_ARTISTS)
+        .collect()
+}
+
+/// An `album` object of a track as a link: an exact `spotify:album:<id>` uri and a name.
+fn album_ref(v: Option<&Value>) -> Option<EntityRef> {
+    let v = v?;
+    let uri = v.get("uri")?.as_str()?;
+    album_uri_id(uri)?;
+    let name = text(v.get("name"));
+    (!name.is_empty()).then(|| EntityRef {
+        uri: uri.to_owned(),
+        name,
+    })
+}
+
+/// `album_type` or `album_group` as a kind; any other text is unknown.
+fn kind_of(v: Option<&Value>) -> AlbumKind {
+    match v.and_then(Value::as_str) {
+        Some("album") => AlbumKind::Album,
+        Some("single") => AlbumKind::Single,
+        Some("compilation") => AlbumKind::Compilation,
+        Some("appears_on") => AlbumKind::AppearsOn,
+        _ => AlbumKind::Unknown,
+    }
+}
+
 /// `item` if it is an object, else `track` if it is an object (`item` wins when both exist).
 fn entry_object(entry: &Value) -> Option<&Value> {
     ["item", "track"]
@@ -139,6 +183,8 @@ fn parse_track(obj: &Value) -> Option<Track> {
         duration_ms,
         images: parse_images(obj.get("album").and_then(|a| a.get("images"))),
         year: parse_year(obj.get("album").and_then(|a| a.get("release_date"))),
+        album_ref: album_ref(obj.get("album")),
+        artists: artist_refs(obj.get("artists")),
     })
 }
 
@@ -280,6 +326,37 @@ pub fn parse_playlist_page(
     })
 }
 
+/// One album object (`/me/albums` entries' `album`, an artist's releases, `/albums/{id}`): the
+/// id must be 22 base62 characters, else `None`. The kind is the object's `album_type`.
+fn parse_album(album: &Value) -> Option<Album> {
+    let id = album
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|i| is_spotify_id(i))?;
+    let artist = album
+        .get("artists")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|x| text(x.get("name")))
+                .filter(|n| !n.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    Some(Album {
+        id: id.to_owned(),
+        uri: format!("spotify:album:{id}"),
+        name: text(album.get("name")),
+        artist: artist.chars().take(MAX_TEXT_CHARS).collect(),
+        track_count: as_u32(album.get("total_tracks")),
+        images: parse_images(album.get("images")),
+        year: parse_year(album.get("release_date")),
+        artists: artist_refs(album.get("artists")),
+        kind: kind_of(album.get("album_type")),
+    })
+}
+
 /// `/me/albums`: entries are `{added_at, album: {id, name, artists, total_tracks}}`. An entry
 /// without an `album` object or with a bad id is skipped and counted.
 pub fn parse_album_page(page: &Value, offset: u32) -> Result<AlbumPage, UnexpectedShape> {
@@ -292,34 +369,14 @@ pub fn parse_album_page(page: &Value, offset: u32) -> Result<AlbumPage, Unexpect
     let mut items = Vec::new();
     let mut skipped = 0u32;
     for e in entries {
-        let album = e.get("album").filter(|a| a.is_object());
-        let id = album
-            .and_then(|a| a.get("id"))
-            .and_then(Value::as_str)
-            .filter(|i| is_spotify_id(i));
-        let (Some(album), Some(id)) = (album, id) else {
-            skipped += 1;
-            continue;
-        };
-        let artist = album
-            .get("artists")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .map(|x| text(x.get("name")))
-                    .filter(|n| !n.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        items.push(Album {
-            id: id.to_owned(),
-            name: text(album.get("name")),
-            artist: artist.chars().take(MAX_TEXT_CHARS).collect(),
-            track_count: as_u32(album.get("total_tracks")),
-            images: parse_images(album.get("images")),
-            year: parse_year(album.get("release_date")),
-        });
+        match e
+            .get("album")
+            .filter(|a| a.is_object())
+            .and_then(parse_album)
+        {
+            Some(a) => items.push(a),
+            None => skipped += 1,
+        }
     }
     Ok(AlbumPage {
         items,
@@ -327,6 +384,138 @@ pub fn parse_album_page(page: &Value, offset: u32) -> Result<AlbumPage, Unexpect
         next_offset,
         total,
     })
+}
+
+/// Whether the artists of release object `e` leave `artist` out: it lists artists, and none of
+/// them is `artist` (by uri or id). A release with no artists array, or an empty one, says nothing.
+fn omits_artist(e: &Value, artist: &str) -> bool {
+    let Some(list) = e.get("artists").and_then(Value::as_array) else {
+        return false;
+    };
+    let id = artist_uri_id(artist);
+    !list.is_empty()
+        && !list.iter().take(MAX_ARTIST_SCAN).any(|a| {
+            a.get("uri").and_then(Value::as_str) == Some(artist)
+                || id.is_some_and(|id| a.get("id").and_then(Value::as_str) == Some(id))
+        })
+}
+
+/// How many of a release's artists are looked at to tell whether `artist` is one of them.
+const MAX_ARTIST_SCAN: usize = 200;
+
+/// The kind of a release on the page of `artist`. A release that does not credit the artist is a
+/// guest appearance whichever group listed it (Spotify no longer sends `album_group`, so
+/// `appears_on` entries of the All list cannot be told by a field). Otherwise, for a group that
+/// was asked for the group decides (Spotify filtered by it); for [`ReleaseGroup::All`] the entry's
+/// own `album_group`, then its `album_type`.
+fn release_kind(e: &Value, group: ReleaseGroup, artist: &str) -> AlbumKind {
+    let compilation = kind_of(e.get("album_type")) == AlbumKind::Compilation
+        || kind_of(e.get("album_group")) == AlbumKind::Compilation;
+    if omits_artist(e, artist) {
+        return AlbumKind::AppearsOn;
+    }
+    match group {
+        ReleaseGroup::Singles => AlbumKind::Single,
+        ReleaseGroup::AppearsOn => AlbumKind::AppearsOn,
+        ReleaseGroup::Albums if compilation => AlbumKind::Compilation,
+        ReleaseGroup::Albums => AlbumKind::Album,
+        ReleaseGroup::All => match kind_of(e.get("album_group")) {
+            AlbumKind::Unknown => kind_of(e.get("album_type")),
+            k => k,
+        },
+    }
+}
+
+/// `/artists/{id}/albums`: entries are album objects, listed for the artist `artist` (a uri). A
+/// bad id is skipped and counted, and so is an album that already appeared on this page (the
+/// list is unique by uri).
+pub fn parse_releases_page(
+    page: &Value,
+    offset: u32,
+    group: ReleaseGroup,
+    artist: &str,
+) -> Result<AlbumPage, UnexpectedShape> {
+    let Frame {
+        entries,
+        next_offset,
+        total,
+        ..
+    } = page_frame(page, offset)?;
+    let mut items: Vec<Album> = Vec::new();
+    let mut skipped = 0u32;
+    for e in entries {
+        match parse_album(e) {
+            Some(mut a) if !items.iter().any(|x| x.uri == a.uri) => {
+                a.kind = release_kind(e, group, artist);
+                items.push(a);
+            }
+            _ => skipped += 1,
+        }
+    }
+    Ok(AlbumPage {
+        items,
+        skipped,
+        next_offset,
+        total,
+    })
+}
+
+/// `/artists/{id}`: the header. `uri` is the one that was asked for; a response whose own `id`
+/// differs from it, or that has no name, is not this artist.
+pub fn parse_artist(v: &Value, uri: &str) -> Result<Artist, UnexpectedShape> {
+    let id = artist_uri_id(uri).ok_or(UnexpectedShape)?;
+    if v.get("id").and_then(Value::as_str).is_some_and(|i| i != id) {
+        return Err(UnexpectedShape);
+    }
+    let name = text(v.get("name"));
+    if name.is_empty() {
+        return Err(UnexpectedShape);
+    }
+    Ok(Artist {
+        uri: uri.to_owned(),
+        name,
+        images: parse_images(v.get("images")),
+    })
+}
+
+/// `/albums/{id}`: the album and its first page of tracks. The simplified tracks have no `album`
+/// object, so each one gets the album's name, ref, covers and year. The album is the one asked
+/// for (`uri`); a response with another `id` is not it.
+pub fn parse_album_detail(v: &Value, uri: &str) -> Result<AlbumDetail, UnexpectedShape> {
+    let id = album_uri_id(uri).ok_or(UnexpectedShape)?;
+    let album = parse_album(v).ok_or(UnexpectedShape)?;
+    if album.id != id || album.name.is_empty() {
+        return Err(UnexpectedShape);
+    }
+    let page = v
+        .get("tracks")
+        .filter(|t| t.is_object())
+        .or_else(|| v.get("items").filter(|i| i.is_object()))
+        .ok_or(UnexpectedShape)?;
+    let mut tracks = parse_tracks(page, 0, |e| e.is_object().then_some(e))?;
+    let link = EntityRef {
+        uri: album.uri.clone(),
+        name: album.name.clone(),
+    };
+    for t in &mut tracks.items {
+        t.album = album.name.clone();
+        t.album_ref = Some(link.clone());
+        t.images = album.images.clone();
+        t.year = album.year;
+    }
+    Ok(AlbumDetail { album, tracks })
+}
+
+/// The popular tracks of an artist out of a track search: the tracks that credit `artist_uri`,
+/// in the search's order, at most [`MAX_POPULAR`].
+pub fn parse_popular(resp: &Value, artist_uri: &str) -> Result<Vec<Track>, UnexpectedShape> {
+    let page = parse_search_page(resp, 0)?;
+    Ok(page
+        .items
+        .into_iter()
+        .filter(|t| t.artists.iter().any(|a| a.uri == artist_uri))
+        .take(MAX_POPULAR)
+        .collect())
 }
 
 /// What a look at the user's library compares: the playlists' version stamps and the liked
@@ -875,5 +1064,419 @@ mod tests {
         // U+200D (a joiner) stays.
         assert_eq!(r.items[0].artist, "Art\u{200D}ist");
         assert_eq!(r.items[0].album, "Alb um");
+    }
+
+    // ------------------------------------------------------------ explore (refs, releases, ...)
+
+    const ART: &str = "0OdUWJ0sBjDrqHygGUXeCF";
+
+    /// The uri of the artist every `release()` credits.
+    fn mine() -> String {
+        format!("spotify:artist:{ART}")
+    }
+
+    fn artist_obj(id: &str, name: &str) -> Value {
+        json!({"id": id, "uri": format!("spotify:artist:{id}"), "name": name})
+    }
+
+    fn release(id: &str, name: &str, album_type: &str, group: Option<&str>) -> Value {
+        let mut v = json!({
+            "id": id, "uri": format!("spotify:album:{id}"), "name": name,
+            "album_type": album_type, "total_tracks": 9, "release_date": "1999-05",
+            "artists": [artist_obj(ART, "Maker")],
+            "images": [{"url": "https://i.scdn.co/a", "width": 640, "height": 640}],
+        });
+        if let Some(g) = group {
+            v["album_group"] = json!(g);
+        }
+        v
+    }
+
+    /// E1
+    #[test]
+    fn tracks_keep_artist_and_album_links_that_pass_the_strict_check() {
+        let mut t = track(A, "Song");
+        t["artists"] = json!([
+            artist_obj(ART, "One"),
+            // A bare id, another type, a trailing newline, no name, no uri and a non-object.
+            {"uri": ART, "name": "Bare"},
+            {"uri": format!("spotify:album:{ART}"), "name": "Wrong type"},
+            {"uri": format!("spotify:artist:{ART}\n"), "name": "Newline"},
+            {"uri": format!("spotify:artist:{B}"), "name": ""},
+            {"name": "No uri"},
+            "x",
+            null,
+            artist_obj(B, "Two"),
+        ]);
+        t["album"] = json!({"name": "Alb", "uri": format!("spotify:album:{B}")});
+        let r = parse_track_page(&page(vec![json!({"item": t})], Value::Null), 0).unwrap();
+        let t = &r.items[0];
+        let refs: Vec<(&str, &str)> = t
+            .artists
+            .iter()
+            .map(|a| (a.uri.as_str(), a.name.as_str()))
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                (format!("spotify:artist:{ART}").as_str(), "One"),
+                (format!("spotify:artist:{B}").as_str(), "Two"),
+            ]
+        );
+        // The display string is unchanged by the refs (every named artist).
+        assert!(t.artist.starts_with("One, Bare, Wrong type"));
+        assert_eq!(
+            t.album_ref,
+            Some(EntityRef {
+                uri: format!("spotify:album:{B}"),
+                name: "Alb".into()
+            })
+        );
+        // No album uri, a track uri in its place, or no name: no link.
+        for bad in [
+            json!({"name": "Alb"}),
+            json!({"name": "Alb", "uri": format!("spotify:track:{B}")}),
+            json!({"name": "", "uri": format!("spotify:album:{B}")}),
+            json!("album"),
+            Value::Null,
+        ] {
+            let mut t = track(A, "Song");
+            t["album"] = bad;
+            let r = parse_track_page(&page(vec![json!({"item": t})], Value::Null), 0).unwrap();
+            assert_eq!(r.items[0].album_ref, None);
+        }
+    }
+
+    /// E2
+    #[test]
+    fn at_most_max_artists_links_are_kept() {
+        let mut t = track(A, "Song");
+        t["artists"] = Value::Array(
+            (0..40)
+                .map(|i| artist_obj(&format!("{i:0>22}"), &format!("N{i}")))
+                .collect(),
+        );
+        let r = parse_track_page(&page(vec![json!({"item": t})], Value::Null), 0).unwrap();
+        assert_eq!(r.items[0].artists.len(), MAX_ARTISTS);
+        assert_eq!(r.items[0].artists[0].name, "N0");
+    }
+
+    /// E3
+    #[test]
+    fn saved_and_release_albums_carry_uri_artists_and_kind() {
+        let p = page(
+            vec![json!({"added_at": "x", "album": release(A, "Al", "compilation", None)})],
+            Value::Null,
+        );
+        let a = &parse_album_page(&p, 0).unwrap().items[0];
+        assert_eq!(a.uri, format!("spotify:album:{A}"));
+        assert_eq!(a.kind, AlbumKind::Compilation);
+        assert_eq!(a.artists[0].uri, format!("spotify:artist:{ART}"));
+        assert_eq!(a.artist, "Maker");
+        // A kind this code does not know is Unknown, never a guess.
+        let mut weird = release(A, "Al", "ep", None);
+        weird["album_type"] = json!(5);
+        let p = page(vec![json!({"album": weird})], Value::Null);
+        assert_eq!(
+            parse_album_page(&p, 0).unwrap().items[0].kind,
+            AlbumKind::Unknown
+        );
+    }
+
+    /// E4
+    #[test]
+    fn releases_take_their_kind_from_the_group_asked() {
+        let entries = vec![
+            release(A, "Alb", "album", Some("album")),
+            release(B, "Sing", "single", Some("single")),
+            release(
+                "1".repeat(22).as_str(),
+                "Comp",
+                "compilation",
+                Some("compilation"),
+            ),
+            release(
+                "2".repeat(22).as_str(),
+                "Guest",
+                "compilation",
+                Some("appears_on"),
+            ),
+            release("3".repeat(22).as_str(), "NoGroup", "single", None),
+        ];
+        let p = page(entries.clone(), Value::Null);
+        let kinds = |g| -> Vec<AlbumKind> {
+            parse_releases_page(&p, 0, g, &format!("spotify:artist:{ART}"))
+                .unwrap()
+                .items
+                .iter()
+                .map(|a| a.kind)
+                .collect()
+        };
+        use AlbumKind::*;
+        assert_eq!(
+            kinds(ReleaseGroup::All),
+            [Album, Single, Compilation, AppearsOn, Single]
+        );
+        // The group asked decides when Spotify filtered by it.
+        assert!(kinds(ReleaseGroup::Singles).iter().all(|k| *k == Single));
+        assert!(
+            kinds(ReleaseGroup::AppearsOn)
+                .iter()
+                .all(|k| *k == AppearsOn)
+        );
+        assert!(
+            kinds(ReleaseGroup::Albums)
+                .iter()
+                .all(|k| matches!(k, Album | Compilation))
+        );
+    }
+
+    /// E4b: Spotify no longer sends `album_group`, so a release that does not credit the page's
+    /// artist is a guest appearance whichever list it came from.
+    #[test]
+    fn a_release_that_does_not_credit_the_artist_is_appears_on_without_album_group() {
+        let other = "5".repeat(22);
+        let by_other = |id: &str, name: &str, ty: &str| {
+            let mut v = release(id, name, ty, None);
+            v["artists"] = json!([artist_obj(&other, "Someone")]);
+            v
+        };
+        let various = "6".repeat(22);
+        let mut vcomp = release(&various, "Hits Vol 3", "compilation", None);
+        vcomp["artists"] = json!([artist_obj(&"7".repeat(22), "Various Artists")]);
+        let entries = vec![
+            release(A, "Own album", "album", None),
+            release(B, "Own single", "single", None),
+            release(&"1".repeat(22), "Own comp", "compilation", None),
+            by_other(&"2".repeat(22), "Their album", "album"),
+            vcomp,
+            by_other(&"3".repeat(22), "Their single", "single"),
+        ];
+        let p = page(entries, Value::Null);
+        let kinds = |g| -> Vec<AlbumKind> {
+            parse_releases_page(&p, 0, g, &mine())
+                .unwrap()
+                .items
+                .iter()
+                .map(|a| a.kind)
+                .collect()
+        };
+        use AlbumKind::*;
+        assert_eq!(
+            kinds(ReleaseGroup::All),
+            [Album, Single, Compilation, AppearsOn, AppearsOn, AppearsOn]
+        );
+        // Under every group the guest releases keep that label; an own release keeps its own.
+        assert_eq!(
+            kinds(ReleaseGroup::Albums)[..3],
+            [Album, Album, Compilation]
+        );
+        assert!(
+            kinds(ReleaseGroup::Albums)[3..]
+                .iter()
+                .all(|k| *k == AppearsOn)
+        );
+        // Judged by the artists' uri or, failing that, their id; no artists says nothing.
+        let mut by_id = release(A, "By id", "album", None);
+        by_id["artists"] = json!([{"id": ART, "name": "Maker"}]);
+        let mut none = release(B, "No artists", "single", None);
+        none["artists"] = json!([]);
+        let mut missing = release(&"1".repeat(22), "Missing", "album", None);
+        missing.as_object_mut().unwrap().remove("artists");
+        let p = page(vec![by_id, none, missing], Value::Null);
+        let r = parse_releases_page(&p, 0, ReleaseGroup::All, &mine()).unwrap();
+        assert_eq!(
+            r.items.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [Album, Single, Album]
+        );
+        // The artist is found among many other artists.
+        let mut crowd = release(A, "Crowd", "album", None);
+        crowd["artists"] = Value::Array(
+            (0..50)
+                .map(|i| artist_obj(&format!("{i:0>22}"), "x"))
+                .chain([artist_obj(ART, "Maker")])
+                .collect(),
+        );
+        let p = page(vec![crowd], Value::Null);
+        let r = parse_releases_page(&p, 0, ReleaseGroup::All, &mine()).unwrap();
+        assert_eq!(r.items[0].kind, Album);
+    }
+
+    /// E5
+    #[test]
+    fn releases_skip_bad_ids_and_repeats_and_page_by_offset() {
+        let mut dup = release(A, "Alb again", "album", None);
+        dup["name"] = json!("Alb again");
+        let p = page(
+            vec![
+                release(A, "Alb", "album", None),
+                dup,
+                json!({"id": "short", "name": "Bad"}),
+                json!(null),
+                json!("x"),
+                release(B, "Two", "album", None),
+            ],
+            json!("https://evil.example/next"),
+        );
+        let r = parse_releases_page(&p, 100, ReleaseGroup::All, &mine()).unwrap();
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.skipped, 4);
+        assert_eq!(r.items[0].name, "Alb");
+        // `next` is only a "more" flag; the offset is computed here (6 raw entries).
+        assert_eq!(r.next_offset, Some(106));
+        // Not a page.
+        assert_eq!(
+            parse_releases_page(&json!({"albums": []}), 0, ReleaseGroup::All, &mine()),
+            Err(UnexpectedShape)
+        );
+    }
+
+    /// E6
+    #[test]
+    fn an_artist_header_needs_its_name_and_the_asked_id() {
+        let uri = format!("spotify:artist:{ART}");
+        let v = json!({"id": ART, "name": "Maker\u{200B}", "images": [
+            {"url": "https://i.scdn.co/p", "width": 640, "height": 640},
+            {"url": "http://plain.example/p"}]});
+        let a = parse_artist(&v, &uri).unwrap();
+        assert_eq!((a.uri.as_str(), a.name.as_str()), (uri.as_str(), "Maker"));
+        assert_eq!(url_of(&a.images), ["https://i.scdn.co/p"]);
+        // Another artist's id, no name, a wrong-typed body, a bad asked uri.
+        assert_eq!(
+            parse_artist(&json!({"id": B, "name": "Other"}), &uri),
+            Err(UnexpectedShape)
+        );
+        assert_eq!(
+            parse_artist(&json!({"id": ART}), &uri),
+            Err(UnexpectedShape)
+        );
+        assert_eq!(parse_artist(&json!([1, 2]), &uri), Err(UnexpectedShape));
+        assert_eq!(parse_artist(&v, ART), Err(UnexpectedShape));
+        // An id-less header is accepted (the id is only compared when present).
+        assert!(parse_artist(&json!({"name": "Maker"}), &uri).is_ok());
+    }
+
+    /// E7
+    #[test]
+    fn an_album_detail_names_the_album_on_every_track() {
+        let uri = format!("spotify:album:{A}");
+        let simple = |id: &str, n: &str| {
+            json!({"type": "track", "uri": format!("spotify:track:{id}"), "name": n,
+                   "duration_ms": 1000, "artists": [artist_obj(ART, "Maker")]})
+        };
+        let mut v = release(A, "The Album", "album", None);
+        v["tracks"] = json!({"items": [simple(B, "One"), json!(null), simple(A, "Two")],
+                             "total": 12, "next": "https://api.spotify.com/x"});
+        let d = parse_album_detail(&v, &uri).unwrap();
+        assert_eq!(d.album.uri, uri);
+        assert_eq!(d.album.kind, AlbumKind::Album);
+        assert_eq!((d.tracks.items.len(), d.tracks.skipped), (2, 1));
+        assert_eq!((d.tracks.next_offset, d.tracks.total), (Some(3), Some(12)));
+        for t in &d.tracks.items {
+            assert_eq!(t.album, "The Album");
+            assert_eq!(
+                t.album_ref.as_ref().map(|r| r.uri.as_str()),
+                Some(uri.as_str())
+            );
+            assert_eq!(t.year, Some(1999));
+            assert_eq!(url_of(&t.images), ["https://i.scdn.co/a"]);
+            assert_eq!(t.artists[0].name, "Maker");
+        }
+        // `items` in place of `tracks` (the migration's rename) is read too.
+        let mut w = v.clone();
+        let t = w["tracks"].take();
+        w["items"] = t;
+        assert_eq!(parse_album_detail(&w, &uri).unwrap().tracks.items.len(), 2);
+        // Another album, no tracks, an unnamed album and a bad asked uri are not an album.
+        assert_eq!(
+            parse_album_detail(&v, &format!("spotify:album:{B}")),
+            Err(UnexpectedShape)
+        );
+        let mut no_tracks = v.clone();
+        no_tracks["tracks"] = json!("x");
+        assert_eq!(parse_album_detail(&no_tracks, &uri), Err(UnexpectedShape));
+        let mut unnamed = v.clone();
+        unnamed["name"] = json!("");
+        assert_eq!(parse_album_detail(&unnamed, &uri), Err(UnexpectedShape));
+        assert_eq!(parse_album_detail(&v, A), Err(UnexpectedShape));
+    }
+
+    /// E8
+    #[test]
+    fn popular_keeps_only_tracks_crediting_the_artist_and_at_most_ten() {
+        let uri = format!("spotify:artist:{ART}");
+        let mine = |i: usize| {
+            let mut t = track(&format!("{i:0>22}"), &format!("Mine {i}"));
+            t["artists"] = json!([artist_obj(B, "Other"), artist_obj(ART, "Maker")]);
+            t
+        };
+        let mut other = track(B, "Theirs");
+        other["artists"] = json!([artist_obj(B, "Other")]);
+        let mut entries: Vec<Value> = (0..15).map(mine).collect();
+        entries.insert(1, other);
+        entries.insert(2, json!(null));
+        let resp = json!({"tracks": {"items": entries, "total": 99, "next": null}});
+        let p = parse_popular(&resp, &uri).unwrap();
+        assert_eq!(p.len(), MAX_POPULAR);
+        assert_eq!(p[0].name, "Mine 0");
+        assert!(p.iter().all(|t| t.artists.iter().any(|a| a.uri == uri)));
+        // No tracks credit it: empty, not an error. A body that is no search page: an error.
+        assert!(
+            parse_popular(&resp, &format!("spotify:artist:{}", "9".repeat(22)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(parse_popular(&json!({}), &uri), Err(UnexpectedShape));
+    }
+
+    /// E9: hostile bodies are errors or skips, never a panic, and big arrays stay capped.
+    #[test]
+    fn hostile_explore_bodies_are_total() {
+        let uri_a = format!("spotify:artist:{ART}");
+        let uri_b = format!("spotify:album:{A}");
+        let bodies = [
+            json!(null),
+            json!(1),
+            json!("x"),
+            json!([]),
+            json!({}),
+            json!({"items": null, "tracks": null, "name": 5, "id": []}),
+            json!({"items": [null, 1, "x", [], {"id": 5}, {"id": null, "album": 3}]}),
+            json!({"id": A, "name": "n", "tracks": {"items": 7}}),
+            json!({"id": A, "name": "n", "tracks": {"items": [{"artists": 5, "album": []}]}}),
+            json!({"tracks": {"items": {"a": 1}}}),
+            json!({"items": [{"artists": [[], {}, null, {"uri": 5, "name": 6}]}]}),
+        ];
+        for b in &bodies {
+            let _ = parse_artist(b, &uri_a);
+            let _ = parse_album_detail(b, &uri_b);
+            let _ = parse_popular(b, &uri_a);
+            for g in [
+                ReleaseGroup::All,
+                ReleaseGroup::Albums,
+                ReleaseGroup::Singles,
+                ReleaseGroup::AppearsOn,
+            ] {
+                let _ = parse_releases_page(b, 0, g, &uri_a);
+                let _ = parse_releases_page(b, u32::MAX, g, &uri_a);
+            }
+        }
+        // Huge arrays: images, artists and a release page are capped; nothing grows unbounded.
+        let mut big = release(A, "Big", "album", None);
+        big["images"] = Value::Array(
+            (0..500)
+                .map(|i| json!({"url": format!("https://i.scdn.co/{i}"), "width": 64}))
+                .collect(),
+        );
+        big["artists"] = Value::Array((0..500).map(|_| artist_obj(ART, "Maker")).collect());
+        let p = page(vec![big], Value::Null);
+        let a = &parse_releases_page(&p, 0, ReleaseGroup::All, &mine())
+            .unwrap()
+            .items[0];
+        assert_eq!(a.images.len(), MAX_IMAGES);
+        assert_eq!(a.artists.len(), MAX_ARTISTS);
+        let giant = "é".repeat(100_000);
+        let v = json!({"id": ART, "name": giant});
+        assert!(parse_artist(&v, &uri_a).unwrap().name.chars().count() <= MAX_TEXT_CHARS);
     }
 }

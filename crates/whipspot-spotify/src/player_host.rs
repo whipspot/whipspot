@@ -178,6 +178,7 @@ impl PlayerHost {
         let _g = self.connect_lock.lock().await;
         let result = self.connect_locked().await;
         if let Err(e) = &result {
+            log::warn!("spotify playback: session not ready: {e}");
             self.emit(UiEvent::error(e.to_string()));
         }
         result
@@ -196,14 +197,25 @@ impl PlayerHost {
     async fn connect_locked(&self) -> Result<(), Error> {
         match self.backend.session_state() {
             SessionState::Valid => return Ok(()),
-            SessionState::Invalid => self.emit(UiEvent::SessionLost),
-            SessionState::None => {}
+            SessionState::Invalid => {
+                log::warn!("spotify playback: session lost, reconnecting");
+                self.emit(UiEvent::SessionLost)
+            }
+            SessionState::None => log::info!("spotify playback: opening a session"),
         }
         let token = self.tokens.access_token().await?;
         match self.backend.connect(&token).await {
-            Ok(()) => return Ok(()),
-            Err(ConnectError::NoAudio) => return Err(Error::AudioUnavailable),
-            Err(ConnectError::Failed) => {}
+            Ok(()) => {
+                log::info!("spotify playback: session open");
+                return Ok(());
+            }
+            Err(ConnectError::NoAudio) => {
+                log::warn!("spotify playback: session open but no audio output");
+                return Err(Error::AudioUnavailable);
+            }
+            Err(ConnectError::Failed) => {
+                log::warn!("spotify playback: session failed, retrying with a fresh token")
+            }
         }
         // One retry with a token that is certainly fresh.
         let token = self.tokens.force_refresh().await?;
@@ -217,9 +229,17 @@ impl PlayerHost {
     /// Load a track (`spotify:track:<22 base62>`, or a bare id). An invalid URI is rejected
     /// before any token or network use.
     pub async fn load(&self, uri: &str, play: bool, position_ms: u32) -> Result<(), Error> {
-        let uri = parse_track_uri(uri).ok_or(Error::InvalidUri)?;
+        let Some(uri) = parse_track_uri(uri) else {
+            log::warn!("spotify playback: load refused, not a track uri");
+            return Err(Error::InvalidUri);
+        };
+        log::debug!("spotify playback: load {uri} play={play} at {position_ms} ms");
         self.ensure_ready().await?;
-        self.backend.load(&uri, play, position_ms)
+        let r = self.backend.load(&uri, play, position_ms);
+        if let Err(e) = &r {
+            log::warn!("spotify playback: load failed: {e}");
+        }
+        r
     }
 
     /// Resume. No session yet means nothing is loaded: a no-op, never a connect.
@@ -265,6 +285,7 @@ impl PlayerHost {
     /// a player this does nothing: never a token, connect or session.
     pub async fn preload(&self, uri: &str) -> Result<(), Error> {
         let uri = parse_track_uri(uri).ok_or(Error::InvalidUri)?;
+        log::debug!("spotify playback: preload {uri}");
         self.backend.preload(&uri)
     }
 }

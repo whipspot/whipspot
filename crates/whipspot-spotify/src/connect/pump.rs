@@ -26,7 +26,7 @@ use url::Url;
 use whipspot_core::{
     engine::SourceWriter,
     events::{RemotePlay, UiEvent},
-    provider::model::{ImageRef, MAX_IMAGES, Track},
+    provider::model::{EntityRef, ImageRef, MAX_IMAGES, Track},
     text::display_text,
 };
 
@@ -34,6 +34,7 @@ use super::mixer::ConnectMixer;
 use crate::{
     provider::{ID, IMAGE_HOSTS},
     session::{Hint, TrackHints},
+    uri::artist_uri_id,
     webapi::model::MAX_TEXT_CHARS,
 };
 
@@ -184,6 +185,7 @@ fn clean(s: &str) -> String {
 /// The remote's track as a core [`Track`]; `None` when its id has no URI.
 pub(crate) fn to_track(item: &AudioItem) -> Option<Track> {
     let uri = item.track_id.to_uri().ok()?;
+    let mut artist_links = Vec::new();
     let (artist, album) = match &item.unique_fields {
         UniqueFields::Track { artists, album, .. } => {
             let names: Vec<&str> = artists
@@ -191,6 +193,20 @@ pub(crate) fn to_track(item: &AudioItem) -> Option<Track> {
                 .iter()
                 .take(MAX_ARTISTS)
                 .map(|a| a.name.as_str())
+                .collect();
+            // The links: the same artists as the display text, each with its exact artist uri
+            // (an id that does not make one is left out). The metadata carries no album id, so
+            // `album_ref` stays empty for the speaker's tracks.
+            artist_links = artists
+                .0
+                .iter()
+                .take(MAX_ARTISTS)
+                .filter_map(|a| {
+                    let uri = a.id.to_uri().ok()?;
+                    artist_uri_id(&uri)?;
+                    let name = clean(&a.name);
+                    (!name.is_empty()).then_some(EntityRef { uri, name })
+                })
                 .collect();
             (names.join(", "), album.as_str())
         }
@@ -208,6 +224,8 @@ pub(crate) fn to_track(item: &AudioItem) -> Option<Track> {
         duration_ms: u64::from(item.duration_ms),
         images: covers(item),
         year: None,
+        album_ref: None,
+        artists: artist_links,
     })
 }
 
@@ -365,6 +383,17 @@ mod tests {
                         },
                     ],
                     year: None,
+                    album_ref: None,
+                    artists: vec![
+                        EntityRef {
+                            uri: "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF".into(),
+                            name: "A".into(),
+                        },
+                        EntityRef {
+                            uri: "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF".into(),
+                            name: "B C".into(),
+                        },
+                    ],
                 },
             })
         );

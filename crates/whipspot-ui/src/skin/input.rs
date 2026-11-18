@@ -223,6 +223,11 @@ impl PanelInput {
         rect_in(panel, w, self.size_of(panel))
     }
 
+    /// Drops a held press without its release effects (its release was lost).
+    pub fn cancel(&mut self) {
+        self.capture = None;
+    }
+
     /// Whether a press is held (the panel then draws at the pointer's pace).
     pub fn held(&self) -> bool {
         self.capture.is_some()

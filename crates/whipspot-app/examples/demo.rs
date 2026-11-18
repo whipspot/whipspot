@@ -123,7 +123,7 @@ use whipspot_core::player::{
     self, EngineSetup, LyricsState, PlayState, Player, PlayerAction, PlayerConfig, PlayerHandle,
     PlayerState, SpectrumFrame,
 };
-use whipspot_core::provider::{Library, ProviderRegistry};
+use whipspot_core::provider::{Library, ProviderRegistry, ReleaseGroup};
 use whipspot_core::skin::{PanelWindows, SkinEngine, SkinRegistry, SkinSource, WidgetKind};
 use whipspot_skin_winamp::WinampEngine;
 use whipspot_skin_winamp::demo::demo_skin;
@@ -181,7 +181,11 @@ struct Args {
 enum RunMode {
     Run,
     Smoke,
-    Dump(PathBuf),
+    Dump {
+        dir: PathBuf,
+        /// Only the main-window screens whose name holds this (no checks, diagnostics, skin or tray shots).
+        only: Option<String>,
+    },
     /// Only the skin screens.
     DumpSkin(PathBuf),
     /// The desktop composites and their parts.
@@ -218,7 +222,10 @@ fn parse(args: &[String]) -> anyhow::Result<Args> {
             "--smoke" => mode = RunMode::Smoke,
             "--dump" => {
                 let dir = it.next().context("--dump needs a directory")?;
-                mode = RunMode::Dump(PathBuf::from(dir));
+                mode = RunMode::Dump {
+                    dir: PathBuf::from(dir),
+                    only: None,
+                };
             }
             "--dump-skin" => {
                 let dir = it.next().context("--dump-skin needs a directory")?;
@@ -241,6 +248,13 @@ fn parse(args: &[String]) -> anyhow::Result<Args> {
                     out: None,
                 }
             }
+            "--only" => {
+                let name = it.next().context("--only needs a name part")?;
+                match &mut mode {
+                    RunMode::Dump { only, .. } => *only = Some(name.clone()),
+                    _ => bail!("--only goes after --dump"),
+                }
+            }
             "--out" => {
                 let dir = it.next().context("--out needs a directory")?;
                 out = Some(PathBuf::from(dir));
@@ -258,7 +272,7 @@ fn parse(args: &[String]) -> anyhow::Result<Args> {
             "--check-fails" => check_fails = true,
             "--logged-out" => logged_out = true,
             _ => bail!(
-                "usage: demo [--smoke | --diagnostics | --check-golden [--out <dir>] | --bless-golden | --smoke-skin [--check-fails] | --smoke-tray [--check-fails] | --dump <dir> | --dump-skin <dir> | --dump-desktop <dir> | --dump-tray <dir>] [--logged-out]"
+                "usage: demo [--smoke | --diagnostics | --check-golden [--out <dir>] | --bless-golden | --smoke-skin [--check-fails] | --smoke-tray [--check-fails] | --dump <dir> [--only <name part>] | --dump-skin <dir> | --dump-desktop <dir> | --dump-tray <dir>] [--logged-out]"
             ),
         }
     }
@@ -305,6 +319,8 @@ struct Setup {
     second_provider: bool,
     /// The demo provider's first login step carries an action button and a status line.
     helper_status: bool,
+    /// Every second track of the playing list has two artists (the link shots' multi-artist line).
+    collab: bool,
 }
 
 impl Setup {
@@ -321,6 +337,7 @@ impl Setup {
             unshuffled: false,
             second_provider: false,
             helper_status: false,
+            collab: false,
         }
     }
 }
@@ -340,6 +357,7 @@ fn player(rt: &tokio::runtime::Runtime, setup: Setup) -> anyhow::Result<PlayerHa
         unshuffled,
         second_provider,
         helper_status,
+        collab,
     } = setup;
     let setup = EngineSetup::Output {
         output: Box::new(ClockedOutput::new(DEMO_RATE)),
@@ -391,7 +409,22 @@ fn player(rt: &tokio::runtime::Runtime, setup: Setup) -> anyhow::Result<PlayerHa
                 .map_err(|e| anyhow::anyhow!("demo playlist: {}", e.message))?;
             extra = more.items.into_iter().take(QUEUE_EXTRA).collect();
         }
-        page.items
+        let mut items = page.items;
+        if collab {
+            // Every second track gains the next track's artist: "A, B", two links.
+            let next: Vec<_> = items
+                .iter()
+                .cycle()
+                .skip(1)
+                .take(items.len())
+                .map(|t| (t.artist.clone(), t.artists.clone()))
+                .collect();
+            for (t, (artist, artists)) in items.iter_mut().zip(next).skip(1).step_by(2) {
+                t.artist = format!("{}, {artist}", t.artist);
+                t.artists.extend(artists);
+            }
+        }
+        items
     } else {
         Vec::new()
     };
@@ -477,8 +510,16 @@ struct Shot {
     second_provider: bool,
     /// The demo provider's first login step has an action button and a status line.
     helper_status: bool,
+    /// Every second track of the playing list has two artists.
+    collab: bool,
     /// The first-run tour's card at this list index is forced on.
     tour: Option<usize>,
+    /// Routes opened first, so the breadcrumb has a previous page (the last one is the previous).
+    trail: Vec<Route>,
+    /// The artist page's release chip.
+    group: Option<ReleaseGroup>,
+    /// An album (its uri) saved to the library before the capture.
+    saved: Option<&'static str>,
     /// The Settings page's Music folders card over a fixed demo list: `Some(scanning)`.
     folders: Option<bool>,
     /// ReplayGain is set to this mode before the capture.
@@ -512,7 +553,11 @@ impl Shot {
             scroll: 0.0,
             second_provider: false,
             helper_status: false,
+            collab: false,
             tour: None,
+            trail: Vec::new(),
+            group: None,
+            saved: None,
             folders: None,
             replay: None,
             size: DUMP_SIZE,
@@ -525,11 +570,38 @@ impl Shot {
 fn album() -> Route {
     Route::Album {
         id: "demo-album-1".into(),
+        uri: "demo:album:1".into(),
         name: "Low Tide Sessions".into(),
         artist: "Velmora".into(),
         images: demo_images("demo-album-1"),
         year: Some(1993),
     }
+}
+
+/// Oruna Vell's page (the demo artist with singles, a guest album and a long release name).
+fn artist() -> Route {
+    Route::Artist {
+        uri: "demo:artist:5".into(),
+        name: "Oruna Vell".into(),
+        images: demo_images("demo-artist-5"),
+    }
+}
+
+/// An album of Oruna Vell's the way a link opens it: by uri, nothing else known.
+fn linked_album(n: u32, name: &str) -> Route {
+    Route::Album {
+        id: String::new(),
+        uri: format!("demo:album:{n}"),
+        name: name.into(),
+        artist: String::new(),
+        images: Vec::new(),
+        year: None,
+    }
+}
+
+/// "Glass Hours", an album only the artist page lists (two tracks credit a second artist).
+fn glass_hours() -> Route {
+    linked_album(13, "Glass Hours")
 }
 
 fn refused() -> Route {
@@ -589,7 +661,11 @@ fn shots() -> Vec<Shot> {
         let shot = |what: &str, route| Shot::new(format!("{t}-{what}@1x"), theme, route);
         shots.extend([
             shot("browse-grid", Route::Albums),
-            shot("browse-tracks", album()),
+            // As the real flow: the Albums tab, then the album (the breadcrumb names the tab).
+            Shot {
+                trail: vec![Route::Albums],
+                ..shot("browse-tracks", album())
+            },
             Shot {
                 mode: Mode::Idle,
                 art: false,
@@ -797,8 +873,106 @@ fn shots() -> Vec<Shot> {
             ..Shot::new(format!("{t}-settings-folders@1x"), theme, Route::Settings)
         });
     }
+    // Artist and album links: the idle view's artist hovered (the large link), the queue's rows
+    // with a two-artist line and one name hovered (the small links), and in A the keyboard-focus
+    // look and the gradient at three more phases; the gradient is at phase 0 but in the phase shots.
+    for (t, theme) in [("a", ThemeId::A), ("b", ThemeId::B), ("c", ThemeId::C)] {
+        shots.push(Shot {
+            mode: Mode::Idle,
+            hover: Some(link(0, false, 0.0)),
+            ..Shot::new(format!("{t}-link-hover@1x"), theme, Route::Albums)
+        });
+        shots.push(Shot {
+            queue: true,
+            unshuffled: true,
+            collab: true,
+            hover: Some(link(ROW_LINK, false, 0.0)),
+            ..Shot::new(format!("{t}-link-hover-row@1x"), theme, Route::Queue)
+        });
+        // The same screen at rest, for the review's side by side.
+        shots.push(Shot {
+            queue: true,
+            unshuffled: true,
+            collab: true,
+            ..Shot::new(format!("{t}-link-rest-row@1x"), theme, Route::Queue)
+        });
+    }
+    // The artist page (reached from an album, so the breadcrumb names it) in the three themes and
+    // with the Singles chip, at the smallest window; the explored album page (reached from the
+    // artist), scrolled to "More by", and with the album saved.
+    let from_album = vec![Route::Albums, linked_album(6, "Field Notes")];
+    for (t, theme) in [("a", ThemeId::A), ("b", ThemeId::B), ("c", ThemeId::C)] {
+        shots.push(Shot {
+            trail: from_album.clone(),
+            ..Shot::new(format!("{t}-artist@1x"), theme, artist())
+        });
+    }
+    shots.push(Shot {
+        trail: from_album.clone(),
+        group: Some(ReleaseGroup::Singles),
+        scroll: ARTIST_DISCOGRAPHY_SCROLL,
+        ..Shot::new("c-artist-singles@1x", ThemeId::C, artist())
+    });
+    shots.push(Shot {
+        trail: from_album.clone(),
+        scroll: ARTIST_DISCOGRAPHY_SCROLL,
+        ..Shot::new("c-artist-releases@1x", ThemeId::C, artist())
+    });
+    shots.push(Shot {
+        trail: from_album,
+        size: MIN_DUMP_SIZE,
+        ..Shot::new("c-artist-min@1x", ThemeId::C, artist())
+    });
+    let from_artist = vec![Route::Albums, artist()];
+    shots.push(Shot {
+        trail: from_artist.clone(),
+        ..Shot::new("c-album-explore@1x", ThemeId::C, glass_hours())
+    });
+    shots.push(Shot {
+        trail: from_artist.clone(),
+        size: MIN_DUMP_SIZE,
+        ..Shot::new("c-album-explore-min@1x", ThemeId::C, glass_hours())
+    });
+    shots.push(Shot {
+        trail: from_artist.clone(),
+        scroll: ALBUM_MORE_SCROLL,
+        ..Shot::new("c-album-explore-more@1x", ThemeId::C, glass_hours())
+    });
+    shots.push(Shot {
+        trail: from_artist,
+        saved: Some("demo:album:13"),
+        ..Shot::new("c-album-saved@1x", ThemeId::C, glass_hours())
+    });
+    shots.push(Shot {
+        mode: Mode::Idle,
+        hover: Some(link(0, true, 0.0)),
+        ..Shot::new("a-link-focus@1x", ThemeId::A, Route::Albums)
+    });
+    for (name, phase) in [("25", 0.25), ("50", 0.5), ("75", 0.75)] {
+        shots.push(Shot {
+            mode: Mode::Idle,
+            hover: Some(link(0, false, phase)),
+            ..Shot::new(format!("a-link-phase-{name}@1x"), ThemeId::A, Route::Albums)
+        });
+    }
     shots
 }
+
+/// How far the artist shots with the discography scroll the page, logical px: the chips and the
+/// first row of tiles in view.
+const ARTIST_DISCOGRAPHY_SCROLL: f32 = 480.0;
+
+/// How far the album-more shot scrolls the explored album page, logical px: the "More by" row.
+const ALBUM_MORE_SCROLL: f32 = 420.0;
+
+/// A forced link hover: the `nth` link drawn, with the gradient at `phase`.
+fn link(nth: usize, focus: bool, phase: f32) -> Hover {
+    Hover::Link { nth, focus, phase }
+}
+
+/// The link the row shots hover: the second artist of the first two-artist row (queue row 2) (a draw-order
+/// index, so it moves when a view draws more links before it).
+const ROW_LINK: usize = 3;
 
 /// One headless window driven by a script.
 struct Script<'a> {
@@ -909,6 +1083,7 @@ fn capture(rt: &tokio::runtime::Runtime, shot: &Shot, path: &Path) -> anyhow::Re
             unshuffled: shot.unshuffled,
             second_provider: shot.second_provider,
             helper_status: shot.helper_status,
+            collab: shot.collab,
         },
     )?;
     if let Some(mode) = shot.replay {
@@ -928,8 +1103,24 @@ fn capture(rt: &tokio::runtime::Runtime, shot: &Shot, path: &Path) -> anyhow::Re
         eq_meters: shot.eq_meters,
         queue_drag: shot.queue_drag,
         tour: shot.tour,
+        group: shot.group,
     };
     let mut script = script_for(shot, &handle, force)?;
+    script
+        .view
+        .trace_links(matches!(shot.hover, Some(Hover::Link { .. })));
+    if let Some(uri) = shot.saved {
+        handle.dispatch(PlayerAction::SetLiked {
+            uri: uri.to_owned(),
+            liked: true,
+        });
+    }
+    for route in &shot.trail {
+        script.view.navigate(route.clone());
+        script.frames(3)?;
+    }
+    let page_boxes = std::env::var_os("WHIPSPOT_DEMO_PAGE_BOXES").is_some();
+    script.view.trace_page_boxes(page_boxes);
     script.view.navigate(shot.route.clone());
     if shot.route == Route::Search {
         script.view.search("a");
@@ -960,7 +1151,86 @@ fn capture(rt: &tokio::runtime::Runtime, shot: &Shot, path: &Path) -> anyhow::Re
     }
     script.dumper.save(path)?;
     println!("dumped {}", path.display());
+    if std::env::var_os("WHIPSPOT_DEMO_LINK_BOXES").is_some() {
+        let boxes: Vec<String> = script
+            .view
+            .link_boxes()
+            .iter()
+            .map(|b| format!("{:.1},{:.1},{:.1},{:.1}", b[0], b[1], b[2], b[3]))
+            .collect();
+        println!("link boxes of {}: {}", shot.name, boxes.join(" "));
+    }
+    if matches!(shot.hover, Some(Hover::Link { .. })) {
+        print_link_glyphs(&shot.name, &script.view.take_link_trace());
+    }
+    if page_boxes {
+        let window = (shot.size.0 as f32, shot.size.1 as f32);
+        let (boxes, bounds) = script.view.page_boxes(window);
+        let problems = page_layout_problems(&boxes, bounds);
+        println!(
+            "page layout of {}: {} boxes, {} problems",
+            shot.name,
+            boxes.len(),
+            problems.len()
+        );
+        for p in &problems {
+            println!("  {p}");
+        }
+    }
     Ok(())
+}
+
+/// Checks the boxes a page drew (`true`: text, else a control or picture; x, y, w, h): no two
+/// intersect unless one lies inside the other (a label on its chip), and none crosses `bounds`.
+fn page_layout_problems(boxes: &[(bool, [f32; 4])], bounds: [f32; 4]) -> Vec<String> {
+    const EPS: f32 = 0.75;
+    let right = |b: &[f32; 4]| b[0] + b[2];
+    let bottom = |b: &[f32; 4]| b[1] + b[3];
+    let inside = |a: &[f32; 4], b: &[f32; 4]| {
+        a[0] >= b[0] - EPS
+            && a[1] >= b[1] - EPS
+            && right(a) <= right(b) + EPS
+            && bottom(a) <= bottom(b) + EPS
+    };
+    let mut out = Vec::new();
+    for (i, (ta, a)) in boxes.iter().enumerate() {
+        if a[0] < bounds[0] - EPS || right(a) > right(&bounds) + EPS {
+            out.push(format!("outside the panel: {a:?} text {ta}"));
+        }
+        for (tb, b) in &boxes[i + 1..] {
+            let crosses = a[0] + EPS < right(b)
+                && b[0] + EPS < right(a)
+                && a[1] + EPS < bottom(b)
+                && b[1] + EPS < bottom(a);
+            if crosses && !inside(a, b) && !inside(b, a) {
+                out.push(format!("overlap: {a:?} text {ta} with {b:?} text {tb}"));
+            }
+        }
+    }
+    out
+}
+
+/// Prints the glyphs a forced link was drawn with (grapheme, centre x, colour), as the view
+/// recorded them while drawing.
+fn print_link_glyphs(name: &str, glyphs: &[whipspot_ui::LinkGlyph]) {
+    let hex = |c: [u8; 4]| format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2]);
+    if let Some(g) = glyphs.first() {
+        let [a, b, c] = g.stops;
+        println!(
+            "link stops of {name}: a {} b {} c {}",
+            hex(a),
+            hex(b),
+            hex(c)
+        );
+    }
+    println!("link glyphs of {name}:");
+    for g in glyphs {
+        let [r, gr, b, _] = g.color;
+        println!(
+            "  {:?} x {:.1} #{r:02X}{gr:02X}{b:02X} phase {:.2}",
+            g.text, g.x, g.phase
+        );
+    }
 }
 
 /// The real idle path, unforced: once a track plays, a pointer move keeps the browse view and
@@ -996,9 +1266,9 @@ fn check_idle_path(rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The real idle path with the pointer resting inside the window: after one move and a few
-/// seconds of synthetic time the view must go idle, and with auto-hide off it must not. Nothing is
-/// saved.
+/// The real idle path with the pointer resting inside the window: after one move and 13 s of
+/// synthetic time the view must go idle (not before 12 s), and with auto-hide off it must not.
+/// Nothing is saved.
 fn check_idle_rest(rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     for auto_hide in [true, false] {
         let handle = player(rt, Setup::new(true))?;
@@ -1015,8 +1285,15 @@ fn check_idle_rest(rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
             script.view.mode() == Mode::Browse,
             "the view is not in browse right after a pointer move"
         );
-        // Twelve half-second steps (6 s) with the pointer still and inside.
-        for _ in 0..12 {
+        // Half-second steps with the pointer still and inside: still browsing at 11 s, idle (with
+        // auto-hide) by 13 s; the resting delay is 12 s.
+        for i in 0..26 {
+            if i == 22 {
+                anyhow::ensure!(
+                    script.view.mode() == Mode::Browse,
+                    "a resting pointer went idle before 12 s"
+                );
+            }
             script.dumper.step(
                 &mut script.view,
                 &handle,
@@ -2616,7 +2893,13 @@ fn run() -> anyhow::Result<()> {
             dump_desktops(&rt, playlist, &dir, true)?;
         }
         RunMode::DumpSkin(dir) => dump_skin(&rt, &dir)?,
-        RunMode::Dump(dir) => {
+        RunMode::Dump { dir, only } => {
+            if let Some(part) = only {
+                for shot in shots().iter().filter(|s| s.name.contains(&part)) {
+                    capture(&rt, shot, &dir.join(format!("{}.png", shot.name)))?;
+                }
+                return Ok(());
+            }
             check_idle_path(&rt)?;
             check_idle_rest(&rt)?;
             for shot in shots() {
@@ -2687,5 +2970,30 @@ fn main() -> ExitCode {
             eprintln!("demo: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_page_layout_check_flags_overlaps_and_overhangs_but_not_a_label_on_its_chip() {
+        let bounds = [10.0, 0.0, 100.0, 200.0];
+        let chip = (false, [20.0, 20.0, 60.0, 30.0]);
+        let label = (true, [30.0, 28.0, 40.0, 16.0]);
+        assert!(page_layout_problems(&[chip, label], bounds).is_empty());
+        // Two texts that cross, a text that half covers a picture, and a box past the right edge.
+        let a = (true, [20.0, 100.0, 50.0, 16.0]);
+        let b = (true, [60.0, 105.0, 40.0, 16.0]);
+        assert_eq!(page_layout_problems(&[a, b], bounds).len(), 1);
+        let pic = (false, [20.0, 150.0, 50.0, 50.0]);
+        let text = (true, [60.0, 160.0, 40.0, 16.0]);
+        assert_eq!(page_layout_problems(&[pic, text], bounds).len(), 1);
+        let wide = (true, [20.0, 10.0, 120.0, 16.0]);
+        assert_eq!(page_layout_problems(&[wide], bounds).len(), 1);
+        // Boxes that only touch are fine.
+        let c = (true, [20.0, 116.0, 50.0, 16.0]);
+        assert!(page_layout_problems(&[a, c], bounds).is_empty());
     }
 }

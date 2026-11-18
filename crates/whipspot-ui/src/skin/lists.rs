@@ -963,6 +963,8 @@ mod tests {
             duration_ms: 61_000,
             images: vec![],
             year: None,
+            album_ref: None,
+            artists: vec![],
         }
     }
 

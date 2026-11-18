@@ -75,3 +75,21 @@ pub const FALLBACK_FONTS: &[&str] = &[
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub const FALLBACK_FONTS: &[&str] = &[];
+
+/// Whether the OS can say which mouse buttons are down ([`mouse_buttons_down`]): macOS. The host
+/// then checks a held button of a skin panel against it on the follow tick; elsewhere it never
+/// ticks for that.
+pub(super) const OS_BUTTONS: bool = cfg!(target_os = "macos");
+
+/// The mouse buttons the OS holds down now as a bit mask (bit 0 left, 1 right, 2 middle, then by
+/// number); `None` where the OS cannot say, which changes nothing.
+pub(super) fn mouse_buttons_down() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform_macos::mouse_buttons_down()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}

@@ -1677,6 +1677,14 @@ impl Control {
                     LibraryQuery::Search { query, offset } => {
                         lib.search(&query, offset).await.map(LibraryPage::Tracks)
                     }
+                    LibraryQuery::Artist { uri } => lib.artist(&uri).await.map(LibraryPage::Artist),
+                    LibraryQuery::Album { uri } => {
+                        lib.album(&uri).await.map(LibraryPage::AlbumDetail)
+                    }
+                    LibraryQuery::ArtistReleases { uri, group, offset } => lib
+                        .artist_releases(&uri, group, offset)
+                        .await
+                        .map(LibraryPage::Albums),
                 },
             };
             shared.notify(PlayerNotice::LibraryPage { request, result });
