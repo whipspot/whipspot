@@ -6,7 +6,7 @@
 //!   `Authorization` header and is never logged, formatted or put in an error.
 //! * Talks only to `https://api.spotify.com/v1/{me, me/playlists, me/tracks, me/albums,
 //!   playlists/{id}/items, albums/{id}, albums/{id}/tracks, artists/{id}, artists/{id}/albums,
-//!   search}` with `limit=50` (search: 10, the most Spotify allows now), plus `/me/library` and
+//!   search}` with `limit=50` (search and an artist's releases: 10, the most Spotify allows now), plus `/me/library` and
 //!   `/me/library/contains` for likes (tracks and albums); no `fields=` filter, no batch,
 //!   `/tracks/{id}` or the old `/playlists/{id}/tracks`. Search is `type=track` only. Ids reach a
 //!   path only after the strict 22-character base62 check. Redirects are never followed.
@@ -50,6 +50,9 @@ pub use model::{
 pub const PAGE_SIZE: u32 = 50;
 /// Search results per request (Spotify lowered the maximum from 50 to 10).
 pub const SEARCH_PAGE_SIZE: u32 = 10;
+/// Releases per `/artists/{id}/albums` request: Spotify's documented maximum for that endpoint
+/// (read 2026-11-20); a larger `limit` is refused and fails the whole artist page.
+pub const RELEASES_PAGE_SIZE: u32 = 10;
 const API_BASE: &str = "https://api.spotify.com/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// A page is at most ~100 KB in practice; anything larger is not a page.
@@ -410,7 +413,7 @@ impl WebApi {
         let v = self
             .get(
                 &format!(
-                    "/artists/{id}/albums?include_groups={groups}&limit={PAGE_SIZE}&offset={offset}"
+                    "/artists/{id}/albums?include_groups={groups}&limit={RELEASES_PAGE_SIZE}&offset={offset}"
                 ),
                 Forbidden::AccessDenied,
             )

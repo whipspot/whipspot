@@ -5,6 +5,9 @@
 //! no empty box (MD75). Add and more have no function (MD53, MD75): only theme A's action row
 //! carries the like heart.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use lune_ui::color::Rgba;
 use lune_ui::paint::Rect;
 use lune_ui::scene::LayerId;
@@ -65,50 +68,14 @@ pub fn next_up(state: &PlayerState) -> Option<&Track> {
     state.queue.next.and_then(|i| state.queue.items.get(i))
 }
 
-/// Draws the idle view in `rect` (the window less a caption's height top and bottom; the media control is hidden then).
-pub fn idle(
-    ui: &mut Ui<'_>,
-    rect: Rect,
-    look: &Look,
-    state: &PlayerState,
-    art: &mut ArtCache,
-    likes: &mut LikeBook,
-    player: &PlayerHandle,
-) {
-    let Some(now) = &state.current else {
-        return;
-    };
-    let track = &now.track;
-    let shown = lyrics_for(state, &track.uri);
-    let scale = ui.painter().s;
-    let m = Side::new(rect);
-    // The cover is asked for only while it is to be drawn (MD62: what is drawn is what is asked).
-    let cover_art = if shown.is_none() {
-        let phys = (m.art.w * scale).ceil() as u32;
-        ImageRef::pick(&track.images, phys)
-            .and_then(|i| art.get(player, i, Variant::Plain, ArtUrgency::Current, phys))
-    } else {
-        None
-    };
-    match Body::choose(shown.is_some(), cover_art.is_some()) {
-        Body::Centred => centred(ui, rect, look, state, track, art, player),
-        body => side(
-            ui,
-            rect,
-            look,
-            state,
-            m,
-            body,
-            shown,
-            cover_art,
-            (art, likes, player),
-        ),
-    }
-}
+/// How long after a track change the idle view waits for the lyrics and the cover before it
+/// shows what it has (MD204): nothing is drawn in the art, lyrics and info area meanwhile, so the
+/// cover is never shown for the moment the lyrics take to come.
+pub(crate) const HOLD: Duration = Duration::from_millis(1200);
 
 /// What the idle view shows where the art goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Body {
+pub(crate) enum Body {
     /// M5's centred block, no art square and no lyrics region.
     Centred,
     /// The art square and the info column beside it.
@@ -117,15 +84,183 @@ enum Body {
     Lyrics,
 }
 
-impl Body {
-    /// Lyrics win; else a ready cover; else the centred block.
-    fn choose(lyrics: bool, cover_ready: bool) -> Body {
-        if lyrics {
-            Body::Lyrics
-        } else if cover_ready {
-            Body::Art
-        } else {
-            Body::Centred
+/// What the idle view should show for the current track: nothing yet, or a body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// The lyrics or the cover are still to come: nothing is drawn.
+    Pending,
+    Show(Body),
+}
+
+/// Where the lyrics of the current track stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LyricsKind {
+    /// Found for this track, synced with at least one line.
+    Synced,
+    /// None to wait for: switched off, or found (plain, instrumental, none) or failed for this
+    /// track.
+    Settled,
+    /// Still to come: looking up this track, or the state names another track (or none).
+    Unsettled,
+}
+
+/// The lyrics state for track `uri`.
+fn lyrics_kind(state: &PlayerState, uri: &str) -> LyricsKind {
+    if !state.lyrics_enabled {
+        return LyricsKind::Settled;
+    }
+    match &state.lyrics {
+        LyricsState::Found { uri: u, lyrics } if u == uri => {
+            if matches!(&**lyrics, Lyrics::Synced(v) if !v.is_empty()) {
+                LyricsKind::Synced
+            } else {
+                LyricsKind::Settled
+            }
+        }
+        LyricsState::Failed { uri: u } if u == uri => LyricsKind::Settled,
+        LyricsState::Off => LyricsKind::Settled,
+        _ => LyricsKind::Unsettled,
+    }
+}
+
+/// What should show, `held` after the track changed (a track not seen to change has been held
+/// for ever): synced lyrics at any time; else, while lyrics are still to come or the track has a
+/// cover that is not ready, nothing until [`HOLD`]; then the cover if it is ready, else the
+/// centred block.
+pub(crate) fn target(
+    lyrics: LyricsKind,
+    has_cover: bool,
+    cover_ready: bool,
+    held: Duration,
+) -> Target {
+    if lyrics == LyricsKind::Synced {
+        return Target::Show(Body::Lyrics);
+    }
+    let waiting = lyrics == LyricsKind::Unsettled || (has_cover && !cover_ready);
+    if waiting && held < HOLD {
+        Target::Pending
+    } else if cover_ready {
+        Target::Show(Body::Art)
+    } else {
+        Target::Show(Body::Centred)
+    }
+}
+
+/// What the idle view is asked to show this frame.
+#[derive(Debug, Clone)]
+pub(crate) enum IdleWant {
+    /// Nothing plays.
+    Nothing,
+    /// The track's lyrics or cover are still to come.
+    Pending,
+    Show(IdleModel),
+}
+
+/// One thing the idle view draws: a snapshot of the player (the whole of it, so the old track's
+/// info can still draw while it fades out) and the body shown in it.
+#[derive(Debug, Clone)]
+pub(crate) struct IdleModel {
+    state: Arc<PlayerState>,
+    body: Body,
+}
+
+impl IdleModel {
+    /// Whether `other` is the same track in the same body (only the state is refreshed).
+    pub fn same(&self, other: &IdleModel) -> bool {
+        self.body == other.body && self.uri() == other.uri()
+    }
+
+    fn uri(&self) -> Option<&str> {
+        self.state.current.as_ref().map(|n| n.track.uri.as_str())
+    }
+}
+
+/// The cover of `track` for the art square of `rect`: whether it has one to draw, and the cover
+/// when it is registered. Asking is what requests it (MD62), so it is asked only for a body that
+/// may draw it.
+fn cover_for(
+    ui: &mut Ui<'_>,
+    rect: Rect,
+    track: &Track,
+    art: &mut ArtCache,
+    player: &PlayerHandle,
+) -> (bool, Option<Art>) {
+    let phys = (Side::new(rect).art.w * ui.painter().s).ceil() as u32;
+    let pick = ImageRef::pick(&track.images, phys);
+    let ready = pick.and_then(|i| art.get(player, i, Variant::Plain, ArtUrgency::Current, phys));
+    (pick.is_some(), ready)
+}
+
+/// What the idle view should show for `state` now: the cover is asked for unless synced lyrics
+/// are to show instead (MD62: what is drawn is what is asked, and a cover still to come is
+/// asked for while the body waits).
+pub(crate) fn idle_want(
+    ui: &mut Ui<'_>,
+    rect: Rect,
+    state: &Arc<PlayerState>,
+    art: &mut ArtCache,
+    player: &PlayerHandle,
+    held: Duration,
+) -> IdleWant {
+    let Some(now) = &state.current else {
+        return IdleWant::Nothing;
+    };
+    let track = &now.track;
+    let lyrics = lyrics_kind(state, &track.uri);
+    let (has_cover, cover_ready) = if lyrics == LyricsKind::Synced {
+        (false, false)
+    } else {
+        let (has, art) = cover_for(ui, rect, track, art, player);
+        (has, art.is_some())
+    };
+    match target(lyrics, has_cover, cover_ready, held) {
+        Target::Pending => IdleWant::Pending,
+        Target::Show(body) => IdleWant::Show(IdleModel {
+            state: Arc::clone(state),
+            body,
+        }),
+    }
+}
+
+/// Draws the idle view of `model` in `rect` (the window less a caption's height top and bottom; the media control is hidden then).
+pub(crate) fn idle(
+    ui: &mut Ui<'_>,
+    rect: Rect,
+    look: &Look,
+    model: &IdleModel,
+    art: &mut ArtCache,
+    likes: &mut LikeBook,
+    player: &PlayerHandle,
+) {
+    let state: &PlayerState = &model.state;
+    let Some(now) = &state.current else {
+        return;
+    };
+    let track = &now.track;
+    let shown = (model.body == Body::Lyrics)
+        .then(|| lyrics_for(state, &track.uri))
+        .flatten();
+    let body = match (model.body, shown) {
+        (Body::Lyrics, None) => Body::Centred,
+        (body, _) => body,
+    };
+    match body {
+        Body::Centred => centred(ui, rect, look, state, track, art, player),
+        body => {
+            let cover_art = (body == Body::Art)
+                .then(|| cover_for(ui, rect, track, art, player).1)
+                .flatten();
+            side(
+                ui,
+                rect,
+                look,
+                state,
+                Side::new(rect),
+                body,
+                shown,
+                cover_art,
+                (art, likes, player),
+            );
         }
     }
 }
@@ -1016,9 +1151,13 @@ mod tests {
         }
     }
 
-    /// The body the idle view picks for `state` (the current uri is "t:a") and a cover ready or not.
+    /// The body the idle view settles on for `state` (the current uri is "t:a") and a cover ready
+    /// or not, long after the track changed.
     fn body_of(state: &PlayerState, cover: bool) -> Body {
-        Body::choose(lyrics_for(state, "t:a").is_some(), cover)
+        match target(lyrics_kind(state, "t:a"), cover, cover, HOLD) {
+            Target::Show(body) => body,
+            Target::Pending => panic!("settled"),
+        }
     }
 
     #[test]
@@ -1054,6 +1193,194 @@ mod tests {
             assert_eq!(body_of(s, true), Body::Art, "{:?}", s.lyrics);
             assert_eq!(body_of(s, false), Body::Centred, "{:?}", s.lyrics);
         }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn t1_target_follows_the_lyrics_and_the_cover_and_waits_at_most_the_hold() {
+        use LyricsKind::{Settled, Synced, Unsettled};
+        let at = |l, has, ready, held| target(l, has, ready, ms(held));
+        let show = Target::Show;
+        // Synced lyrics show at any time, cover or not, ready or not.
+        for (has, ready) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(at(Synced, has, ready, 0), show(Body::Lyrics));
+        }
+        // Lyrics still to come: nothing until the hold, then the cover if ready, else centred.
+        assert_eq!(at(Unsettled, true, true, 0), Target::Pending);
+        assert_eq!(at(Unsettled, true, true, 1199), Target::Pending);
+        assert_eq!(at(Unsettled, true, true, 1200), show(Body::Art));
+        assert_eq!(at(Unsettled, true, false, 1200), show(Body::Centred));
+        assert_eq!(at(Unsettled, false, false, 0), Target::Pending);
+        assert_eq!(at(Unsettled, false, false, 1200), show(Body::Centred));
+        // No lyrics to wait for: a cover not ready yet is waited for; no cover is not.
+        assert_eq!(at(Settled, true, false, 0), Target::Pending);
+        assert_eq!(at(Settled, true, false, 1200), show(Body::Centred));
+        assert_eq!(at(Settled, true, true, 0), show(Body::Art));
+        assert_eq!(at(Settled, false, false, 0), show(Body::Centred));
+        // A track not seen to change has been held for ever.
+        assert_eq!(
+            target(Unsettled, true, true, Duration::MAX),
+            show(Body::Art)
+        );
+    }
+
+    #[test]
+    fn t2_the_lyrics_state_is_settled_only_by_an_answer_for_this_track() {
+        use whipspot_core::lyrics::LyricLine;
+        let synced = Lyrics::Synced(vec![LyricLine {
+            at_ms: 0,
+            text: "la".into(),
+        }]);
+        let kind = |l, on| lyrics_kind(&with_lyrics(l, on), "t:a");
+        assert_eq!(kind(found("t:a", synced.clone()), true), LyricsKind::Synced);
+        // Another track's answer (the first frames after a change) is still to come.
+        assert_eq!(
+            kind(found("t:old", synced.clone()), true),
+            LyricsKind::Unsettled
+        );
+        assert_eq!(
+            kind(LyricsState::Searching { uri: "t:a".into() }, true),
+            LyricsKind::Unsettled
+        );
+        assert_eq!(kind(LyricsState::Idle, true), LyricsKind::Unsettled);
+        assert_eq!(
+            kind(LyricsState::Failed { uri: "t:a".into() }, true),
+            LyricsKind::Settled
+        );
+        assert_eq!(
+            kind(
+                LyricsState::Failed {
+                    uri: "t:old".into()
+                },
+                true
+            ),
+            LyricsKind::Unsettled
+        );
+        assert_eq!(
+            kind(found("t:a", Lyrics::Instrumental), true),
+            LyricsKind::Settled
+        );
+        assert_eq!(kind(found("t:a", Lyrics::None), true), LyricsKind::Settled);
+        assert_eq!(kind(LyricsState::Off, true), LyricsKind::Settled);
+        // Lyrics switched off wait for nothing.
+        assert_eq!(kind(found("t:a", synced), false), LyricsKind::Settled);
+        assert_eq!(kind(LyricsState::Idle, false), LyricsKind::Settled);
+    }
+
+    /// The new track's body over time as the user would see it: every 8 ms from the change at 0 to
+    /// 3 s, the bodies of track 2 that show at an opacity above 0, in order of first showing, with
+    /// when each first showed; and whether the old track's and the new one's bodies ever showed
+    /// together. `lyrics_at(t)` and `cover_at(t)` say what the lyrics and the cover are at `t`.
+    fn replay(
+        lyrics_at: impl Fn(u64) -> LyricsKind,
+        cover_at: impl Fn(u64) -> bool,
+    ) -> Vec<(Body, u64)> {
+        use crate::anim::{Pace, Swap};
+        // (track, body): the old track 1 had its art up.
+        let same = |a: &(u8, Body), b: &(u8, Body)| a == b;
+        let mut swap = Swap::default();
+        swap.update(Some((1, Body::Art)), ms(0), Pace::Full, same);
+        let mut seen: Vec<(Body, u64)> = Vec::new();
+        for t in (0..3000).step_by(8) {
+            let ready = cover_at(t);
+            let want = match target(lyrics_at(t), true, ready, ms(t)) {
+                Target::Pending => None,
+                Target::Show(body) => Some((2, body)),
+            };
+            swap.update(want, ms(t), Pace::Full, same);
+            let (out, shown) = swap.alphas(ms(t));
+            assert!(out == 0.0 || shown == 0.0, "{t}: both showing");
+            if shown > 0.0
+                && let Some(&(2, body)) = swap.shown()
+                && seen.last().map(|s| s.0) != Some(body)
+            {
+                seen.push((body, t));
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn t3_lyrics_arriving_early_never_show_the_art_first() {
+        // (a) The lyrics answer at 100 ms, the cover is ready at once.
+        let seen = replay(
+            |t| {
+                if t >= 100 {
+                    LyricsKind::Synced
+                } else {
+                    LyricsKind::Unsettled
+                }
+            },
+            |_| true,
+        );
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [Body::Lyrics]);
+        // They come in after the old art has faded out.
+        assert!(seen[0].1 >= crate::anim::OUT.as_millis() as u64, "{seen:?}");
+        // (d) A cache hit: the first snapshot has them.
+        let seen = replay(|_| LyricsKind::Synced, |_| true);
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [Body::Lyrics]);
+    }
+
+    #[test]
+    fn t4_lyrics_that_fail_show_the_art_once_and_never_lyrics() {
+        // (b) The lookup fails after 300 ms.
+        let seen = replay(
+            |t| {
+                if t >= 300 {
+                    LyricsKind::Settled
+                } else {
+                    LyricsKind::Unsettled
+                }
+            },
+            |_| true,
+        );
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [Body::Art]);
+        // It showed after the answer, not at the change.
+        assert!(seen[0].1 >= 300, "{seen:?}");
+    }
+
+    #[test]
+    fn t5_late_lyrics_show_the_art_after_the_hold_and_then_change_once_to_the_lyrics() {
+        // (c) The lyrics answer at 2000 ms; the cover is ready from the start.
+        let seen = replay(
+            |t| {
+                if t >= 2000 {
+                    LyricsKind::Synced
+                } else {
+                    LyricsKind::Unsettled
+                }
+            },
+            |_| true,
+        );
+        assert_eq!(
+            seen.iter().map(|s| s.0).collect::<Vec<_>>(),
+            [Body::Art, Body::Lyrics]
+        );
+        let hold = HOLD.as_millis() as u64;
+        assert!(seen[0].1 >= hold, "the art waited for the hold: {seen:?}");
+        // The lyrics come in one out/in after their answer, not in the same frame.
+        assert!(
+            seen[1].1 >= 2000 + crate::anim::OUT.as_millis() as u64,
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn t6_a_cover_that_is_late_is_waited_for_and_one_that_never_comes_leaves_the_centred_block() {
+        // No lyrics; the cover is ready at 500 ms: nothing until then, then the art.
+        let seen = replay(|_| LyricsKind::Settled, |t| t >= 500);
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [Body::Art]);
+        assert!(seen[0].1 >= 500);
+        // A cover that never comes: the centred block after the hold.
+        let seen = replay(|_| LyricsKind::Settled, |_| false);
+        assert_eq!(
+            seen.iter().map(|s| s.0).collect::<Vec<_>>(),
+            [Body::Centred]
+        );
+        assert!(seen[0].1 >= HOLD.as_millis() as u64);
     }
 
     #[test]

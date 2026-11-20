@@ -33,6 +33,7 @@ pub mod output;
 mod pages;
 pub mod palette;
 mod queue;
+mod scroll_memory;
 mod search;
 mod settings;
 mod shortcuts;
@@ -61,7 +62,7 @@ use lune_ui::widgets::caption::{CaptionButton, CaptionOptions};
 use lune_ui::widgets::toast::ToastKind;
 use lune_ui::window::{ResizeEdge, edge_at};
 use whipspot_core::folders::MusicFolders;
-use whipspot_core::player::{PlayState, PlayerAction, PlayerHandle};
+use whipspot_core::player::{PlayState, PlayerAction, PlayerHandle, PlayerState};
 
 use art::ArtCache;
 use background::CoverBg;
@@ -310,6 +311,10 @@ pub struct NativeUi {
     likes: LikeBook,
     /// Which track is current and since when it changed (a new track fades in).
     track: anim::TrackWatch,
+    /// The idle view's body, which changes one at a time with a fade (MD204).
+    idle_swap: anim::Swap<now_playing::IdleModel>,
+    /// The idle view waits for its lyrics or cover, or a body is fading (the demo's dumps wait).
+    idle_busy: bool,
     /// The cover behind everything, its Ken Burns clock and cross-fade.
     cover_bg: CoverBg,
     /// The accents of the cover drawn now (theme C's; A and B ignore them).
@@ -351,6 +356,8 @@ impl NativeUi {
             art: ArtCache::new(),
             likes: LikeBook::default(),
             track: anim::TrackWatch::default(),
+            idle_swap: anim::Swap::default(),
+            idle_busy: false,
             cover_bg: CoverBg::default(),
             accent: None,
             skins: None,
@@ -514,6 +521,74 @@ impl NativeUi {
     /// each frame of this window (`WindowView::images`).
     pub fn images(&mut self, store: &mut dyn ImageStore) {
         self.art.sync(store);
+    }
+
+    /// Whether the idle view is waiting for its lyrics or cover, or fading one body for another
+    /// (the demo's dumps wait for it to be over).
+    #[doc(hidden)]
+    pub fn idle_busy(&self) -> bool {
+        self.idle_busy
+    }
+
+    /// The idle view (MD204): the body the track should show, which waits for the lyrics and the
+    /// cover to settle, changes one at a time (the old fades out, then the new fades in) and
+    /// holds the old snapshot to draw while it leaves. `fade` is the view's own cross-fade with
+    /// the sheet.
+    fn idle_frame(
+        &mut self,
+        ui: &mut Ui<'_>,
+        rect: Rect,
+        look: &Look,
+        state: &Arc<PlayerState>,
+        (fade, track_since): (f32, Option<Duration>),
+        player: &PlayerHandle,
+    ) {
+        let now = ui.time();
+        // A track not seen to change has been settled for as long as the app has run.
+        let held = track_since.map_or(Duration::MAX, |s| now.saturating_sub(s));
+        let want = now_playing::idle_want(ui, rect, state, &mut self.art, player, held);
+        let pending = matches!(want, now_playing::IdleWant::Pending);
+        let model = match want {
+            now_playing::IdleWant::Show(m) => Some(m),
+            _ => None,
+        };
+        self.idle_swap
+            .update(model, now, anim::pace(), now_playing::IdleModel::same);
+        self.idle_busy = pending || self.idle_swap.running();
+        if self.idle_busy {
+            ui.request_repaint_at(now + FADE_FRAME);
+        }
+        let (out, shown) = self.idle_swap.alphas(now);
+        if out * fade > FADE_EPS
+            && let Some(model) = self.idle_swap.leaving().cloned()
+        {
+            with_alpha(ui, out * fade, |ui| {
+                now_playing::idle(
+                    ui,
+                    rect,
+                    look,
+                    &model,
+                    &mut self.art,
+                    &mut self.likes,
+                    player,
+                );
+            });
+        }
+        if shown * fade > FADE_EPS
+            && let Some(model) = self.idle_swap.shown().cloned()
+        {
+            with_alpha(ui, shown * fade, |ui| {
+                now_playing::idle(
+                    ui,
+                    rect,
+                    look,
+                    &model,
+                    &mut self.art,
+                    &mut self.likes,
+                    player,
+                );
+            });
+        }
     }
 
     /// Whether every cover the last frame drew is registered or given up on (the demo's dumps
@@ -683,7 +758,6 @@ impl NativeUi {
         self.track
             .update(state.current.as_ref().map(|n| n.track.uri.as_str()), now);
         let track_since = self.track.since();
-        let track_fade = anim::enter(track_since, now, anim::TRACK);
         if anim::running(track_since, now, anim::TRACK) {
             ui.request_repaint_at(now + FADE_FRAME);
         }
@@ -865,18 +939,11 @@ impl NativeUi {
             self.tour.start();
             self.navigate(Tab::Home.root());
         }
-        if fade * track_fade > FADE_EPS {
-            with_alpha(ui, fade * track_fade, |ui| {
-                now_playing::idle(
-                    ui,
-                    layout.idle,
-                    &look,
-                    &state,
-                    &mut self.art,
-                    &mut self.likes,
-                    player,
-                );
-            });
+        if fade > FADE_EPS {
+            self.idle_frame(ui, layout.idle, &look, &state, (fade, track_since), player);
+        } else {
+            self.idle_swap.reset();
+            self.idle_busy = false;
         }
 
         // The playing marks bounce while a song plays; ask for frames only while some were drawn.

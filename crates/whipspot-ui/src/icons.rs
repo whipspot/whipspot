@@ -27,6 +27,8 @@ pub(crate) enum Icon {
     ChevL,
     ChevR,
     Check,
+    /// A cross: clears the search field.
+    Close,
     Note,
     Clock,
     /// An open eye: the browse view hides by itself when the pointer rests.
@@ -176,6 +178,10 @@ pub(crate) fn icon(p: &mut P<'_>, icon: Icon, c: (f32, f32), size: f32, color: R
         Icon::ChevL => line(p, &[(0.28, -0.66), (-0.36, 0.0), (0.28, 0.66)]),
         Icon::ChevR => line(p, &[(-0.28, -0.66), (0.36, 0.0), (-0.28, 0.66)]),
         Icon::Check => line(p, &[(-0.7, 0.02), (-0.22, 0.5), (0.74, -0.54)]),
+        Icon::Close => {
+            line(p, &[(-0.55, -0.55), (0.55, 0.55)]);
+            line(p, &[(-0.55, 0.55), (0.55, -0.55)]);
+        }
         Icon::Note => {
             // Centred on its ink: the head's left edge (-0.57) to the flag's tip (0.57).
             line(p, &[(0.07, 0.5), (0.07, -0.84), (0.57, -0.6)]);

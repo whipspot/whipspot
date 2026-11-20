@@ -304,6 +304,7 @@ impl QueuePane {
             likes,
             player,
             hearts,
+            None,
         );
         if let Some(pos) = result.play {
             // The context is the whole queue, filtered or not.

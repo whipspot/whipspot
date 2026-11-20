@@ -16,6 +16,7 @@ use lune_ui::paint::{Rect, StrokeStyle, Xform};
 use lune_ui::text::{Spec, Style};
 use lune_ui::ui::{Sense, Ui};
 use lune_ui::widgets::button::ButtonKind;
+use lune_ui::widgets::scroll_area::ScrollView;
 use lune_ui::widgets::virtual_list::{
     Heights, ListOptions, RowCtx, RowKey, SelectionMode, row_fill,
 };
@@ -30,6 +31,7 @@ use crate::library::{LOAD_FAILED, Slot};
 use crate::likes::{LikeBook, heart};
 use crate::link::{self, Face, Place};
 use crate::now_playing::format_time;
+use crate::scroll_memory;
 use crate::theme::{Labels, Look};
 
 /// Two presses within this time on one row are a double click (the toolkit's own interval).
@@ -147,6 +149,26 @@ pub fn slot_at(rows: &[(usize, Rect)], y: f32) -> Option<usize> {
     )
 }
 
+/// A raw pointer position (window space) in the space the table draws in: the table sits in the
+/// translated content of the page's scroll area `outer`, so a press counts only inside that
+/// area's viewport and moves by its offset to meet the rows' rects. `None` when the press is
+/// outside the viewport (the page header, the top bar); no `outer` is no translation.
+fn to_table(pos: (f32, f32), outer: Option<&ScrollView>) -> Option<(f32, f32)> {
+    let Some(v) = outer else {
+        return Some(pos);
+    };
+    v.viewport
+        .contains(pos)
+        .then_some((pos.0 + v.offset.0 as f32, pos.1 + v.offset.1 as f32))
+}
+
+/// The drawn row (its index among the visible rows) whose pitch holds the drawing-space height `y`.
+fn row_at(rows: &[(usize, Rect)], y: f32) -> Option<usize> {
+    rows.iter()
+        .find(|(_, r)| y >= r.y && y < r.y + ROW_PITCH)
+        .map(|&(i, _)| i)
+}
+
 /// What a frame of the table asks of its caller.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PaneResult {
@@ -244,9 +266,26 @@ pub struct TrackTable {
     /// The rows drawn in the last frame (position in the visible rows, slot) and the list's rect.
     rows: Vec<(usize, Rect)>,
     list: Rect,
+    /// The offset the next frame's list is asked to scroll to (scroll memory, MD202); consumed
+    /// by that frame.
+    restore: Option<f64>,
+    /// The list's scroll in the last frame: offset, extent and viewport heights.
+    scrolled: Option<(f64, f64, f64)>,
 }
 
 impl TrackTable {
+    /// Asks the next frame's list to scroll to offset `y` (a reveal, repeated by the caller until
+    /// it is there).
+    pub fn set_restore(&mut self, y: Option<f64>) {
+        self.restore = y;
+    }
+
+    /// The list's offset, extent and viewport height in the last frame, `None` when it drew no
+    /// list.
+    pub fn scrolled(&self) -> Option<(f64, f64, f64)> {
+        self.scrolled
+    }
+
     /// Edits the next frame's rows as `edit` says (see [`Edit`]).
     pub fn set_edit(&mut self, edit: Edit) {
         self.edit = Some(edit);
@@ -274,6 +313,11 @@ impl TrackTable {
     /// `covers` gives the rows' thumbs. `hearts` is `Some(writable)` when the provider has likes:
     /// the rows then draw the like heart and a click on it goes to `likes` (a flip when `writable`,
     /// else the hint); the book dispatches through `player`.
+    ///
+    /// `outer` is the scroll area the table is drawn inside, when it is in one (the artist and
+    /// album pages): presses arrive in window space, the rows' rects in the area's translated
+    /// space, so a press is mapped through it first (MD201). The library lists and the queue pass
+    /// `None`.
     #[allow(clippy::too_many_arguments)]
     pub fn frame(
         &mut self,
@@ -289,9 +333,12 @@ impl TrackTable {
         likes: &mut LikeBook,
         player: &PlayerHandle,
         hearts: Option<bool>,
+        outer: Option<&ScrollView>,
     ) -> PaneResult {
         let mut result = PaneResult::default();
         let edit = self.edit.take();
+        let restore = self.restore.take();
+        self.scrolled = None;
         self.out = EditOut::default();
         self.rows.clear();
         let items = slot.items();
@@ -349,6 +396,10 @@ impl TrackTable {
             Some(e) => ("queue", e.key),
             None => ("tracks", slot.serial()),
         };
+        if let Some(y) = restore {
+            let extent = visible.len() as f64 * f64::from(ROW_PITCH);
+            scroll_memory::reveal_list(ui, key, y, f64::from(list.h), extent);
+        }
         let resp = ui.virtual_list(
             key,
             list,
@@ -450,6 +501,7 @@ impl TrackTable {
             },
         );
 
+        self.scrolled = Some((resp.offset, resp.extent, f64::from(list.h)));
         if let Some(e) = edit {
             if let Some(slot) = e.drop
                 && let Some(y) = drop_y(&rows, slot)
@@ -474,17 +526,22 @@ impl TrackTable {
         for event in &ui.input().events {
             match event {
                 Event::PointerButton {
-                    pos,
+                    pos: raw,
                     button: PointerButton::Primary,
                     pressed: true,
                     ..
-                } if body.contains(*pos) => {
+                } => {
+                    // Everything below is in the table's drawing space; `link::over` alone
+                    // takes the raw position (link boxes are window-space rects).
+                    let Some(pos) = to_table(*raw, outer).filter(|p| body.contains(*p)) else {
+                        continue;
+                    };
                     // A press on a heart is the heart's, not a row press.
                     if hearts.is_some() && (pos.0 - cols.like).abs() <= HEART_HIT / 2.0 {
                         continue;
                     }
                     // A press on an artist or album link is the link's too.
-                    if link::over(*pos) {
+                    if link::over(*raw) {
                         continue;
                     }
                     // Nor is a press on the edit controls: the grip and the remove button.
@@ -494,10 +551,7 @@ impl TrackTable {
                     {
                         continue;
                     }
-                    let Some(&(row, _)) = rows
-                        .iter()
-                        .find(|(_, r)| pos.1 >= r.y && pos.1 < r.y + ROW_PITCH)
-                    else {
+                    let Some(row) = row_at(&rows, pos.1) else {
                         continue;
                     };
                     if pos.0 < area.x + PLAY_ZONE {
@@ -781,6 +835,114 @@ pub fn play_visible(player: &PlayerHandle, slot: &Slot<Track>, visible: &[usize]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(offset_y: f64) -> ScrollView {
+        ScrollView {
+            viewport: Rect::new(10.0, 20.0, 300.0, 200.0),
+            offset: (0.0, offset_y),
+        }
+    }
+
+    #[test]
+    fn a_press_maps_into_the_drawing_space_of_the_page_it_sits_in() {
+        // No outer area: no translation.
+        assert_eq!(to_table((40.0, 90.0), None), Some((40.0, 90.0)));
+        // Scrolled 300 px: the window's y 90 is the content's y 390.
+        let v = view(300.0);
+        assert_eq!(to_table((40.0, 90.0), Some(&v)), Some((40.0, 390.0)));
+        // Outside the viewport (the page header, the top bar) it selects nothing.
+        assert_eq!(to_table((40.0, 10.0), Some(&v)), None);
+        assert_eq!(to_table((5.0, 90.0), Some(&v)), None);
+        assert_eq!(to_table((40.0, 230.0), Some(&v)), None);
+        // The viewport's own edges: `Rect::contains` takes the top and left, not the bottom.
+        let r = v.viewport;
+        assert_eq!(
+            to_table((r.x, r.y), Some(&v)).is_some(),
+            r.contains((r.x, r.y))
+        );
+        assert!(to_table((r.x, r.y), Some(&v)).is_some());
+        assert_eq!(
+            to_table((r.x, r.bottom()), Some(&v)).is_some(),
+            r.contains((r.x, r.bottom()))
+        );
+    }
+
+    /// The premise, against luneui's real translation: in a scrolled page the row the pointer
+    /// hovers is the row found from the mapped press, not the one the raw press would find.
+    #[test]
+    fn the_mapped_press_finds_the_row_luneui_hovers_in_a_scrolled_page() {
+        use lune_ui::testing::UiHarness;
+        use lune_ui::widgets::scroll_area::{Extent, ScrollOptions};
+
+        const N: usize = 60;
+        let mut h = UiHarness::new((320.0, 240.0));
+        let vp = Rect::new(0.0, 0.0, 320.0, 240.0);
+        let list = Rect::new(0.0, 0.0, 320.0, N as f32 * ROW_PITCH);
+        let frame = |h: &mut UiHarness, ms: u64| {
+            h.at_ms(ms);
+            let mut seen: Vec<(usize, Rect, bool)> = Vec::new();
+            let mut outer = None;
+            h.frame(|ui| {
+                let opts = ScrollOptions::default();
+                ui.scroll_area("page", vp, &opts, |ui, view| {
+                    let o = ListOptions {
+                        count: N,
+                        heights: Heights::Fixed(ROW_PITCH),
+                        selection: SelectionMode::None,
+                        index_of: None,
+                        label: "Rows",
+                    };
+                    ui.virtual_list(
+                        "rows",
+                        list,
+                        &o,
+                        |i| RowKey(i as u64),
+                        |_, ctx| {
+                            seen.push((ctx.index, ctx.rect, ctx.hovered));
+                            ROW_PITCH
+                        },
+                    );
+                    outer = Some(*view);
+                    (
+                        (),
+                        Extent {
+                            width: 320.0,
+                            height: N as f64 * ROW_PITCH as f64,
+                        },
+                    )
+                });
+            });
+            (seen, outer.expect("drawn"))
+        };
+        frame(&mut h, 0);
+        h.input.pointer_to(100.0, 100.0);
+        h.input.scroll_pixels(0.0, -400.0);
+        // Let the scroll settle.
+        let mut view = frame(&mut h, 16).1;
+        for i in 2..40 {
+            view = frame(&mut h, i * 50).1;
+        }
+        assert!(
+            view.offset.1 >= 5.0 * ROW_PITCH as f64,
+            "scrolled by at least five rows ({})",
+            view.offset.1
+        );
+        // The pointer rests over a row; one frame to hover it, the press frame reads it.
+        h.input.pointer_to(100.0, 120.0);
+        frame(&mut h, 3000);
+        let (seen, view) = frame(&mut h, 3016);
+        let hovered: Vec<usize> = seen.iter().filter(|r| r.2).map(|r| r.0).collect();
+        assert_eq!(hovered.len(), 1, "one row is hovered: {hovered:?}");
+        let rows: Vec<(usize, Rect)> = seen.iter().map(|&(i, r, _)| (i, r)).collect();
+        let raw = (100.0, 120.0);
+        let mapped = to_table(raw, Some(&view)).expect("inside the viewport");
+        assert_eq!(row_at(&rows, mapped.1), Some(hovered[0]));
+        assert_ne!(
+            row_at(&rows, raw.1),
+            Some(hovered[0]),
+            "the raw point is rows away"
+        );
+    }
 
     #[test]
     fn r2_columns_at_1440_with_and_without_the_thumb_column() {

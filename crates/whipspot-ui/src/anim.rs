@@ -25,6 +25,8 @@ pub(crate) const PAGE_SLIDE: f32 = 6.0;
 pub(crate) const TIP: Duration = Duration::from_millis(140);
 /// The now-playing title and cover coming in with a new track.
 pub(crate) const TRACK: Duration = Duration::from_millis(280);
+/// The idle view's outgoing body fading away before the next one comes in (MD204).
+pub(crate) const OUT: Duration = Duration::from_millis(160);
 /// A cover arriving from the network, from the placeholder.
 pub(crate) const ART: Duration = Duration::from_millis(250);
 /// The progress ring sweeping back when a new track starts.
@@ -185,6 +187,140 @@ impl TrackWatch {
     }
 }
 
+/// What a [`Swap`] draws as it leaves.
+#[derive(Debug, Clone)]
+struct Leaving<M> {
+    model: M,
+    since: Duration,
+    /// Its opacity when it began to leave (it may have been part way in).
+    from: f32,
+}
+
+/// One thing on show that changes one at a time (MD204): when what should show changes, the old
+/// one fades out over [`OUT`], and only then does the new one fade in over [`TRACK`]; never both
+/// at once. A change while one is fading starts from the opacity the visible one has. The old
+/// model stays kept to draw while it leaves. At a still pace every change is immediate, and the
+/// very first thing after a [`reset`](Swap::reset) appears at once (the view's own fade brings
+/// it in).
+///
+/// The models are the caller's; `same` says whether two are the same thing (only refreshed).
+#[derive(Debug, Clone)]
+pub(crate) struct Swap<M> {
+    shown: Option<M>,
+    /// The incoming one's rise began (or begins) at this time; `None` is fully in.
+    rise: Option<Duration>,
+    leaving: Option<Leaving<M>>,
+    /// An update has been seen since the last reset.
+    started: bool,
+}
+
+impl<M> Default for Swap<M> {
+    fn default() -> Self {
+        Swap {
+            shown: None,
+            rise: None,
+            leaving: None,
+            started: false,
+        }
+    }
+}
+
+impl<M> Swap<M> {
+    /// Forgets everything (the view is not on screen).
+    pub fn reset(&mut self) {
+        *self = Swap::default();
+    }
+
+    /// Takes what should show now (`None`: nothing yet).
+    pub fn update(
+        &mut self,
+        want: Option<M>,
+        now: Duration,
+        pace: Pace,
+        same: impl Fn(&M, &M) -> bool,
+    ) {
+        if self.leaving.as_ref().is_some_and(|l| now >= l.since + OUT) {
+            self.leaving = None;
+        }
+        if self.rise.is_some_and(|t| now >= t + TRACK) {
+            self.rise = None;
+        }
+        let first = !std::mem::replace(&mut self.started, true);
+        let same_thing = match (&self.shown, &want) {
+            (Some(a), Some(b)) => same(a, b),
+            _ => false,
+        };
+        if same_thing {
+            // A refresh: the live state replaces the kept one.
+            self.shown = want;
+            return;
+        }
+        if self.shown.is_none() && want.is_none() {
+            return;
+        }
+        if pace == Pace::Still {
+            self.shown = want;
+            self.rise = None;
+            self.leaving = None;
+            return;
+        }
+        let was = self.shown_alpha(now);
+        let mut free_at = self.leaving.as_ref().map(|l| l.since + OUT);
+        if let Some(model) = self.shown.take()
+            && was > 0.0
+        {
+            // It is visible, so nothing else is leaving: it fades out from where it is.
+            self.leaving = Some(Leaving {
+                model,
+                since: now,
+                from: was,
+            });
+            free_at = Some(now + OUT);
+        }
+        self.rise = match want {
+            None => None,
+            // The first thing on show appears at once.
+            Some(_) if first && free_at.is_none() => None,
+            Some(_) => Some(free_at.unwrap_or(now)),
+        };
+        self.shown = want;
+    }
+
+    fn shown_alpha(&self, now: Duration) -> f32 {
+        match (&self.shown, self.rise) {
+            (None, _) => 0.0,
+            (Some(_), None) => 1.0,
+            (Some(_), Some(t)) if now < t => 0.0,
+            (Some(_), Some(t)) => Easing::QuadOut.eval(progress(t, now, TRACK)),
+        }
+    }
+
+    /// The opacity of what is leaving and of what is coming in (or on show) at `now`; they are
+    /// never both above 0.
+    pub fn alphas(&self, now: Duration) -> (f32, f32) {
+        let out = self
+            .leaving
+            .as_ref()
+            .map_or(0.0, |l| l.from * (1.0 - progress(l.since, now, OUT)));
+        (out, self.shown_alpha(now))
+    }
+
+    /// What is leaving, to draw at the first opacity of [`alphas`](Swap::alphas).
+    pub fn leaving(&self) -> Option<&M> {
+        self.leaving.as_ref().map(|l| &l.model)
+    }
+
+    /// What is on show or coming in, for the second opacity.
+    pub fn shown(&self) -> Option<&M> {
+        self.shown.as_ref()
+    }
+
+    /// Whether a fade is in progress as of the last update (the view asks for frames).
+    pub fn running(&self) -> bool {
+        self.leaving.is_some() || self.rise.is_some()
+    }
+}
+
 /// The ring's sweep back to the start of a new track: from the value it showed to the live one,
 /// eased in and out over [`SWEEP`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -335,5 +471,142 @@ mod tests {
         assert_eq!(Sweep::new(0.01, ms(0)), None);
         assert_eq!(Sweep::new(0.0, ms(0)), None);
         assert!((300..=450).contains(&(SWEEP.as_millis() as u64)));
+    }
+
+    /// A model for the swap tests: (what it is, a payload the refresh replaces).
+    type Thing = (&'static str, u32);
+
+    fn same(a: &Thing, b: &Thing) -> bool {
+        a.0 == b.0
+    }
+
+    fn on(s: &mut Swap<Thing>, what: &'static str, t: u64) {
+        s.update(Some((what, 0)), ms(t), Pace::Full, same);
+    }
+
+    fn nothing(s: &mut Swap<Thing>, t: u64) {
+        s.update(None, ms(t), Pace::Full, same);
+    }
+
+    /// Every 4 ms in `from..to`: the two opacities are never both above 0.
+    fn never_both(s: &Swap<Thing>, from: u64, to: u64) {
+        for t in (from..to).step_by(4) {
+            let (out, shown) = s.alphas(ms(t));
+            assert!(out == 0.0 || shown == 0.0, "{t}: {out} {shown}");
+        }
+    }
+
+    #[test]
+    fn w1_the_first_thing_appears_at_once_and_a_refresh_changes_nothing() {
+        let mut s = Swap::default();
+        on(&mut s, "a", 1000);
+        assert_eq!(s.alphas(ms(1000)), (0.0, 1.0));
+        assert!(!s.running());
+        // The same thing again with a new payload: replaced, no fade.
+        s.update(Some(("a", 7)), ms(1100), Pace::Full, same);
+        assert_eq!(s.shown(), Some(&("a", 7)));
+        assert_eq!(s.alphas(ms(1100)), (0.0, 1.0));
+        assert!(!s.running() && s.leaving().is_none());
+    }
+
+    #[test]
+    fn w2_a_change_fades_the_old_out_then_the_new_in_never_both() {
+        let mut s = Swap::default();
+        on(&mut s, "a", 0);
+        on(&mut s, "b", 5000);
+        assert_eq!(s.leaving(), Some(&("a", 0)));
+        assert_eq!(s.alphas(ms(5000)), (1.0, 0.0));
+        // The old falls to 0 over OUT; the new is 0 until then.
+        let (mid_out, mid_in) = s.alphas(ms(5000) + OUT / 2);
+        assert!(
+            (mid_out - 0.5).abs() < 0.01 && mid_in == 0.0,
+            "{mid_out} {mid_in}"
+        );
+        let end = ms(5000) + OUT;
+        assert_eq!(s.alphas(end), (0.0, 0.0));
+        // Then the new rises over TRACK, to 1.
+        let (o, i) = s.alphas(end + TRACK / 2);
+        assert!(o == 0.0 && i > 0.5 && i < 1.0, "{o} {i}");
+        assert_eq!(s.alphas(end + TRACK), (0.0, 1.0));
+        never_both(&s, 5000, 5000 + 700);
+        // Once over, nothing runs.
+        on(&mut s, "b", 6000);
+        assert!(!s.running() && s.leaving().is_none());
+        assert_eq!(s.alphas(ms(6000)), (0.0, 1.0));
+    }
+
+    #[test]
+    fn w3_a_change_while_fading_starts_from_the_alpha_on_show_without_a_jump() {
+        let mut s = Swap::default();
+        on(&mut s, "a", 0);
+        on(&mut s, "b", 1000);
+        // b is part way in when c arrives.
+        let t = 1000 + OUT.as_millis() as u64 + 100;
+        let (_, b_alpha) = s.alphas(ms(t));
+        assert!(b_alpha > 0.0 && b_alpha < 1.0);
+        on(&mut s, "c", t);
+        assert_eq!(s.leaving(), Some(&("b", 0)));
+        let (out, shown) = s.alphas(ms(t));
+        assert!(
+            (out - b_alpha).abs() < 1e-6 && shown == 0.0,
+            "{out} vs {b_alpha}"
+        );
+        never_both(&s, t, t + 700);
+        let (out, _) = s.alphas(ms(t + OUT.as_millis() as u64));
+        assert_eq!(out, 0.0);
+        assert_eq!(s.alphas(ms(t) + OUT + TRACK).1, 1.0);
+
+        // A change during the out phase (the incoming not yet visible): the old keeps leaving,
+        // the new one waits for it to be gone.
+        let mut s = Swap::default();
+        on(&mut s, "a", 0);
+        on(&mut s, "b", 1000);
+        on(&mut s, "c", 1000 + 80);
+        assert_eq!(s.leaving(), Some(&("a", 0)));
+        assert_eq!(s.shown(), Some(&("c", 0)));
+        never_both(&s, 1000, 1700);
+        assert_eq!(s.alphas(ms(1000) + OUT + TRACK).1, 1.0);
+    }
+
+    #[test]
+    fn w4_pending_fades_the_old_out_and_the_next_in_after_it() {
+        let mut s = Swap::default();
+        on(&mut s, "a", 0);
+        nothing(&mut s, 1000);
+        assert_eq!(s.leaving(), Some(&("a", 0)));
+        assert!(s.shown().is_none());
+        // Pending lasts past the fade-out; then the new one fades in from nothing (not at once).
+        on(&mut s, "b", 1500);
+        assert_eq!(s.alphas(ms(1500)), (0.0, 0.0));
+        let (_, i) = s.alphas(ms(1500) + TRACK / 2);
+        assert!(i > 0.0 && i < 1.0);
+        assert_eq!(s.alphas(ms(1500) + TRACK).1, 1.0);
+        // Arriving while the old one still leaves waits for it.
+        let mut s = Swap::default();
+        on(&mut s, "a", 0);
+        nothing(&mut s, 1000);
+        on(&mut s, "b", 1050);
+        assert_eq!(s.alphas(ms(1050)).1, 0.0);
+        never_both(&s, 1000, 1700);
+        assert_eq!(s.alphas(ms(1000) + OUT + TRACK).1, 1.0);
+    }
+
+    #[test]
+    fn w5_a_still_pace_switches_at_once_and_a_reset_starts_over() {
+        let mut s = Swap::default();
+        s.update(Some(("a", 0)), ms(0), Pace::Still, same);
+        s.update(Some(("b", 0)), ms(10), Pace::Still, same);
+        assert_eq!(s.alphas(ms(10)), (0.0, 1.0));
+        assert!(!s.running() && s.leaving().is_none());
+        s.update(None, ms(20), Pace::Still, same);
+        assert!(s.shown().is_none() && !s.running());
+        // After a reset the first thing is on show at once even at a full pace.
+        let mut s = Swap::default();
+        on(&mut s, "a", 0);
+        on(&mut s, "b", 100);
+        s.reset();
+        assert!(s.shown().is_none() && s.leaving().is_none());
+        on(&mut s, "c", 500);
+        assert_eq!(s.alphas(ms(500)), (0.0, 1.0));
     }
 }

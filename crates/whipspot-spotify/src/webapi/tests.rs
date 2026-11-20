@@ -1188,7 +1188,7 @@ async fn an_artist_page_asks_the_artist_its_releases_and_a_filtered_search() {
         [
             format!("GET /artists/{ART} HTTP/1.1"),
             format!(
-                "GET /artists/{ART}/albums?include_groups=album,single,compilation,appears_on&limit=50&offset=0 HTTP/1.1"
+                "GET /artists/{ART}/albums?include_groups=album,single,compilation,appears_on&limit=10&offset=0 HTTP/1.1"
             ),
             "GET /search?type=track&limit=10&q=artist%3A%22Maker%22 HTTP/1.1".to_owned(),
         ]
@@ -1335,11 +1335,11 @@ async fn release_groups_and_offsets_reach_the_request() {
         r.mock.lines(),
         [
             format!(
-                "GET /artists/{ART}/albums?include_groups=album,compilation&limit=50&offset=50 HTTP/1.1"
+                "GET /artists/{ART}/albums?include_groups=album,compilation&limit=10&offset=50 HTTP/1.1"
             ),
-            format!("GET /artists/{ART}/albums?include_groups=single&limit=50&offset=0 HTTP/1.1"),
+            format!("GET /artists/{ART}/albums?include_groups=single&limit=10&offset=0 HTTP/1.1"),
             format!(
-                "GET /artists/{ART}/albums?include_groups=appears_on&limit=50&offset=100 HTTP/1.1"
+                "GET /artists/{ART}/albums?include_groups=appears_on&limit=10&offset=100 HTTP/1.1"
             ),
         ]
     );
@@ -1349,6 +1349,22 @@ async fn release_groups_and_offsets_reach_the_request() {
         (guest.items[0].kind, guest.next_offset),
         (AlbumKind::AppearsOn, Some(101))
     );
+}
+
+/// A full page of 10 releases with a `next` URL pages on by exactly 10.
+#[tokio::test]
+async fn a_full_page_of_ten_releases_pages_on_by_ten() {
+    let entries = (0..10)
+        .map(|i| release_entry(&format!("{i:0>22}"), "album"))
+        .collect();
+    let r = rig(vec![ok(items_page(entries, json!("n")))]);
+    let page = r
+        .api
+        .artist_releases(&art_uri(), ReleaseGroup::All, 20)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 10);
+    assert_eq!(page.next_offset, Some(30));
 }
 
 /// X6: an album is one request; its tracks carry the album's name and link.

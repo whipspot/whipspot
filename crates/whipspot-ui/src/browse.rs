@@ -27,6 +27,7 @@ use crate::library::{
 use crate::likes::LikeBook;
 use crate::pages::{self, FilterCache, Hero, HeroOut, Save};
 use crate::queue::QueuePane;
+use crate::scroll_memory::{self, Restore, Scrolled, Step};
 use crate::search;
 use crate::settings::{SettingsOut, SettingsPane, SettingsView};
 use crate::theme::Look;
@@ -87,6 +88,12 @@ pub struct Browse {
     /// the page in; the first route does not).
     shown: Option<Route>,
     changed: Option<Duration>,
+    /// A restore of the page's scroll in progress after a back or forward (MD202).
+    restore: Option<Restore>,
+    /// The offset the views are asked to reveal this frame (the restore's), and what the page on
+    /// show reported of its scroll in this frame.
+    want: Option<f64>,
+    scrolled: Option<Scrolled>,
 }
 
 /// What a page draws against in one frame.
@@ -133,6 +140,9 @@ impl Browse {
             visible: FilterCache::default(),
             shown: None,
             changed: None,
+            restore: None,
+            want: None,
+            scrolled: None,
         }
     }
 
@@ -351,6 +361,9 @@ impl Browse {
             self.history.push(Route::Search);
         }
 
+        let now = ui.time();
+        let (arrived, drawn_at) = self.begin_scroll(now);
+
         let route = self.history.current().clone();
         if route != Route::Account {
             self.account.leave();
@@ -365,7 +378,6 @@ impl Browse {
             c.h + layout::HEADING_TOP,
         );
         // A page change fades the new page in (and slides it up a few px).
-        let now = ui.time();
         match &self.shown {
             Some(was) if *was == route => {}
             Some(_) => {
@@ -424,7 +436,63 @@ impl Browse {
         });
         self.settle_play(player);
         self.play_release(ui.time(), player);
+        self.settle_scroll(ui, rect, arrived, drawn_at);
         settings_out
+    }
+
+    /// Starts the frame's scroll memory: a back or forward that arrived at a scrolled entry begins
+    /// a restore, and one pending from before a push, back or forward is dropped (it belonged to
+    /// another page). Sets what the views are asked for and clears what they reported. Returns
+    /// whether a restore began now and the history generation the frame draws.
+    fn begin_scroll(&mut self, now: Duration) -> (bool, u64) {
+        if self
+            .restore
+            .is_some_and(|r| r.generation != self.history.generation())
+        {
+            self.restore = None;
+        }
+        let arrived = match self.history.take_arrival() {
+            Some(y) => {
+                self.restore = Some(Restore {
+                    y,
+                    since: now,
+                    generation: self.history.generation(),
+                });
+                true
+            }
+            None => false,
+        };
+        self.want = self.restore.map(|r| r.y);
+        self.scrolled = None;
+        (arrived, self.history.generation())
+    }
+
+    /// Ends the frame's scroll memory: a restore in progress steps (and ends when the page is
+    /// there, cannot go further, the user took over or the time is up); otherwise the page's
+    /// offset goes into its history entry. Nothing is written while a restore is pending, and
+    /// nothing when the frame navigated (the next frame draws the new entry).
+    fn settle_scroll(&mut self, ui: &mut Ui<'_>, sheet: Rect, arrived: bool, drawn_at: u64) {
+        let scrolled = self.scrolled.take();
+        if self.history.generation() != drawn_at {
+            return;
+        }
+        let now = ui.time();
+        match self.restore {
+            Some(r) => {
+                // The press that went back is not the user taking over.
+                let moved = !arrived && scroll_memory::user_moved(ui, sheet);
+                if scroll_memory::step(&r, scrolled, now, moved) == Step::Done {
+                    self.restore = None;
+                } else {
+                    ui.request_repaint_at(now + crate::FADE_FRAME);
+                }
+            }
+            None => {
+                if let Some(s) = scrolled {
+                    self.history.set_scroll(s.offset);
+                }
+            }
+        }
     }
 
     /// Plays the release a Play on the artist page asked for, once its tracks are in.
@@ -617,7 +685,17 @@ impl Browse {
             open,
             play,
             retry,
-        } = grid::home(ui, vp, c, look, &sections, covers);
+            scrolled,
+        } = grid::home(ui, vp, c, look, &sections, covers, self.want);
+        let (pl, al, li) = (
+            &self.library.playlists,
+            &self.library.albums,
+            &self.library.liked,
+        );
+        let loading = (pl.items().is_empty() && can_grow(pl))
+            || (al.items().is_empty() && can_grow(al))
+            || (li.items().is_empty() && can_grow(li));
+        self.scrolled = scrolled.map(|s| scrolled_of(s, loading));
         if let Some(tab) = header {
             self.navigate(tab.root());
         }
@@ -669,7 +747,9 @@ impl Browse {
             cards: &cards,
             status: status_of(slot, "No playlists."),
         };
-        let out = grid::collection(ui, vp, c, look, &page, covers);
+        let out = grid::collection(ui, vp, c, look, &page, covers, self.want);
+        let growing = can_grow(slot);
+        self.scrolled = out.scrolled.map(|s| scrolled_of(s, growing));
         self.page_out(out, ListKind::Playlists, player, |s, i| {
             s.library.playlists.items().get(i).map(Self::playlist_route)
         });
@@ -698,7 +778,9 @@ impl Browse {
             cards: &cards,
             status: status_of(slot, "No saved albums."),
         };
-        let out = grid::collection(ui, vp, c, look, &page, covers);
+        let out = grid::collection(ui, vp, c, look, &page, covers, self.want);
+        let growing = can_grow(slot);
+        self.scrolled = out.scrolled.map(|s| scrolled_of(s, growing));
         self.page_out(out, ListKind::Albums, player, |s, i| s.album_route(i));
     }
 
@@ -892,9 +974,12 @@ impl Browse {
             album_page,
             ..Form::default()
         };
+        self.pane.set_restore(self.want);
         let result = self.pane.frame(
-            ui, geo.table, look, form, slot, visible, empty, current, covers, likes, player, hearts,
+            ui, geo.table, look, form, slot, visible, empty, current, covers, likes, player,
+            hearts, None,
         );
+        self.scrolled = self.pane.scrolled().map(|s| scrolled_of(s, can_grow(slot)));
         if let Some(pos) = result.play {
             play_visible(player, slot, visible, pos);
         }
@@ -953,10 +1038,14 @@ impl Browse {
         let Some(open) = self.library.open_artist.as_ref() else {
             return;
         };
+        self.artist.set_restore(self.want);
         let out = self
             .artist
             .frame(ui, sheet, open, (&prev, forced), on, covers, likes);
         let group = self.artist.group(uri);
+        let head = open.head();
+        let growing = (head.data().is_none() && !head.failed()) || can_grow(open.releases(group));
+        self.scrolled = out.scrolled.map(|s| scrolled_of(s, growing));
         // What the page asked for, read before the library is borrowed again.
         let releases = open.releases(group).items();
         let opened = out.open.and_then(|i| releases.get(i)).map(release_route);
@@ -1076,6 +1165,7 @@ impl Browse {
             save,
             route_artist: artist,
             visible,
+            restore: self.want,
         };
         let out = artist::album_page(
             ui,
@@ -1088,6 +1178,7 @@ impl Browse {
             (&mut self.pane, &mut self.filter),
         );
         self.filter_focused = out.filter_focused;
+        self.scrolled = out.scrolled.map(|s| scrolled_of(s, can_grow(&open.tracks)));
         // The rows follow the text a frame late (the field is drawn inside the page): draw again.
         if self.filter != typed {
             ui.request_repaint_at(ui.time());
@@ -1377,6 +1468,22 @@ fn count_of<T>(slot: &Slot<T>) -> Option<u32> {
     })
 }
 
+/// Whether more of `slot`'s list may still arrive (so a page reaching for the offset it was left
+/// at may find it a page later).
+fn can_grow<T>(slot: &Slot<T>) -> bool {
+    !slot.failed() && (slot.loading() || slot.has_more())
+}
+
+/// What a view reported of its scroll area (offset, extent, viewport heights) as a [`Scrolled`].
+fn scrolled_of((offset, extent, viewport): (f64, f64, f64), can_grow: bool) -> Scrolled {
+    Scrolled {
+        offset,
+        extent,
+        viewport,
+        can_grow,
+    }
+}
+
 /// What a collection list is doing, for its page.
 fn status_of<T>(slot: &Slot<T>, empty: &'static str) -> Status {
     if slot.failed() {
@@ -1418,6 +1525,128 @@ mod tests {
     }
 
     use whipspot_core::provider::model::{Capabilities, ProviderInfo};
+
+    /// One frame of the scroll memory alone: the views are replaced by `report`, the scroll the
+    /// page on show would have reported; `ms` is the frame's time.
+    fn memory_frame(
+        h: &mut lune_ui::testing::UiHarness,
+        sheet: &mut Browse,
+        ms: u64,
+        report: Option<(f64, bool)>,
+    ) -> Option<f64> {
+        h.at_ms(ms);
+        let mut want = None;
+        h.frame(|ui| {
+            let (arrived, drawn_at) = sheet.begin_scroll(ui.time());
+            want = sheet.want;
+            sheet.scrolled = report.map(|(offset, can_grow)| Scrolled {
+                offset,
+                extent: 5000.0,
+                viewport: 400.0,
+                can_grow,
+            });
+            sheet.settle_scroll(ui, Rect::new(0.0, 0.0, 800.0, 600.0), arrived, drawn_at);
+        });
+        want
+    }
+
+    #[test]
+    fn back_restores_the_offset_the_page_was_left_at_and_only_then_records_again() {
+        let mut h = lune_ui::testing::UiHarness::new((800.0, 600.0));
+        let mut sheet = Browse::new(Tab::Home);
+        sheet.navigate(Route::Albums);
+        for i in 0..3 {
+            assert_eq!(
+                memory_frame(&mut h, &mut sheet, i * 16, Some((600.0, false))),
+                None
+            );
+        }
+        // An album opened from the grid starts at the top and records its own offset.
+        sheet.navigate(Route::Liked);
+        memory_frame(&mut h, &mut sheet, 100, Some((0.0, false)));
+        memory_frame(&mut h, &mut sheet, 116, Some((80.0, false)));
+        // Back: the restore asks for 600; the fresh page reports 0 and must not overwrite it.
+        assert!(sheet.back());
+        let want = memory_frame(&mut h, &mut sheet, 200, Some((0.0, true)));
+        assert_eq!(want, Some(600.0));
+        let want = memory_frame(&mut h, &mut sheet, 216, Some((0.0, true)));
+        assert_eq!(want, Some(600.0), "still asked while the page is not there");
+        // The page gets there: the restore ends and recording resumes with the real offset.
+        memory_frame(&mut h, &mut sheet, 300, Some((600.0, true)));
+        assert!(sheet.restore.is_none());
+        let want = memory_frame(&mut h, &mut sheet, 316, Some((640.0, false)));
+        assert_eq!(want, None);
+        // Forward and back again: the Liked entry kept its 80, the Albums one now 640.
+        assert!(sheet.forward());
+        assert_eq!(
+            memory_frame(&mut h, &mut sheet, 400, Some((0.0, true))),
+            Some(80.0)
+        );
+        assert!(sheet.back());
+        assert_eq!(
+            memory_frame(&mut h, &mut sheet, 500, Some((0.0, true))),
+            Some(640.0)
+        );
+    }
+
+    #[test]
+    fn a_push_or_the_user_or_the_clock_ends_a_restore() {
+        let new = || {
+            let mut sheet = Browse::new(Tab::Home);
+            sheet.navigate(Route::Albums);
+            sheet
+        };
+        let go_back = |h: &mut lune_ui::testing::UiHarness, sheet: &mut Browse| {
+            memory_frame(h, sheet, 0, Some((300.0, false)));
+            sheet.navigate(Route::Liked);
+            memory_frame(h, sheet, 16, Some((0.0, false)));
+            sheet.back();
+            assert_eq!(memory_frame(h, sheet, 100, Some((0.0, true))), Some(300.0));
+        };
+        // A push (a tab click, a link) drops it: the next frame asks for nothing.
+        let mut h = lune_ui::testing::UiHarness::new((800.0, 600.0));
+        let mut sheet = new();
+        go_back(&mut h, &mut sheet);
+        sheet.navigate(Route::Playlists);
+        assert_eq!(
+            memory_frame(&mut h, &mut sheet, 116, Some((0.0, true))),
+            None
+        );
+        assert!(sheet.restore.is_none());
+
+        // The wheel in a later frame hands the page back to the user.
+        let mut h = lune_ui::testing::UiHarness::new((800.0, 600.0));
+        let mut sheet = new();
+        go_back(&mut h, &mut sheet);
+        h.input.scroll_pixels(0.0, -40.0);
+        memory_frame(&mut h, &mut sheet, 116, Some((0.0, true)));
+        assert!(sheet.restore.is_none());
+        assert_eq!(
+            memory_frame(&mut h, &mut sheet, 132, Some((0.0, true))),
+            None
+        );
+
+        // The press that went back (the same frame) is not the user taking over.
+        let mut h = lune_ui::testing::UiHarness::new((800.0, 600.0));
+        let mut sheet = new();
+        memory_frame(&mut h, &mut sheet, 0, Some((300.0, false)));
+        sheet.navigate(Route::Liked);
+        memory_frame(&mut h, &mut sheet, 16, Some((0.0, false)));
+        sheet.back();
+        h.input.pointer_to(20.0, 20.0);
+        h.input.click(lune_ui::input::PointerButton::Primary);
+        memory_frame(&mut h, &mut sheet, 100, Some((0.0, true)));
+        assert!(sheet.restore.is_some());
+
+        // Three seconds on, a restore that never got there gives up.
+        let mut h = lune_ui::testing::UiHarness::new((800.0, 600.0));
+        let mut sheet = new();
+        go_back(&mut h, &mut sheet);
+        memory_frame(&mut h, &mut sheet, 3000, Some((0.0, true)));
+        assert!(sheet.restore.is_some());
+        memory_frame(&mut h, &mut sheet, 3101, Some((0.0, true)));
+        assert!(sheet.restore.is_none());
+    }
 
     fn entry(id: &'static str, explore: bool) -> ProviderEntry {
         ProviderEntry {

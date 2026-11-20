@@ -34,6 +34,12 @@ const FIELD_MIN_W: f32 = 116.0;
 /// The key hint inside the field is drawn only when the field is at least this wide.
 const KEYCAP_MIN_FIELD_W: f32 = 190.0;
 const FIELD_H: f32 = 38.0;
+/// The clear button at the field's right end while it has text: its side, its icon's size, its
+/// distance from the field's right edge, and the gap between it and the text area.
+const CLEAR_BOX: f32 = 24.0;
+const CLEAR_ICON: f32 = 12.0;
+const CLEAR_INSET: f32 = 8.0;
+const CLEAR_GAP: f32 = 4.0;
 /// The gap between the last tab and the field at the least.
 const FIELD_GAP: f32 = 20.0;
 /// The tab gap in the roomy case and the narrowest it shrinks to.
@@ -98,6 +104,16 @@ fn hit_rect(c: (f32, f32)) -> Rect {
         c.1 - HIT_HALF,
         2.0 * HIT_HALF,
         2.0 * HIT_HALF,
+    )
+}
+
+/// The clear button's box in the search field `field`: right-aligned, centred vertically.
+fn clear_box(field: Rect) -> Rect {
+    Rect::new(
+        field.right() - CLEAR_INSET - CLEAR_BOX,
+        field.y + (field.h - CLEAR_BOX) / 2.0,
+        CLEAR_BOX,
+        CLEAR_BOX,
     )
 }
 
@@ -447,16 +463,19 @@ impl TopBar {
 
         // The search field: the box in the style of the theme, the toolkit's field inside it.
         let f = m.field;
+        // While the field has text its right end holds the clear button instead of the key hint.
+        let clear = (!self.text.is_empty()).then(|| clear_box(f));
         let keycap =
-            (k.decor().labels == Labels::Tracked && f.w >= KEYCAP_MIN_FIELD_W).then(|| {
-                let label = if mac { "CMD K" } else { "CTRL K" };
-                let p = ui.painter();
-                let kw = caps_width(p, label, 8.0, 1.0);
-                (
-                    label,
-                    Rect::new(f.right() - 14.0 - kw - 12.0, cy - 9.0, kw + 12.0, 18.0),
-                )
-            });
+            (k.decor().labels == Labels::Tracked && f.w >= KEYCAP_MIN_FIELD_W && clear.is_none())
+                .then(|| {
+                    let label = if mac { "CMD K" } else { "CTRL K" };
+                    let p = ui.painter();
+                    let kw = caps_width(p, label, 8.0, 1.0);
+                    (
+                        label,
+                        Rect::new(f.right() - 14.0 - kw - 12.0, cy - 9.0, kw + 12.0, 18.0),
+                    )
+                });
         {
             let p = ui.painter();
             match style {
@@ -466,7 +485,32 @@ impl TopBar {
             }
             icon(p, Icon::Search, (f.x + 22.0, cy), 14.0, ink.muted, HAIR);
         }
-        out.submit = self.field(ui, f, keycap.map(|(_, r)| r));
+        let mut clear_hover = false;
+        if let Some(r) = clear {
+            // Before the field: a click empties it, and the field takes the focus in this frame.
+            let resp = ui.interact(ui.id("topbar-clear"), r, Sense::CLICK);
+            clear_hover = resp.hovered;
+            if resp.hovered {
+                ui.set_cursor(CursorIcon::Pointer);
+            }
+            if resp.clicked {
+                self.text.clear();
+                self.want_focus = true;
+            }
+            ui.tooltip(&resp, "Clear");
+        }
+        out.submit = self.field(ui, f, keycap.map(|(_, r)| r), clear);
+        if let Some(r) = clear.filter(|_| !self.text.is_empty()) {
+            let col = if clear_hover { ink.text } else { ink.muted };
+            icon(
+                ui.painter(),
+                Icon::Close,
+                (r.x + r.w / 2.0, cy),
+                CLEAR_ICON,
+                col,
+                HAIR,
+            );
+        }
         if let Some((label, r)) = keycap {
             let p = ui.painter();
             p.ring(r, 5.0, 1.0, ink.line, false);
@@ -548,7 +592,13 @@ impl TopBar {
 
     /// The toolkit's text field inside the box `f` (no chrome of its own); the query when Enter
     /// was pressed with one typed.
-    fn field(&mut self, ui: &mut Ui<'_>, f: Rect, keycap: Option<Rect>) -> Option<String> {
+    fn field(
+        &mut self,
+        ui: &mut Ui<'_>,
+        f: Rect,
+        keycap: Option<Rect>,
+        clear: Option<Rect>,
+    ) -> Option<String> {
         if std::mem::take(&mut self.want_focus) {
             // The focus lands at the next frame's start, so one more frame is asked for.
             let id = ui.id("topbar-search");
@@ -556,7 +606,11 @@ impl TopBar {
             let at = ui.time() + Duration::from_millis(16);
             ui.request_repaint_at(at);
         }
-        let right = keycap.map_or(f.right() - 14.0, |r| r.x - 8.0);
+        let right = match (clear, keycap) {
+            (Some(c), _) => c.x - CLEAR_GAP,
+            (None, Some(r)) => r.x - 8.0,
+            (None, None) => f.right() - 14.0,
+        };
         let area = Rect::new(f.x + 38.0, f.y, (right - f.x - 38.0).max(0.0), f.h);
         let opts = FieldOptions {
             placeholder: PLACEHOLDER,
@@ -575,6 +629,117 @@ impl TopBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::theme::{ThemeId, theme};
+    use lune_ui::input::PointerButton;
+    use lune_ui::testing::UiHarness;
+
+    fn field_at(w: f32) -> Rect {
+        Rect::new(400.0, 40.0, w, FIELD_H)
+    }
+
+    #[test]
+    fn the_clear_box_is_24_px_at_the_fields_right_end_and_centred() {
+        for w in [FIELD_W, FIELD_MIN_W] {
+            let f = field_at(w);
+            let b = clear_box(f);
+            assert_eq!((b.w, b.h), (24.0, 24.0));
+            assert_eq!(b.right(), f.right() - 8.0);
+            assert_eq!(b.y + b.h / 2.0, f.y + f.h / 2.0);
+        }
+    }
+
+    #[test]
+    fn at_the_narrowest_field_the_box_is_inside_it_right_of_the_search_icon_with_room_to_type() {
+        let f = field_at(FIELD_MIN_W);
+        let b = clear_box(f);
+        assert!(b.x >= f.x && b.right() <= f.right() && b.y >= f.y && b.bottom() <= f.bottom());
+        // The search icon is centred at f.x + 22 and 14 wide.
+        assert!(b.x > f.x + 22.0 + 7.0 + CLEAR_GAP);
+        // The text area runs from f.x + 38 to the box less the gap: room for a few characters.
+        let text_w = (b.x - CLEAR_GAP) - (f.x + 38.0);
+        assert!(text_w >= 40.0, "{text_w}");
+    }
+
+    fn state<'a>() -> TopState<'a> {
+        TopState {
+            tab: Some(Tab::Home),
+            can_back: false,
+            can_forward: false,
+            auto_hide: false,
+            switch: None,
+            menu_forced: false,
+        }
+    }
+
+    #[test]
+    fn a_click_on_the_clear_box_empties_the_field_and_focuses_it_without_a_search() {
+        let k = Look::new(theme(ThemeId::A), None);
+        let s = Rect::new(32.0, 8.0, 1000.0, 200.0);
+        // The field's right edge and centre do not depend on the tab widths.
+        let right = s.right() - GEAR_INSET - HIDE_FROM_GEAR - FIELD_FROM_GEAR;
+        let cy = s.y + ROW_Y;
+        let b = clear_box(Rect::new(
+            right - FIELD_W,
+            cy - FIELD_H / 2.0,
+            FIELD_W,
+            FIELD_H,
+        ));
+        let at = (b.x + b.w / 2.0, b.y + b.h / 2.0);
+
+        let mut h = UiHarness::new((1100.0, 260.0));
+        let mut bar = TopBar::default();
+        bar.set_text("abc");
+        let frame = |h: &mut UiHarness, bar: &mut TopBar, ms: u64| {
+            h.at_ms(ms);
+            let mut out = TopOut::default();
+            h.frame(|ui| out = bar.frame(ui, s, &k, state()));
+            out
+        };
+        frame(&mut h, &mut bar, 0);
+        h.input.pointer_to(at.0, at.1);
+        frame(&mut h, &mut bar, 16);
+        h.input.click(PointerButton::Primary);
+        let out = frame(&mut h, &mut bar, 32);
+        assert!(bar.text.is_empty(), "the field was emptied: {:?}", bar.text);
+        assert_eq!(out.submit, None, "no search is submitted");
+        frame(&mut h, &mut bar, 48);
+        frame(&mut h, &mut bar, 64);
+        assert!(bar.focused(), "the field has the focus");
+
+        // A click at the same spot with the field empty hits nothing: no box, no change.
+        h.input.click(PointerButton::Primary);
+        frame(&mut h, &mut bar, 80);
+        assert!(bar.text.is_empty());
+    }
+
+    #[test]
+    fn a_click_beside_the_box_leaves_the_text() {
+        let k = Look::new(theme(ThemeId::A), None);
+        let s = Rect::new(32.0, 8.0, 1000.0, 200.0);
+        let right = s.right() - GEAR_INSET - HIDE_FROM_GEAR - FIELD_FROM_GEAR;
+        let cy = s.y + ROW_Y;
+        let b = clear_box(Rect::new(
+            right - FIELD_W,
+            cy - FIELD_H / 2.0,
+            FIELD_W,
+            FIELD_H,
+        ));
+        let mut h = UiHarness::new((1100.0, 260.0));
+        let mut bar = TopBar::default();
+        bar.set_text("abc");
+        for (ms, at) in [(0, None), (16, Some((b.x - 40.0, b.y + 12.0)))] {
+            h.at_ms(ms);
+            if let Some((x, y)) = at {
+                h.input.pointer_to(x, y);
+                h.input.click(PointerButton::Primary);
+            }
+            h.frame(|ui| {
+                bar.frame(ui, s, &k, state());
+            });
+        }
+        assert_eq!(bar.text, "abc");
+    }
 
     const TW: [f32; 5] = [40.0, 62.0, 50.0, 40.0, 48.0];
 

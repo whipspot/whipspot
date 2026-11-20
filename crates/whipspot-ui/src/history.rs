@@ -168,44 +168,82 @@ pub fn tab_of(route: &Route) -> Option<Tab> {
     }
 }
 
-/// A browser-style history: a push truncates what lies forward of the current entry.
+/// An offset this small is "at the top": nothing to restore.
+const TOP: f64 = 0.5;
+
+/// One entry: the route and where its list was scrolled when it was last on show.
+#[derive(Debug, Clone)]
+struct Entry {
+    route: Route,
+    scroll: f64,
+}
+
+/// A browser-style history: a push truncates what lies forward of the current entry. Each entry
+/// keeps the scroll offset of its page (MD202), handed back when back or forward returns to it.
 #[derive(Debug, Clone)]
 pub struct History {
-    entries: Vec<Route>,
+    entries: Vec<Entry>,
     at: usize,
+    /// The offset of the entry a back or forward just arrived at, until taken; a push clears it.
+    arrived: Option<f64>,
+    /// Counts every change of the current entry (a push, a back, a forward).
+    generation: u64,
 }
 
 impl History {
     /// A history holding only `start`.
     pub fn new(start: Route) -> History {
         History {
-            entries: vec![start],
+            entries: vec![Entry {
+                route: start,
+                scroll: 0.0,
+            }],
             at: 0,
+            arrived: None,
+            generation: 0,
         }
     }
 
     /// The route on show.
     pub fn current(&self) -> &Route {
-        &self.entries[self.at]
+        &self.entries[self.at].route
     }
 
     /// Opens `route`: forward entries are dropped; the current route again is a no-op; past
-    /// [`HISTORY_CAP`] entries the oldest goes.
+    /// [`HISTORY_CAP`] entries the oldest goes. The new entry starts at the top.
     pub fn push(&mut self, route: Route) {
         if *self.current() == route {
             return;
         }
         self.entries.truncate(self.at + 1);
-        self.entries.push(route);
+        self.entries.push(Entry { route, scroll: 0.0 });
         if self.entries.len() > HISTORY_CAP {
             self.entries.remove(0);
         }
         self.at = self.entries.len() - 1;
+        self.arrived = None;
+        self.generation += 1;
+    }
+
+    /// How many times the current entry has changed.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Notes where the current entry's page is scrolled.
+    pub fn set_scroll(&mut self, y: f64) {
+        self.entries[self.at].scroll = if y.is_finite() { y.max(0.0) } else { 0.0 };
+    }
+
+    /// The offset the entry that a back or forward arrived at had been left at, once; `None`
+    /// when it was at the top, after a push, or when already taken.
+    pub fn take_arrival(&mut self) -> Option<f64> {
+        self.arrived.take().filter(|y| *y > TOP)
     }
 
     /// The entry before the current one, if any (a breadcrumb names it).
     pub fn previous(&self) -> Option<&Route> {
-        self.at.checked_sub(1).map(|i| &self.entries[i])
+        self.at.checked_sub(1).map(|i| &self.entries[i].route)
     }
 
     /// Goes one entry back; whether there was one.
@@ -213,6 +251,7 @@ impl History {
         let ok = self.can_back();
         if ok {
             self.at -= 1;
+            self.arrive();
         }
         ok
     }
@@ -222,8 +261,14 @@ impl History {
         let ok = self.can_forward();
         if ok {
             self.at += 1;
+            self.arrive();
         }
         ok
+    }
+
+    fn arrive(&mut self) {
+        self.arrived = Some(self.entries[self.at].scroll);
+        self.generation += 1;
     }
 
     pub fn can_back(&self) -> bool {
@@ -318,6 +363,98 @@ mod tests {
         }
         assert_eq!(steps, HISTORY_CAP - 1);
         assert_ne!(*h.current(), Route::Home);
+    }
+
+    #[test]
+    fn s1_each_entry_keeps_its_own_offset_across_back_forward_and_pushes() {
+        let mut h = History::new(Route::Home);
+        h.set_scroll(100.0);
+        h.push(Route::Albums);
+        h.set_scroll(250.0);
+        h.push(Route::Liked);
+        h.set_scroll(900.0);
+        assert!(h.back());
+        assert_eq!(h.take_arrival(), Some(250.0));
+        assert!(h.back());
+        assert_eq!(h.take_arrival(), Some(100.0));
+        assert!(h.forward() && h.forward());
+        assert_eq!(h.take_arrival(), Some(900.0));
+        // Going back and forward again does not lose any.
+        assert!(h.back());
+        assert_eq!(h.take_arrival(), Some(250.0));
+        // The offset is recorded again while the entry is on show.
+        h.set_scroll(300.0);
+        assert!(h.forward() && h.back());
+        assert_eq!(h.take_arrival(), Some(300.0));
+    }
+
+    #[test]
+    fn s1_a_push_after_back_truncates_and_starts_at_the_top() {
+        let mut h = History::new(Route::Home);
+        h.set_scroll(40.0);
+        h.push(Route::Albums);
+        h.set_scroll(500.0);
+        h.back();
+        h.push(Route::Search);
+        // The new entry starts at 0, and a push leaves no arrival to restore.
+        assert_eq!(h.take_arrival(), None);
+        h.set_scroll(0.0);
+        assert!(h.back());
+        assert_eq!(h.take_arrival(), Some(40.0));
+        assert!(h.forward());
+        assert_eq!(h.take_arrival(), None, "the Search entry is at the top");
+    }
+
+    #[test]
+    fn s1_pushing_the_current_route_again_keeps_its_offset() {
+        let mut h = History::new(Route::Home);
+        h.push(Route::Albums);
+        h.set_scroll(321.0);
+        let before = h.generation();
+        h.push(Route::Albums);
+        assert_eq!(h.generation(), before, "a no-op push changes nothing");
+        h.push(Route::Liked);
+        assert!(h.back());
+        assert_eq!(h.take_arrival(), Some(321.0));
+    }
+
+    #[test]
+    fn s1_the_cap_drops_the_oldest_with_its_offset_and_keeps_the_rest_aligned() {
+        let mut h = History::new(Route::Home);
+        for n in 0..(HISTORY_CAP as u32 + 5) {
+            h.push(playlist(n));
+            h.set_scroll(f64::from(n) + 1.0);
+        }
+        // Walk back to the oldest entry kept: each offset is that of its own route.
+        let mut seen = 0;
+        while h.back() {
+            let Route::Playlist { id, .. } = h.current().clone() else {
+                panic!("a playlist");
+            };
+            let n: f64 = id[1..].parse().unwrap();
+            assert_eq!(h.take_arrival(), Some(n + 1.0), "{id}");
+            seen += 1;
+        }
+        assert_eq!(seen, HISTORY_CAP - 1);
+    }
+
+    #[test]
+    fn s1_an_arrival_is_taken_once_and_only_when_off_the_top() {
+        let mut h = History::new(Route::Home);
+        h.set_scroll(0.4);
+        h.push(Route::Albums);
+        h.back();
+        assert_eq!(h.take_arrival(), None, "0.4 px is the top");
+        h.set_scroll(2.0);
+        h.forward();
+        h.back();
+        assert_eq!(h.take_arrival(), Some(2.0));
+        assert_eq!(h.take_arrival(), None, "taken once");
+        // Not finite or negative offsets are the top.
+        h.set_scroll(f64::NAN);
+        h.forward();
+        h.back();
+        assert_eq!(h.take_arrival(), None);
     }
 
     #[test]

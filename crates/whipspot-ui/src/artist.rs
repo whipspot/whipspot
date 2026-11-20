@@ -22,6 +22,7 @@ use crate::library::{ArtistOpen, GROUPS, LOAD_FAILED, Open, Slot};
 use crate::likes::LikeBook;
 use crate::link::{self, Face, Place};
 use crate::pages::{self, Hero, HeroOut, Save};
+use crate::scroll_memory;
 use crate::theme::Look;
 use crate::tracks::{BAND_H, Form, PaneResult, ROW_PITCH, TrackTable, play_visible};
 
@@ -62,6 +63,8 @@ pub(crate) struct ArtistView {
     uri: String,
     group: ReleaseGroup,
     table: TrackTable,
+    /// The offset the next frame's page is asked to scroll to (scroll memory, MD202).
+    restore: Option<f64>,
 }
 
 impl Default for ArtistView {
@@ -70,12 +73,13 @@ impl Default for ArtistView {
             uri: String::new(),
             group: ReleaseGroup::All,
             table: TrackTable::default(),
+            restore: None,
         }
     }
 }
 
 /// What the page reported in a frame.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub(crate) struct ArtistOut {
     /// The breadcrumb's link (back).
     pub crumb: bool,
@@ -88,9 +92,16 @@ pub(crate) struct ArtistOut {
     pub more: bool,
     /// The Retry of a failed header or group.
     pub retry: bool,
+    /// The page's scroll area: offset, extent and viewport heights (scroll memory, MD202).
+    pub scrolled: Option<(f64, f64, f64)>,
 }
 
 impl ArtistView {
+    /// Asks the next frame's page to scroll to offset `y`.
+    pub(crate) fn set_restore(&mut self, y: Option<f64>) {
+        self.restore = y;
+    }
+
     /// The group the chips have selected for `uri`.
     pub(crate) fn group(&self, uri: &str) -> ReleaseGroup {
         if self.uri == uri {
@@ -197,6 +208,15 @@ impl ArtistView {
             identity: Some(open.serial),
             ..ScrollOptions::default()
         };
+        if let Some(y) = self.restore.take() {
+            scroll_memory::reveal_area(
+                ui,
+                ("artist-page", open.serial),
+                y,
+                f64::from(vp.h),
+                f64::from(content_h),
+            );
+        }
         let area = ui.scroll_area(("artist-page", open.serial), vp, &opts, |ui, view| {
             let seen = Rect::new(vp.x, vp.y + view.offset.1 as f32, vp.w, vp.h);
             page_boxes_scope(true);
@@ -271,6 +291,7 @@ impl ArtistView {
                     likes,
                     player,
                     None,
+                    Some(view),
                 );
                 if let Some(pos) = result.play {
                     play_visible(player, &open.shown, &visible, pos);
@@ -356,6 +377,7 @@ impl ArtistView {
         out.more = loaded
             && area.offset.1 + f64::from(vp.h) >= area.extent.1 - f64::from(NEAR_END)
             && slot.has_more();
+        out.scrolled = Some((area.offset.1, area.extent.1, f64::from(area.viewport.h)));
         out
     }
 }
@@ -373,10 +395,12 @@ pub(crate) struct AlbumArgs<'a> {
     pub route_artist: &'a str,
     /// The rows of the track table (every loaded track).
     pub visible: &'a [usize],
+    /// The offset the page is asked to scroll to (scroll memory, MD202).
+    pub restore: Option<f64>,
 }
 
 /// What the explored album page reported in a frame.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub(crate) struct AlbumOut {
     /// The filter field has keyboard focus.
     pub filter_focused: bool,
@@ -385,6 +409,8 @@ pub(crate) struct AlbumOut {
     /// The "More by" tile (its index in [`more_by`]) to open or to play.
     pub open: Option<usize>,
     pub play_release: Option<usize>,
+    /// The page's scroll area: offset, extent and viewport heights (scroll memory, MD202).
+    pub scrolled: Option<(f64, f64, f64)>,
 }
 
 /// The releases the "More by" row shows: the first artist's releases but this album, at most one
@@ -506,7 +532,16 @@ pub(crate) fn album_page(
         identity: Some(slot.serial()),
         ..ScrollOptions::default()
     };
-    ui.scroll_area(("album-page", slot.serial()), vp, &opts, |ui, view| {
+    if let Some(y) = a.restore {
+        scroll_memory::reveal_area(
+            ui,
+            ("album-page", slot.serial()),
+            y,
+            f64::from(vp.h),
+            f64::from(content_h),
+        );
+    }
+    let area = ui.scroll_area(("album-page", slot.serial()), vp, &opts, |ui, view| {
         let seen = Rect::new(vp.x, vp.y + view.offset.1 as f32, vp.w, vp.h);
         page_boxes_scope(true);
         ui.painter().on(LayerId::Popup);
@@ -544,6 +579,7 @@ pub(crate) fn album_page(
             likes,
             player,
             hearts,
+            Some(view),
         );
         ui.painter().on(LayerId::Popup);
         if let (Some(artist), false) = (first, tiles.is_empty()) {
@@ -595,6 +631,7 @@ pub(crate) fn album_page(
             },
         )
     });
+    out.scrolled = Some((area.offset.1, area.extent.1, f64::from(area.viewport.h)));
     out
 }
 

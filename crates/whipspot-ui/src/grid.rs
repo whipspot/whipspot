@@ -21,6 +21,7 @@ use crate::draw::{P, alpha, disc, outline, shadow, text, width};
 use crate::history::Tab;
 use crate::icons::{Icon, icon, play_filled};
 use crate::library::LOAD_FAILED;
+use crate::scroll_memory;
 use crate::theme::{Labels, Look, Pill};
 
 /// The gap between cards, both ways.
@@ -125,13 +126,15 @@ pub struct CardOut {
 }
 
 /// What a page reported: the card to open or to play, and that the next page is due.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct PageOut {
     pub open: Option<usize>,
     pub play: Option<usize>,
     pub near_end: bool,
     /// The Retry button of a failed list was pressed.
     pub retry: bool,
+    /// The page's scroll area: offset, extent and viewport heights (scroll memory, MD202).
+    pub scrolled: Option<(f64, f64, f64)>,
 }
 
 thread_local! {
@@ -391,6 +394,7 @@ pub fn collection(
     k: &Look,
     page: &Page<'_>,
     covers: &mut Covers<'_>,
+    want: Option<f64>,
 ) -> PageOut {
     let Page {
         scope,
@@ -411,6 +415,16 @@ pub fn collection(
     let rows = cards.len().div_ceil(cols);
     let tail_h = if status == Status::Failed { 70.0 } else { 0.0 };
     let content_h = c.y - vp.y + CARDS_TOP + rows as f32 * pitch + tail_h + BOTTOM_PAD;
+    // Back or forward asked for the offset the page was left at (MD202).
+    if let Some(y) = want {
+        scroll_memory::reveal_area(
+            ui,
+            (scope, "page"),
+            y,
+            f64::from(vp.h),
+            f64::from(content_h),
+        );
+    }
     let area = ui.scroll_area((scope, "page"), vp, &opts, |ui, view| {
         let seen = Rect::new(vp.x, vp.y + view.offset.1 as f32, vp.w, vp.h);
         ui.painter().on(LayerId::Popup);
@@ -455,6 +469,7 @@ pub fn collection(
         )
     });
     out.near_end = area.offset.1 + f64::from(vp.h) >= area.extent.1 - f64::from(NEAR_END);
+    out.scrolled = Some((area.offset.1, area.extent.1, f64::from(area.viewport.h)));
     out
 }
 
@@ -480,12 +495,14 @@ pub struct Section<'a> {
 
 /// What Home reported: a section header pressed, a card to open or play (section, card), a
 /// Retry (section).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct HomeOut {
     pub header: Option<Tab>,
     pub open: Option<(usize, usize)>,
     pub play: Option<(usize, usize)>,
     pub retry: Option<usize>,
+    /// The page's scroll area: offset, extent and viewport heights (scroll memory, MD202).
+    pub scrolled: Option<(f64, f64, f64)>,
 }
 
 /// The height Home's section of `rows` rows of cards `w` wide takes, header and gap included.
@@ -567,6 +584,7 @@ pub fn home(
     k: &Look,
     sections: &[Section<'_>],
     covers: &mut Covers<'_>,
+    want: Option<f64>,
 ) -> HomeOut {
     let opts = ScrollOptions {
         bars: (Bars::Hidden, Bars::Auto),
@@ -579,7 +597,10 @@ pub fn home(
     let heights: Vec<f32> = rows.iter().map(|&r| section_height(r, w)).collect();
     let content_h = c.y - vp.y + heights.iter().sum::<f32>() + BOTTOM_PAD;
     let mut out = HomeOut::default();
-    ui.scroll_area("home-page", vp, &opts, |ui, _view| {
+    if let Some(y) = want {
+        scroll_memory::reveal_area(ui, "home-page", y, f64::from(vp.h), f64::from(content_h));
+    }
+    let area = ui.scroll_area("home-page", vp, &opts, |ui, _view| {
         ui.painter().on(LayerId::Popup);
         let mut y = c.y;
         for (s, section) in sections.iter().enumerate() {
@@ -669,6 +690,7 @@ pub fn home(
             },
         )
     });
+    out.scrolled = Some((area.offset.1, area.extent.1, f64::from(area.viewport.h)));
     out
 }
 

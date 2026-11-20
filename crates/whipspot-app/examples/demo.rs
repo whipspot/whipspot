@@ -40,7 +40,8 @@
 //! Dumped screens (MD60), for each theme t in a, b, c: `t-browse-grid@1x` (Albums),
 //! `t-browse-tracks@1x` (an album open), `t-idle@1x`, `t-tooltip@1x` (the quality pill's signal
 //! path) and `t-progress-hover@1x` (the ring's tooltip over the idle view); then in theme c:
-//! `c-browse-grid@2x`, `c-home@1x`, `c-search@1x` (results for "a"), `c-account@1x` (logged out),
+//! `c-browse-grid@2x`, `c-home@1x`, `c-search@1x` (results for "a"; with `a-search@1x` and
+//! `b-search@1x` the clear button shows in the field), `c-account@1x` (logged out),
 //! `c-empty@1x` (logged out, Home), `c-refused@1x` (the unreadable playlist after its refusal),
 //! `c-min@1x` (760x480, Albums); and `diagnostics@1x`. Eight screens show covers, lyrics and likes
 //! (M6): `a-idle-art@1x`, `b-idle-art@1x`, `c-idle-art@1x` (the idle view with its cover),
@@ -712,6 +713,9 @@ fn shots() -> Vec<Shot> {
             ..Shot::new("c-home-rows@1x", c, Route::Home)
         },
         Shot::new("c-search@1x", c, Route::Search),
+        // The search field's clear button shows while it has text ("a" in the Search shots).
+        Shot::new("a-search@1x", ThemeId::A, Route::Search),
+        Shot::new("b-search@1x", ThemeId::B, Route::Search),
         Shot {
             logged_in: false,
             ..Shot::new("c-account@1x", c, Route::Account)
@@ -1004,10 +1008,12 @@ impl Script<'_> {
     }
 
     /// Draws frames until the covers it drew are in and, when `lyrics`, the current track's
-    /// lyrics are found; fails after [`SETTLE_FRAMES`].
+    /// lyrics are found, and the idle view is no longer waiting for them or fading a body (MD204);
+    /// fails after [`SETTLE_FRAMES`].
     fn settle(&mut self, lyrics: bool) -> anyhow::Result<()> {
         for _ in 0..SETTLE_FRAMES {
-            if self.view.art_settled() && (!lyrics || self.lyrics_found()) {
+            if self.view.art_settled() && (!lyrics || self.lyrics_found()) && !self.view.idle_busy()
+            {
                 // One more frame draws what the last registration brought.
                 return self.step(Vec::new());
             }
