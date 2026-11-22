@@ -1,6 +1,6 @@
 //! Scroll memory (MD202): back and forward return a page to where it was scrolled.
 //!
-//! luneui v0.7.0 has no absolute scroll setter, so a restore is a reveal: `scroll_to` with the
+//! luneui v0.7.6 has no absolute scroll setter, so a restore is a reveal: `scroll_to` with the
 //! span `y .. y + viewport`, which from the top of a fresh area lands the offset exactly on `y`
 //! (the span's end meets the viewport's end). The target is clamped to the content's last
 //! offset, because luneui ignores a reveal whose span starts past the content: a page that is
@@ -23,7 +23,7 @@ use lune_ui::widgets::scroll_area::{Reveal, Target, max_offset};
 pub(crate) const RESTORE_FOR: Duration = Duration::from_millis(3000);
 /// An offset this close to the wanted one is there (px).
 const CLOSE: f64 = 1.0;
-/// The key of the scroll area inside luneui v0.7.0's virtual list (`virtual_list.rs:51`, its
+/// The key of the scroll area inside luneui v0.7.6's virtual list (`virtual_list.rs:51`, its
 /// private `const AREA`), under the list's own scope. A luneui upgrade that renames it fails the
 /// `reveal_list` test, not the app.
 const LIST_AREA: &str = "area";
