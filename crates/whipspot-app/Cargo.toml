@@ -1,6 +1,6 @@
 [package]
 name = "whipspot-app"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -18,7 +18,7 @@ whipspot-skin-wmp = { path = "../whipspot-skin-wmp" }
 whipspot-local = { path = "../whipspot-local" }
 whipspot-ytmusic = { path = "../whipspot-ytmusic" }
 # luneui by tag (D45), with the app's own winit, wgpu and pollster (the toolkit re-exports none).
-lune-ui = { git = "https://github.com/lune-rs/luneui-rs", tag = "v0.7.0" }
+lune-ui = { git = "https://github.com/lune-rs/luneui", tag = "v0.7.6" }
 winit = "0.30"
 wgpu = "30"
 pollster = "0.4"

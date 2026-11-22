@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 # Views over lune_ui::Ui (D31); no winit, wgpu or adapter here (scripts/check-boundaries.sh R4).
-lune-ui = { git = "https://github.com/lune-rs/luneui-rs", tag = "v0.7.0" }
+lune-ui = { git = "https://github.com/lune-rs/luneui", tag = "v0.7.6" }
 whipspot-core = { path = "../whipspot-core" }
 
 [lints]
