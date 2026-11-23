@@ -38,6 +38,10 @@ use crate::theme::{Labels, Look, ThemeId, theme};
 /// music service.
 pub(crate) const LYRICS_NOTE: &str = "Lyrics come from LRCLIB (lrclib.net), which learns the artist, title, album and length of what plays.";
 
+/// The sentence under the Efficiency mode switch (D7): what it does, and that music is not slowed.
+pub(crate) const EFFICIENCY_NOTE: &str =
+    "While Whipspot is hidden, it lets the system save power. Playing music is never slowed down.";
+
 /// The sentence under the quality choice while it differs from the running one (MD88).
 const QUALITY_NOTE: &str = "Applies the next time Whipspot starts.";
 
@@ -633,7 +637,8 @@ fn skins_card(
     r.bottom()
 }
 
-/// The Playback card: streaming quality and the Lyrics switch. Returns the card's bottom.
+/// The Playback card: streaming quality, the Lyrics switch and the Efficiency mode switch.
+/// Returns the card's bottom.
 fn playback_card(
     ui: &mut Ui<'_>,
     k: &Look,
@@ -648,6 +653,9 @@ fn playback_card(
     let note = quality_note(view.quality, view.quality_at_start);
     let lyrics_note = Spec::plain(LYRICS_NOTE, Style::ui(12.5, k.ink.muted)).wrapped(inner_w);
     let lyrics_note_h = ui.painter().measure(&lyrics_note).1;
+    let efficiency_note =
+        Spec::plain(EFFICIENCY_NOTE, Style::ui(12.5, k.ink.muted)).wrapped(inner_w);
+    let efficiency_note_h = ui.painter().measure(&efficiency_note).1;
     let radios_h = QUALITIES.len() as f32 * RADIO_H;
     let h = BODY_Y
         + radios_h
@@ -658,6 +666,12 @@ fn playback_card(
         + SWITCH_ROW_H
         + 6.0
         + lyrics_note_h
+        + 14.0
+        + 1.0
+        + 14.0
+        + SWITCH_ROW_H
+        + 6.0
+        + efficiency_note_h
         + PAD_BOTTOM;
     let r = Rect::new(at.x, at.y, at.w, h);
     card(ui.painter(), k, r, "Playback");
@@ -731,6 +745,37 @@ fn playback_card(
         player.dispatch(PlayerAction::SetLyrics(on));
     }
     ui.painter().text(&lyrics_note, x0, y + SWITCH_ROW_H + 6.0);
+
+    // The hairline, then the Efficiency mode switch (D7).
+    y += SWITCH_ROW_H + 6.0 + lyrics_note_h + 14.0;
+    ui.painter()
+        .fill(Rect::new(x0, y, inner_w, 1.0), 0.0, k.ink.line_soft);
+    y += 15.0;
+    text(
+        ui.painter(),
+        "Efficiency mode",
+        13.5,
+        k.ink.text,
+        true,
+        x0,
+        y + (SWITCH_ROW_H - 13.5 * 1.3) / 2.0,
+        0.0,
+    );
+    let mut on = state.power.enabled;
+    let track = Rect::new(
+        x0 + inner_w - TOGGLE_W,
+        y + (SWITCH_ROW_H - TOGGLE_H) / 2.0,
+        TOGGLE_W,
+        TOGGLE_H,
+    );
+    if ui
+        .toggle("efficiency-toggle", track, &mut on, "Efficiency mode")
+        .changed
+    {
+        player.dispatch(PlayerAction::SetEfficiency(on));
+    }
+    ui.painter()
+        .text(&efficiency_note, x0, y + SWITCH_ROW_H + 6.0);
     r.bottom()
 }
 
@@ -1116,6 +1161,15 @@ mod tests {
             quality_note(StreamQuality::Low, StreamQuality::High),
             Some("Applies the next time Whipspot starts.")
         );
+    }
+
+    #[test]
+    fn the_efficiency_note_names_no_os_and_says_music_is_not_slowed() {
+        assert!(!EFFICIENCY_NOTE.is_empty());
+        for os in ["Windows", "macOS", "Mac", "Linux"] {
+            assert!(!EFFICIENCY_NOTE.contains(os), "{EFFICIENCY_NOTE}");
+        }
+        assert!(EFFICIENCY_NOTE.contains("never slowed down"));
     }
 
     #[test]
