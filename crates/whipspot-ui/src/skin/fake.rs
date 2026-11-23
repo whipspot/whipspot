@@ -162,6 +162,7 @@ pub(crate) fn player_state() -> PlayerState {
         lyrics: LyricsState::Off,
         lyrics_enabled: false,
         remote: None,
+        power: Default::default(),
     }
 }
 

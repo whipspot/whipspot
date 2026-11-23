@@ -32,6 +32,7 @@ use super::{OUTPUT_STOPPED, texts};
 use crate::engine::{BAND_COUNT, Engine, EqSettings, OutputMode, OutputRequest};
 use crate::events::{RemotePlay, UiEvent};
 use crate::lyrics::{Lyrics, LyricsError, LyricsQuery};
+use crate::power::{self, PowerControl, PowerMode};
 use crate::provider::{
     AuthFailure, LibErrorKind, LibraryError, Provider, ProviderAuthStatus, ProviderRegistry,
     RemoteCommand, Track,
@@ -193,6 +194,18 @@ struct Held {
     cancel: Arc<AtomicBool>,
 }
 
+/// The release timers and the efficiency mode the control task applies.
+pub(crate) struct Policy {
+    /// How long an exclusive output may stay open while paused (H28, D14).
+    pub(crate) pause_release: Duration,
+    /// How long any output may stay open while paused and hidden with the setting on.
+    pub(crate) hidden_pause_release: Duration,
+    /// The OS power control, if one is wired.
+    pub(crate) power: Option<Arc<dyn PowerControl>>,
+    /// The efficiency setting at start.
+    pub(crate) power_enabled: bool,
+}
+
 pub(crate) struct Control {
     shared: Arc<Shared>,
     registry: Arc<ProviderRegistry>,
@@ -218,9 +231,20 @@ pub(crate) struct Control {
     carry: Option<Fallback>,
     /// How long an exclusive output may stay open while paused (H28, D14).
     pause_release: Duration,
-    /// When the exclusive output is given back if the pause lasts; armed while paused with an
-    /// exclusive output open, cleared by anything else (and re-armed by each action).
+    /// How long any output may stay open while paused and hidden with the setting on (D3).
+    hidden_pause_release: Duration,
+    /// When the output is given back if the pause lasts; armed while paused with an output the
+    /// release applies to (see [`Control::pause_release_applies`]), cleared by anything else
+    /// (and re-armed by each action).
     pause_deadline: Option<tokio::time::Instant>,
+    /// The OS power control; `None` means no `set` is ever called.
+    power: Option<Arc<dyn PowerControl>>,
+    /// The efficiency setting (also `PlayerState.power.enabled`).
+    power_enabled: bool,
+    /// Whether any window of the front-end is shown (also `PlayerState.power.shown`).
+    shown: bool,
+    /// The mode last asked of `power` (Normal at start, with no call).
+    applied: PowerMode,
     /// The provider whose remote controls playback (also `PlayerState.remote`): its transport
     /// buttons go to the remote and no local load is pending, held or carried.
     remote: Option<&'static str>,
@@ -244,7 +268,7 @@ impl Control {
         transport: UnboundedSender<TransportCmd>,
         internal: UnboundedSender<Internal>,
         lyrics: LyricsLookups,
-        pause_release: Duration,
+        policy: Policy,
     ) -> Self {
         Control {
             shared,
@@ -264,8 +288,13 @@ impl Control {
             held: None,
             holds: 0,
             carry: None,
-            pause_release,
+            pause_release: policy.pause_release,
+            hidden_pause_release: policy.hidden_pause_release,
             pause_deadline: None,
+            power: policy.power,
+            power_enabled: policy.power_enabled,
+            shown: true,
+            applied: PowerMode::Normal,
             remote: None,
             unloaded: false,
         }
@@ -298,7 +327,12 @@ impl Control {
 
     /// Reopen the chosen output (`rate` for an exclusive choice; 0 = any) through its fallback
     /// chain and show what opened. All attempts failing leaves the engine released (MD41).
+    /// The whole-process saving (EcoIdle) is left first: it is never in force while an output
+    /// opens or is open (efficiency mode I1).
     fn reopen(&mut self, rate: Option<u32>) {
+        if self.applied == PowerMode::EcoIdle {
+            self.apply_power(power::wanted(self.power_enabled, self.shown, true));
+        }
         let rate = rate.filter(|&r| r != 0);
         let requests = output::chain(self.device.as_deref(), self.mode, rate);
         let reopened = self.engine.reopen(&requests);
@@ -335,10 +369,10 @@ impl Control {
         });
     }
 
-    /// Release the output and show the exclusive idle summary.
+    /// Release the output and show the idle summary of the mode chosen.
     fn release_idle(&mut self) {
         self.engine.release();
-        let summary = output::idle_summary(self.device.as_deref());
+        let summary = output::idle_summary(self.mode, self.device.as_deref());
         self.update(|s| {
             s.output_summary = summary;
             s.output.fallback = None;
@@ -346,10 +380,17 @@ impl Control {
         });
     }
 
-    /// The play state became Stopped by the user's Stop or the end of the queue: an exclusive
-    /// choice gives the device back (MD41). Pause keeps it.
+    /// Every window is hidden and the efficiency setting is on: an idle output is given back
+    /// (D3) so the OS sees the app as silent.
+    fn saving_hidden(&self) -> bool {
+        self.power_enabled && !self.shown
+    }
+
+    /// The play state became Stopped by the user's Stop or the end of the queue (or the app was
+    /// hidden while stopped): an exclusive choice gives the device back (MD41), and so does a
+    /// shared one while hidden with the setting on (D3). Pause keeps it.
     fn release_when_stopped(&mut self) {
-        if self.mode == OutputMode::Exclusive
+        if (self.mode == OutputMode::Exclusive || self.saving_hidden())
             && self.pending.is_none()
             && self.state().play_state == PlayState::Stopped
             && !self.engine.is_released()
@@ -358,9 +399,9 @@ impl Control {
         }
     }
 
-    /// Whether the pause release applies now: paused with nothing loading, an exclusive output
-    /// open (a shared one, or an exclusive choice that fell back to shared, is never released
-    /// on pause).
+    /// Whether the pause release applies now: paused with nothing loading and an exclusive
+    /// output open, or any output while hidden with the setting on (D3). Otherwise a shared
+    /// one, or an exclusive choice that fell back to shared, is never released on pause.
     fn pause_release_applies(&self) -> bool {
         // A remote's pause is the remote's: no local seek or release behind its back.
         self.remote.is_none()
@@ -369,7 +410,7 @@ impl Control {
             && self
                 .engine
                 .output()
-                .is_some_and(|i| i.mode == OutputMode::Exclusive)
+                .is_some_and(|i| i.mode == OutputMode::Exclusive || self.saving_hidden())
     }
 
     /// Keep the pause timer in step with the state: running (from when the pause began) while
@@ -378,11 +419,66 @@ impl Control {
         if !self.pause_release_applies() {
             self.pause_deadline = None;
         } else if self.pause_deadline.is_none() {
-            self.pause_deadline = Some(tokio::time::Instant::now() + self.pause_release);
+            let after = if self.saving_hidden() {
+                self.pause_release.min(self.hidden_pause_release)
+            } else {
+                self.pause_release
+            };
+            self.pause_deadline = Some(tokio::time::Instant::now() + after);
         }
     }
 
-    /// The pause lasted: give the exclusive device back (H28). The queued audio goes with it,
+    /// Whether audio is open, opening or loading: what keeps the process out of EcoIdle (I2).
+    fn audio_active(&self) -> bool {
+        self.engine.output().is_some()
+            || self.pending.is_some()
+            || matches!(
+                self.state().play_state,
+                PlayState::Loading | PlayState::Playing
+            )
+    }
+
+    /// Bring the power mode in step with the setting, the windows and the audio (I2); runs at
+    /// the end of every loop turn.
+    fn sync_power(&mut self) {
+        let want = power::wanted(self.power_enabled, self.shown, self.audio_active());
+        self.apply_power(want);
+    }
+
+    /// Ask for `want` if it is not the mode last asked for (I3): one `set` per change, none
+    /// without a control. A refusal is shown and not retried until the wanted mode changes.
+    fn apply_power(&mut self, want: PowerMode) {
+        if want == self.applied {
+            return;
+        }
+        self.applied = want;
+        let result = match &self.power {
+            Some(p) => p.set(want),
+            None => Ok(()),
+        };
+        self.update(|s| {
+            s.power.mode = want;
+            s.power.error = result.err();
+        });
+    }
+
+    /// `SetShown`: an idle output is given back at once when hidden while stopped; a pause's
+    /// countdown was restarted by the action and is re-armed with the hidden length. Never
+    /// opens an output (the next audio does, MD41).
+    fn set_shown(&mut self, shown: bool) {
+        self.shown = shown;
+        self.update(|s| s.power.shown = shown);
+        self.release_when_stopped();
+    }
+
+    /// `SetEfficiency`: as [`Self::set_shown`], for the setting.
+    fn set_efficiency(&mut self, on: bool) {
+        self.power_enabled = on;
+        self.update(|s| s.power.enabled = on);
+        self.release_when_stopped();
+    }
+
+    /// The pause lasted: give the device back (H28; any output while hidden, D3). The queued audio goes with it,
     /// so the provider is sought back to the position shown, and resuming reopens the device
     /// (the engine's on-demand open, MD41) and continues from there.
     fn pause_timed_out(&mut self) {
@@ -468,6 +564,7 @@ impl Control {
             }
             self.check_output();
             self.arm_pause_timer();
+            self.sync_power();
         }
     }
 
@@ -728,6 +825,8 @@ impl Control {
             }
             PlayerAction::SetLiked { uri, liked } => self.set_liked(uri, liked),
             PlayerAction::CheckLibrary => self.check_library(),
+            PlayerAction::SetShown(shown) => self.set_shown(shown),
+            PlayerAction::SetEfficiency(on) => self.set_efficiency(on),
         }
     }
 

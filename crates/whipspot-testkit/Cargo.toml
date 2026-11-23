@@ -11,7 +11,8 @@ whipspot-core = { path = "../whipspot-core" }
 [dev-dependencies]
 # Decodes the fixtures of audio_files in its self-test (the version the local adapter uses).
 symphonia = { version = "=0.6.1", default-features = false, features = ["flac", "pcm", "wav"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# test-util: the efficiency-mode tests in audio_output run on a paused clock.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 
 # The workspace table plus one exception (Q24): forbid cannot be relaxed per file, so this crate
 # denies unsafe_code and tests/no_alloc.rs alone allows it (a counting global allocator). Keep

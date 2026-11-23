@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::engine::{BAND_COUNT, OutputDevice, OutputMode, ReplayGainMode};
 use crate::lyrics::Lyrics;
+use crate::power::PowerStatus;
 use crate::provider::{
     AlbumDetail, AlbumPage, ArtistPage, LibraryError, LoginInput, PlaylistPage, ProviderAuthStatus,
     ProviderInfo, ReleaseGroup, Track, TrackPage,
@@ -114,6 +115,8 @@ pub struct PlayerState {
     /// the transport buttons go to that remote, `current` is its track and the queue is kept
     /// with nothing in it current. `None` when Whipspot plays its own queue.
     pub remote: Option<&'static str>,
+    /// Efficiency mode: the setting, whether a window is shown, and the power mode asked for.
+    pub power: PowerStatus,
 }
 
 /// The output the user chose and what the player knows about it.
@@ -282,6 +285,10 @@ pub enum PlayerAction {
     /// changed ([`crate::provider::Library::check_changes`]). Never blocks the loop and posts no
     /// notice itself.
     CheckLibrary,
+    /// Whether any window of the front-end is shown; the front-end sends it on change.
+    SetShown(bool),
+    /// Switch efficiency mode on or off (the setting).
+    SetEfficiency(bool),
 }
 
 /// Something that happened once, for the front-end to show or route. Error texts are this

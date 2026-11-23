@@ -1049,6 +1049,7 @@ mod tests {
             lyrics: LyricsState::Off,
             lyrics_enabled: false,
             remote: None,
+            power: Default::default(),
         }
     }
 
