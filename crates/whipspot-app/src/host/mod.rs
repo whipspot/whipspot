@@ -388,6 +388,9 @@ struct Win<'a> {
     /// Hidden by the front-end switch (the native window while a skin runs): never drawn, so its
     /// view does not drain the player's notices (V7).
     hidden: bool,
+    /// The OS says the window is covered or off screen (`WindowEvent::Occluded`; only macOS
+    /// sends it, so elsewhere this stays false).
+    occluded: bool,
     /// What the window's last frame asked of the loop.
     flow: ControlFlow,
     /// What the OS title shows, and when it rotates (MD52).
@@ -423,6 +426,36 @@ impl Win<'_> {
     fn minimized(&self) -> bool {
         self.window.is_minimized() == Some(true)
     }
+
+    /// What decides whether the window counts as shown (D6).
+    fn visibility(&self) -> WinVis {
+        WinVis {
+            front_hidden: self.hidden,
+            minimised: self.minimized(),
+            os_visible: self.window.is_visible(),
+            occluded: self.occluded,
+        }
+    }
+}
+
+/// What the host knows of one window when it decides whether the app is shown.
+#[derive(Clone, Copy, Debug)]
+struct WinVis {
+    /// Hidden by the front-end switch.
+    front_hidden: bool,
+    minimised: bool,
+    /// The OS's answer, `None` when it will not say.
+    os_visible: Option<bool>,
+    occluded: bool,
+}
+
+/// Whether any window of ours is shown: the tray menu while open, or a window that is not
+/// front-end-hidden, minimised, reported invisible by the OS or occluded. Focus does not matter.
+fn any_shown(wins: impl IntoIterator<Item = WinVis>, tray_open: bool) -> bool {
+    tray_open
+        || wins
+            .into_iter()
+            .any(|w| !w.front_hidden && !w.minimised && w.os_visible != Some(false) && !w.occluded)
 }
 
 /// A window that is not open: its spec and its view (kept, so reopening shows what it knew).
@@ -444,6 +477,9 @@ struct App<'p, 'a> {
     first_maximized: bool,
     first_position: Option<(i32, i32)>,
     error: Option<String>,
+    /// The last `SetShown` value sent to the player (starts true: nothing is sent at start-up
+    /// while visible).
+    shown_sent: bool,
     /// The first panel set is open and laid out (the smoke with a panel check counts frames from
     /// here).
     set_ready: bool,
@@ -516,6 +552,7 @@ pub fn run<'a>(
         first_maximized: first_spec.is_some_and(|(_, maximized)| maximized),
         first_position: None,
         error: None,
+        shown_sent: true,
         set_ready: false,
         smoke_count: 0,
         panel_checked: false,
@@ -720,6 +757,7 @@ impl<'p, 'a> App<'p, 'a> {
                 flow: ControlFlow::Wait,
                 title: TitleMarquee::new(platform::MARQUEE, title, Instant::now()),
                 hidden: false,
+                occluded: false,
                 slot,
                 window,
                 surface,
@@ -1458,6 +1496,20 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
         self.check_smoke_deadline(event_loop);
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The main thread follows the power mode like the runtime's workers do (I5).
+        crate::power::sync_current_thread();
+        if event_loop.exiting() {
+            return;
+        }
+        let tray_open = self.tray.as_ref().is_some_and(TrayControl::is_visible);
+        let shown = any_shown(self.wins.values().map(Win::visibility), tray_open);
+        if shown != self.shown_sent {
+            self.shown_sent = shown;
+            self.player.dispatch(PlayerAction::SetShown(shown));
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, mut event: WindowEvent) {
         // After `exit()` winit still delivers queued events; ignore them so no frame is acquired.
         if event_loop.exiting() {
@@ -1517,6 +1569,11 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
             // Any other Whipspot window (main, diagnostics): a library look, as the panels do.
             WindowEvent::Focused(true) => {
                 self.player.dispatch(PlayerAction::CheckLibrary);
+            }
+            WindowEvent::Occluded(occluded) => {
+                if let Some(win) = self.wins.get_mut(&id) {
+                    win.occluded = *occluded;
+                }
             }
             WindowEvent::ScaleFactorChanged {
                 scale_factor,
@@ -1598,6 +1655,73 @@ fn trace_button(button: winit::event::MouseButton) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vis() -> WinVis {
+        WinVis {
+            front_hidden: false,
+            minimised: false,
+            os_visible: Some(true),
+            occluded: false,
+        }
+    }
+
+    #[test]
+    fn all_minimised_is_hidden() {
+        let min = WinVis {
+            minimised: true,
+            ..vis()
+        };
+        assert!(!any_shown([min, min], false));
+    }
+
+    #[test]
+    fn a_shown_panel_counts_with_the_native_window_front_hidden() {
+        let native = WinVis {
+            front_hidden: true,
+            ..vis()
+        };
+        assert!(any_shown([native, vis()], false));
+    }
+
+    #[test]
+    fn only_occluded_windows_are_hidden() {
+        let occ = WinVis {
+            occluded: true,
+            ..vis()
+        };
+        assert!(!any_shown([occ, occ], false));
+        assert!(any_shown([occ, vis()], false));
+    }
+
+    #[test]
+    fn the_open_tray_menu_counts() {
+        let min = WinVis {
+            minimised: true,
+            ..vis()
+        };
+        assert!(any_shown([min], true));
+        assert!(!any_shown([min], false));
+    }
+
+    #[test]
+    fn no_windows_is_hidden() {
+        assert!(!any_shown([], false));
+        assert!(any_shown([], true));
+    }
+
+    #[test]
+    fn the_os_visible_answer() {
+        let off = WinVis {
+            os_visible: Some(false),
+            ..vis()
+        };
+        let unknown = WinVis {
+            os_visible: None,
+            ..vis()
+        };
+        assert!(!any_shown([off], false));
+        assert!(any_shown([unknown], false));
+    }
 
     #[test]
     fn the_earlier_flow_wins() {
