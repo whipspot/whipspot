@@ -13,6 +13,7 @@ use anyhow::{Context, anyhow};
 use whipspot_app::host::{self, HostOptions, WindowSpec};
 use whipspot_app::logging;
 use whipspot_app::paths::{AppPaths, os_music_dir};
+use whipspot_app::power::{self, OsPower};
 use whipspot_app::selftest;
 use whipspot_app::settings::{
     EqSettings, FRONT_END_NATIVE, FRONT_END_SKIN, OUTPUT_MODE_EXCLUSIVE, OUTPUT_MODE_SHARED,
@@ -195,8 +196,11 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
         None => (Settings::default(), None),
     };
 
+    // Each worker applies the efficiency mode's thread mark to itself when it unparks (I5); no
+    // audio work runs on these workers.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .on_thread_unpark(power::sync_current_thread)
         .build()
         .context("tokio runtime")?;
     let _enter = rt.enter();
@@ -289,7 +293,9 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
     // declare, cached under the cache root (MD80), and LRCLIB lyrics. With no directory root
     // there is no cache folder, so no art is fetched; lyrics need no folder.
     let hosts = registry.image_hosts();
-    let mut config = PlayerConfig::default().with_lyrics(Arc::new(Lrclib::new()), settings.lyrics);
+    let mut config = PlayerConfig::default()
+        .with_lyrics(Arc::new(Lrclib::new()), settings.lyrics)
+        .with_power(Arc::new(OsPower::new()), settings.efficiency_mode);
     if let Some(paths) = paths {
         // Art follows the scheme of the ref: `local-art:` to the Local provider, the rest to the
         // network adapter (D9).
@@ -403,6 +409,7 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
     settings.volume = handle.state().volume;
     settings.balance = handle.state().balance;
     settings.lyrics = handle.state().lyrics_enabled;
+    settings.efficiency_mode = handle.state().power.enabled;
     // The Connect step's state, when the Accounts page ever read it (D7); else what was loaded.
     if let Some(on) = step_logged_in(&handle.state().providers, SPOTIFY_ID, STEP_CONNECT) {
         settings.spotify_connect = on;

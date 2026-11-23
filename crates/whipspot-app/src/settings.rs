@@ -65,6 +65,8 @@ pub struct Settings {
     pub output_mode: String,
     /// Look lyrics up on LRCLIB for the current song (MD78); on by default.
     pub lyrics: bool,
+    /// Let the OS save power while every window is hidden and nothing plays (D7); on by default.
+    pub efficiency_mode: bool,
     /// The theme's key, `"a"`, `"b"` or `"c"`; any other value loads as `"c"` (MD89).
     pub theme: String,
     /// `"high"`, `"normal"` or `"low"` (MD88); any other value loads as `"high"`.
@@ -146,6 +148,7 @@ impl Default for Settings {
             output_device: None,
             output_mode: OUTPUT_MODE_SHARED.to_owned(),
             lyrics: true,
+            efficiency_mode: true,
             theme: ThemeId::default().key().to_owned(),
             stream_quality: StreamQuality::default().key().to_owned(),
             auto_hide: true,
@@ -460,6 +463,7 @@ mod tests {
             output_device: Some("Speakers".to_owned()),
             output_mode: OUTPUT_MODE_EXCLUSIVE.to_owned(),
             lyrics: false,
+            efficiency_mode: false,
             theme: "b".to_owned(),
             stream_quality: "low".to_owned(),
             auto_hide: false,
@@ -524,6 +528,28 @@ mod tests {
         assert!(loaded.lyrics);
         assert_eq!(loaded.volume, 30);
         assert_eq!(notice, None);
+    }
+
+    #[test]
+    fn efficiency_mode_default_on_and_a_file_without_the_field_loads_on() {
+        assert!(Settings::default().efficiency_mode);
+        let scratch = Scratch::new("efficiency-missing");
+        let paths = AppPaths::under(&scratch.0);
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.settings_file(),
+            br#"{"version":1,"volume":30,"output_mode":"shared"}"#,
+        )
+        .unwrap();
+        let (loaded, notice) = Settings::load(&paths);
+        assert!(loaded.efficiency_mode);
+        assert_eq!(loaded.volume, 30);
+        assert_eq!(notice, None);
+        let off = load_text(
+            "efficiency-off",
+            br#"{"version":1,"efficiency_mode":false}"#,
+        );
+        assert!(!off.efficiency_mode);
     }
 
     /// MD116: the `audio_output` key of the deleted rodio fallback is ignored on load and absent
@@ -1105,6 +1131,7 @@ mod tests {
             output_device: maybe(rng).then(|| random_text(rng)),
             output_mode: ["shared", "exclusive", "", "bogus"][rng.below(4)].to_owned(),
             lyrics: maybe(rng),
+            efficiency_mode: maybe(rng),
             theme: ["a", "b", "c", "z", ""][rng.below(5)].to_owned(),
             stream_quality: ["high", "normal", "low", "ultra"][rng.below(4)].to_owned(),
             auto_hide: maybe(rng),
