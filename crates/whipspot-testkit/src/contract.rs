@@ -21,6 +21,7 @@ use whipspot_core::{
     },
     folders::{FolderError, MusicFolders},
     lyrics::{Lyrics, LyricsError, LyricsQuery, LyricsSource, MAX_LYRIC_CHARS, MAX_LYRIC_LINES},
+    power::{PowerControl, PowerError, PowerMode},
     provider::{
         Album, AlbumKind, AuthFlow, AuthStepStatus, EntityRef, ImageRef, LibErrorKind, Library,
         LibraryError, LoginInput, MAX_ARTISTS, MAX_IMAGES, MAX_POPULAR, Provider, ProviderInfo,
@@ -2583,5 +2584,66 @@ pub fn run_music_folders_contract(folders: &dyn MusicFolders, dirs: [&Path; 2], 
         folders.status().tracks,
         0,
         "music folders contract: no folders, no tracks once idle"
+    );
+}
+
+/// Power control cases. `p` is any implementation: a fake, or the adapter on this machine, which
+/// then changes the test process's own power mode and must leave it at Normal.
+///
+/// | method | case |
+/// |---|---|
+/// | `name` | not empty, at most 48 characters, no control character |
+/// | `set` | Normal, Eco, EcoIdle, EcoIdle, Eco, Normal each give Ok, or each gives Unsupported: never a mix, and never Refused on Normal |
+/// | `set` | 4 threads × 50 mixed calls do not panic |
+/// | `set` | the suite ends at Normal, with the answer it gave before |
+pub fn run_power_control_contract(p: &dyn PowerControl) {
+    let name = p.name();
+    assert!(
+        !name.is_empty() && name.chars().count() <= 48 && !name.chars().any(char::is_control),
+        "power control contract: the name is short, printable and not empty ({name:?})"
+    );
+
+    let sequence = [
+        PowerMode::Normal,
+        PowerMode::Eco,
+        PowerMode::EcoIdle,
+        PowerMode::EcoIdle,
+        PowerMode::Eco,
+        PowerMode::Normal,
+    ];
+    let results: Vec<Result<(), PowerError>> = sequence.iter().map(|&m| p.set(m)).collect();
+    let first = results[0];
+    assert!(
+        matches!(first, Ok(()) | Err(PowerError::Unsupported)),
+        "power control contract: set(Normal) is Ok or Unsupported ({first:?})"
+    );
+    for (mode, result) in sequence.iter().zip(&results) {
+        assert_eq!(
+            *result, first,
+            "power control contract: set({mode:?}) answers as set(Normal) does"
+        );
+    }
+
+    let all_joined = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..4usize)
+            .map(|t| {
+                s.spawn(move || {
+                    for i in 0..50usize {
+                        let _ = p.set(sequence[(t + i) % sequence.len()]);
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().all(|h| h.join().is_ok())
+    });
+    assert!(
+        all_joined,
+        "power control contract: concurrent set calls do not panic"
+    );
+
+    assert_eq!(
+        p.set(PowerMode::Normal),
+        first,
+        "power control contract: the suite ends at Normal, with the answer it gave before"
     );
 }

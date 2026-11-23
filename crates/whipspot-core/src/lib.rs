@@ -8,6 +8,7 @@ pub mod events;
 pub mod folders;
 pub mod lyrics;
 pub mod player;
+pub mod power;
 pub mod provider;
 pub mod secret;
 pub mod skin;
