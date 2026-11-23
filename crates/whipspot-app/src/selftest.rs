@@ -161,6 +161,7 @@ fn state_for(info: &OutputInfo, modes: &[OutputMode]) -> PlayerState {
         lyrics: LyricsState::Off,
         lyrics_enabled: false,
         remote: None,
+        power: Default::default(),
     }
 }
 

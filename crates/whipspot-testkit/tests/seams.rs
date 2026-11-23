@@ -23,6 +23,7 @@ const SEAMS: &[(&str, Cover)] = &[
     ("AudioOutput", Cover::Suite("run_audio_output_contract")),
     ("LyricsSource", Cover::Suite("run_lyrics_source_contract")),
     ("MusicFolders", Cover::Suite("run_music_folders_contract")),
+    ("PowerControl", Cover::Suite("run_power_control_contract")),
     ("Provider", Cover::Suite("run_provider_contract")),
     ("AuthFlow", Cover::CoveredBy("run_provider_contract")),
     (

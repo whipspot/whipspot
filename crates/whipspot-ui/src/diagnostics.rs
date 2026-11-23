@@ -19,6 +19,7 @@ use whipspot_core::diagnostics::{
     AudioDiagnostics, Dither, Resampler, Stage, Verdict as PathVerdict,
 };
 use whipspot_core::player::{OutputStatus, PlayerHandle, PlayerState};
+use whipspot_core::power::{PowerMode, PowerStatus};
 
 use crate::layout::{CONTENT_PAD, HEADING_TOP, MARGIN};
 use crate::output::{self, OutputModel};
@@ -95,8 +96,29 @@ fn count(value: Option<u64>) -> String {
     or_unknown(value, |n| n.to_string())
 }
 
-/// The five sections of `diag`, in the window's order.
-fn sections(diag: &AudioDiagnostics) -> [Section; 5] {
+/// The efficiency mode's value: the adapter's name and what the player did about power (D8).
+/// The texts are fixed except the name, which the adapter gives as a fixed string.
+pub(crate) fn power_text(power: &PowerStatus) -> String {
+    let Some(name) = power.name else {
+        return "Not managed".to_owned();
+    };
+    if !power.enabled {
+        return format!("{name}, off in Settings");
+    }
+    if power.error.is_some() {
+        return format!("{name}, the system refused");
+    }
+    match (power.mode, power.shown) {
+        (PowerMode::Eco, _) => format!("{name}, saving power (hidden, music at full speed)"),
+        (PowerMode::EcoIdle, _) => format!("{name}, saving power (hidden, nothing playing)"),
+        (PowerMode::Normal, false) => format!("{name}, normal"),
+        (PowerMode::Normal, true) => format!("{name}, normal (window shown)"),
+    }
+}
+
+/// The six sections of `diag` and `power`, in the window's order. Power comes first, so its
+/// row sits in the window's first screenful.
+fn sections(diag: &AudioDiagnostics, power: &PowerStatus) -> [Section; 6] {
     let (s, dc, dsp, o, l) = (
         &diag.source,
         &diag.decode,
@@ -105,6 +127,10 @@ fn sections(diag: &AudioDiagnostics) -> [Section; 5] {
         &diag.live,
     );
     [
+        Section {
+            title: "Power",
+            rows: vec![("Efficiency mode", power_text(power))],
+        },
         Section {
             title: "Source",
             rows: vec![
@@ -233,10 +259,15 @@ fn verdict_text(verdict: Option<&PathVerdict>) -> String {
 /// The diagnostics as plain text, for the clipboard: the output, the verdict with its reasons,
 /// the lossy flag, then each section's rows as `key: value` lines (the window's keys and order).
 pub fn text(diag: &AudioDiagnostics, state: &PlayerState) -> String {
-    render_text(diag, &state.output_summary, &state.output)
+    render_text(diag, &state.output_summary, &state.output, &state.power)
 }
 
-fn render_text(diag: &AudioDiagnostics, summary: &str, out: &OutputStatus) -> String {
+fn render_text(
+    diag: &AudioDiagnostics,
+    summary: &str,
+    out: &OutputStatus,
+    power: &PowerStatus,
+) -> String {
     let mut s = String::from("Audio diagnostics\n");
     s.push_str(&format!(
         "Chosen output: {}, {}\n",
@@ -256,7 +287,7 @@ fn render_text(diag: &AudioDiagnostics, summary: &str, out: &OutputStatus) -> St
         s.push_str(&format!("  - {reason}\n"));
     }
     s.push_str(&format!("Lossy source: {}\n", yes_no(diag.lossy_source)));
-    for section in sections(diag) {
+    for section in sections(diag, power) {
         s.push_str(&format!("\n{}\n", section.title));
         for (key, value) in &section.rows {
             s.push_str(&format!("{key}: {value}\n"));
@@ -354,7 +385,7 @@ impl DiagnosticsUi {
         let output = &mut self.output;
         let copy = ui
             .scroll_area("column", card, &ScrollOptions::default(), |ui, _| {
-                let (copy, bottom) = column_body(ui, column, output, &diag, player);
+                let (copy, bottom) = column_body(ui, column, output, &diag, &state.power, player);
                 (
                     copy,
                     Extent::new(f64::from(card.w), f64::from(bottom + BOTTOM_PAD - card.y)),
@@ -395,6 +426,7 @@ fn column_body(
     column: Rect,
     model: &mut OutputModel,
     diag: &AudioDiagnostics,
+    power: &PowerStatus,
     player: &PlayerHandle,
 ) -> (bool, f32) {
     let mut y = column.y;
@@ -439,7 +471,7 @@ fn column_body(
     }
 
     // The sections.
-    for section in sections(diag) {
+    for section in sections(diag, power) {
         y += SECTION_GAP;
         y += heading(ui, section.title, column.x, y) + HEADING_GAP;
         let pairs: Vec<(&str, &str)> = section.rows.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -485,7 +517,12 @@ mod tests {
         });
         diag.lossy_source = Some(true);
         let out = OutputStatus::default();
-        let text = render_text(&diag, "Shared mode, Speakers, 48 kHz, 32-bit float", &out);
+        let text = render_text(
+            &diag,
+            "Shared mode, Speakers, 48 kHz, 32-bit float",
+            &out,
+            &PowerStatus::default(),
+        );
         for header in [
             "\nSource\n",
             "\nDecode\n",
@@ -507,7 +544,12 @@ mod tests {
 
     #[test]
     fn an_empty_snapshot_reads_unknown_everywhere() {
-        let text = render_text(&AudioDiagnostics::default(), "", &OutputStatus::default());
+        let text = render_text(
+            &AudioDiagnostics::default(),
+            "",
+            &OutputStatus::default(),
+            &PowerStatus::default(),
+        );
         assert!(text.contains("Verdict: path unknown\n"));
         assert!(text.contains("Lossy source: unknown\n"));
         assert!(text.contains("Output summary: Output not open\n"));
@@ -521,7 +563,7 @@ mod tests {
         diag.live.callback_cpu_avg_us = Some(40);
         diag.live.callback_cpu_max_us = Some(310);
         diag.live.clock_drift_ppm = Some(-12.34);
-        let text = render_text(&diag, "", &OutputStatus::default());
+        let text = render_text(&diag, "", &OutputStatus::default(), &PowerStatus::default());
         let live = text.split("\nLive\n").nth(1).expect("a Live section");
         let lines: Vec<&str> = live.lines().collect();
         assert_eq!(
@@ -536,8 +578,69 @@ mod tests {
         // Not known yet (under 2 s of rendering): unknown, not zero.
         diag.live.callback_cpu_max_us = None;
         diag.live.clock_drift_ppm = None;
-        let text = render_text(&diag, "", &OutputStatus::default());
+        let text = render_text(&diag, "", &OutputStatus::default(), &PowerStatus::default());
         assert!(text.contains("Callback CPU max: unknown\n"));
         assert!(text.contains("Clock drift: unknown\n"));
+    }
+
+    fn power(
+        name: Option<&'static str>,
+        enabled: bool,
+        shown: bool,
+        mode: PowerMode,
+    ) -> PowerStatus {
+        PowerStatus {
+            name,
+            enabled,
+            shown,
+            mode,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn the_power_row_reads_each_case() {
+        use whipspot_core::power::PowerError;
+        assert_eq!(power_text(&PowerStatus::default()), "Not managed");
+        assert_eq!(
+            power_text(&power(Some("Demo power"), false, true, PowerMode::Normal)),
+            "Demo power, off in Settings"
+        );
+        let refused = PowerStatus {
+            error: Some(PowerError::Refused),
+            ..power(Some("Demo power"), true, false, PowerMode::Normal)
+        };
+        assert_eq!(power_text(&refused), "Demo power, the system refused");
+        assert_eq!(
+            power_text(&power(Some("Demo power"), true, false, PowerMode::Eco)),
+            "Demo power, saving power (hidden, music at full speed)"
+        );
+        assert_eq!(
+            power_text(&power(Some("Demo power"), true, false, PowerMode::EcoIdle)),
+            "Demo power, saving power (hidden, nothing playing)"
+        );
+        assert_eq!(
+            power_text(&power(Some("Demo power"), true, false, PowerMode::Normal)),
+            "Demo power, normal"
+        );
+        assert_eq!(
+            power_text(&power(Some("Demo power"), true, true, PowerMode::Normal)),
+            "Demo power, normal (window shown)"
+        );
+    }
+
+    #[test]
+    fn the_text_has_a_power_section_with_the_row() {
+        let shown = power(Some("Demo power"), true, true, PowerMode::Normal);
+        let text = render_text(
+            &AudioDiagnostics::default(),
+            "",
+            &OutputStatus::default(),
+            &shown,
+        );
+        assert!(
+            text.contains("\nPower\nEfficiency mode: Demo power, normal (window shown)\n"),
+            "{text}"
+        );
     }
 }

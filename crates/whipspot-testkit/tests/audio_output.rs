@@ -1,11 +1,12 @@
 //! The engine's open-request protocol on a fake output (MD38, MD39, I12–I17): rate follow,
 //! declined requests, release and reopen on demand, reopen keeping blocked writers alive,
 //! no request without data, the player giving an exclusive device back after a long pause
-//! (H28), and the actions that reach the heard track during a held gapless switch (H25). No
-//! device is opened; every signal is built here.
+//! (H28), the actions that reach the heard track during a held gapless switch (H25), and
+//! efficiency mode's power modes and output release while hidden (D3, I1 to I4). No device is
+//! opened; every signal is built here.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -13,12 +14,13 @@ use whipspot_core::engine::{
     DeviceFormat, Engine, EngineConfig, OutputError, OutputMode, OutputRequest, SampleFormat,
     SourceError, SourceInfo, SourceWriter, StreamFormat,
 };
-use whipspot_core::events::UiEvent;
+use whipspot_core::events::{RemotePlay, UiEvent};
 use whipspot_core::player::{
     self, EngineSetup, PlayState, Player, PlayerAction, PlayerConfig, PlayerHandle, PlayerState,
 };
+use whipspot_core::power::{PowerControl, PowerError, PowerMode};
 use whipspot_core::provider::{ProviderRegistry, Track};
-use whipspot_testkit::{FakeOutput, FakeProvider};
+use whipspot_testkit::{FakeOutput, FakePower, FakeProvider};
 
 const RATE: u32 = 44_100;
 const HIGH: u32 = 96_000;
@@ -343,9 +345,42 @@ async fn pause_rig(mode: OutputMode) -> PlayerRig {
 
 /// [`pause_rig`] with the queue `uris`, the first playing.
 async fn pause_rig_with(mode: OutputMode, uris: &[&str]) -> PlayerRig {
+    let rig = start_rig(
+        pause_output(),
+        mode,
+        uris,
+        PlayerConfig::default().with_exclusive_pause_release(PAUSE_RELEASE),
+    );
+    wait_state(&rig.h, "playing", |s| s.play_state == PlayState::Playing).await;
+    rig.write(true).await;
+    rig
+}
+
+/// The exclusive-capable I16 fake the player rigs use.
+fn pause_output() -> FakeOutput {
     let fake = FakeOutput::new(device(), OutputMode::Shared);
     fake.report_request_mode(true);
     fake.set_modes(vec![OutputMode::Shared, OutputMode::Exclusive]);
+    fake
+}
+
+fn track_of(uri: &str) -> Track {
+    Track {
+        uri: uri.into(),
+        name: "one".into(),
+        artist: "artist".into(),
+        album: "album".into(),
+        duration_ms: 180_000,
+        images: vec![],
+        year: None,
+        album_ref: None,
+        artists: vec![],
+    }
+}
+
+/// A player on `fake` with `mode` chosen and `config`, asked to play the queue `uris` from the
+/// first (the play is not awaited).
+fn start_rig(fake: FakeOutput, mode: OutputMode, uris: &[&str], config: PlayerConfig) -> PlayerRig {
     let setup = EngineSetup::Output {
         output: Box::new(fake.clone()),
         request: OutputRequest {
@@ -357,12 +392,7 @@ async fn pause_rig_with(mode: OutputMode, uris: &[&str]) -> PlayerRig {
     let provider = Arc::new(FakeProvider::new("fakea", true).with_context(ctx.clone()));
     let mut registry = ProviderRegistry::new();
     registry.register(provider.clone()).unwrap();
-    let h = Player::start(
-        registry,
-        wiring,
-        PlayerConfig::default().with_exclusive_pause_release(PAUSE_RELEASE),
-        &tokio::runtime::Handle::current(),
-    );
+    let h = Player::start(registry, wiring, config, &tokio::runtime::Handle::current());
     let rig = PlayerRig {
         h,
         source: ctx.source,
@@ -370,24 +400,9 @@ async fn pause_rig_with(mode: OutputMode, uris: &[&str]) -> PlayerRig {
         fake,
     };
     rig.h.dispatch(PlayerAction::PlayItem {
-        context: uris
-            .iter()
-            .map(|&uri| Track {
-                uri: uri.into(),
-                name: "one".into(),
-                artist: "artist".into(),
-                album: "album".into(),
-                duration_ms: 180_000,
-                images: vec![],
-                year: None,
-                album_ref: None,
-                artists: vec![],
-            })
-            .collect(),
+        context: uris.iter().map(|&uri| track_of(uri)).collect(),
         index: 0,
     });
-    wait_state(&rig.h, "playing", |s| s.play_state == PlayState::Playing).await;
-    rig.write(true).await;
     rig
 }
 
@@ -625,4 +640,432 @@ async fn a_seek_during_a_held_switch_reloads_the_heard_track_at_the_target() {
         current(s) == Some(ONE) && s.play_state == PlayState::Paused && s.position_now() == 30_000
     })
     .await;
+}
+
+// ------------------------------------------- efficiency mode: power and release while hidden
+
+// These run on a paused clock (current-thread runtime): `advance` is the only thing that moves
+// tokio's time, and every wait yields to the player's tasks instead of sleeping, so no timer
+// fires behind the test's back. The real-time `DEADLINE` only bounds a wait that never ends.
+
+const MIN: Duration = Duration::from_secs(60);
+
+/// Waits, yielding to the player's tasks, until `f` holds.
+async fn settle_until(h: &PlayerHandle, what: &str, f: impl Fn(&PlayerState) -> bool) {
+    let start = Instant::now();
+    while !f(&h.state()) {
+        assert!(
+            start.elapsed() < DEADLINE,
+            "timed out waiting for {what}: {:?}",
+            h.state()
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Lets the player's tasks run what is ready now; the paused clock does not move.
+async fn settle() {
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Waits, yielding, until the provider was called `want`.
+async fn settle_call(r: &PlayerRig, what: &str, want: impl Fn(&[String]) -> bool) {
+    let start = Instant::now();
+    while !want(&r.provider.calls()) {
+        assert!(
+            start.elapsed() < DEADLINE,
+            "no {what}: {:?}",
+            r.provider.calls()
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Moves the paused clock by `d` and lets the player act on it.
+async fn advance(d: Duration) {
+    tokio::time::advance(d).await;
+    settle().await;
+}
+
+/// A player with `power` wired (`enabled` the setting) and the default release timers (10 min
+/// exclusive, 60 s hidden), playing one track whose first audio is written.
+async fn power_rig(
+    fake: FakeOutput,
+    mode: OutputMode,
+    power: Arc<dyn PowerControl>,
+    enabled: bool,
+) -> PlayerRig {
+    let r = start_rig(
+        fake,
+        mode,
+        &[ONE],
+        PlayerConfig::default().with_power(power, enabled),
+    );
+    settle_until(&r.h, "playing", |s| s.play_state == PlayState::Playing).await;
+    r.write(true).await;
+    assert!(r.fake.is_open());
+    r
+}
+
+async fn hide(r: &PlayerRig) {
+    r.h.dispatch(PlayerAction::SetShown(false));
+    settle_until(&r.h, "hidden", |s| !s.power.shown).await;
+}
+
+async fn show(r: &PlayerRig) {
+    r.h.dispatch(PlayerAction::SetShown(true));
+    settle_until(&r.h, "shown", |s| s.power.shown).await;
+}
+
+async fn pause_now(r: &PlayerRig) {
+    r.h.dispatch(PlayerAction::Pause);
+    settle_until(&r.h, "paused", |s| s.play_state == PlayState::Paused).await;
+}
+
+async fn mode_is(r: &PlayerRig, mode: PowerMode) {
+    settle_until(&r.h, "the power mode", |s| s.power.mode == mode).await;
+}
+
+/// Playing shared, hidden (Eco), then stopped: released, EcoIdle.
+async fn hidden_and_stopped(r: &PlayerRig) {
+    hide(r).await;
+    mode_is(r, PowerMode::Eco).await;
+    r.h.dispatch(PlayerAction::Stop);
+    settle_until(&r.h, "released", |s| {
+        s.play_state == PlayState::Stopped && s.output.idle
+    })
+    .await;
+    mode_is(r, PowerMode::EcoIdle).await;
+}
+
+/// Records each `set` with whether the fake output was open and how many opens it had seen at
+/// that moment: it proves the mode changed before an open.
+struct OrderedPower {
+    fake: FakeOutput,
+    log: Mutex<Vec<(PowerMode, bool, usize)>>,
+}
+
+impl OrderedPower {
+    fn log(&self) -> Vec<(PowerMode, bool, usize)> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+impl PowerControl for OrderedPower {
+    fn name(&self) -> &'static str {
+        "ordered"
+    }
+    fn set(&self, mode: PowerMode) -> Result<(), PowerError> {
+        let open = self.fake.is_open();
+        let opens = self.fake.requests().len();
+        self.log.lock().unwrap().push((mode, open, opens));
+        Ok(())
+    }
+}
+
+// (a)
+#[tokio::test(start_paused = true)]
+async fn hidden_stop_releases_a_shared_output_at_once() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), true).await;
+    assert_eq!(r.h.state().power.name, Some("fake"));
+    hide(&r).await;
+    mode_is(&r, PowerMode::Eco).await;
+    assert_eq!(power.calls(), [PowerMode::Eco]);
+    r.h.dispatch(PlayerAction::Stop);
+    settle_until(&r.h, "released", |s| s.output.idle).await;
+    assert!(!r.fake.is_open());
+    mode_is(&r, PowerMode::EcoIdle).await;
+    assert_eq!(power.calls(), [PowerMode::Eco, PowerMode::EcoIdle]);
+    let s = r.h.state();
+    assert_eq!(s.output_summary, "Shared mode, default device, idle");
+    assert_eq!(s.power.error, None);
+}
+
+// (b)
+#[tokio::test(start_paused = true)]
+async fn hidden_pause_releases_a_shared_output_after_60_s_and_seeks_back() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), true).await;
+    pause_now(&r).await;
+    let shown = r.h.state().position_now();
+    hide(&r).await;
+    mode_is(&r, PowerMode::Eco).await;
+    advance(MIN - Duration::from_secs(1)).await;
+    assert!(r.fake.is_open(), "released before 60 s");
+    assert!(!r.h.state().output.idle);
+    advance(Duration::from_secs(1)).await;
+    settle_until(&r.h, "released", |s| s.output.idle).await;
+    assert!(!r.fake.is_open());
+    let seek = format!("seek {shown}");
+    settle_call(&r, "the seek back", |c| c.contains(&seek)).await;
+    mode_is(&r, PowerMode::EcoIdle).await;
+    assert_eq!(power.calls(), [PowerMode::Eco, PowerMode::EcoIdle]);
+    assert_eq!(r.h.state().play_state, PlayState::Paused);
+}
+
+// (c) I1: the whole-process saving is left before any open.
+#[tokio::test(start_paused = true)]
+async fn play_from_eco_idle_leaves_it_before_the_output_opens() {
+    let fake = pause_output();
+    let power = Arc::new(OrderedPower {
+        fake: fake.clone(),
+        log: Mutex::new(Vec::new()),
+    });
+    let r = power_rig(fake, OutputMode::Shared, power.clone(), true).await;
+    hidden_and_stopped(&r).await;
+    let opens = r.fake.requests().len();
+    assert_eq!(
+        power.log(),
+        [
+            (PowerMode::Eco, true, opens),
+            (PowerMode::EcoIdle, false, opens)
+        ]
+    );
+    r.h.dispatch(PlayerAction::Play);
+    settle_until(&r.h, "playing", |s| s.play_state == PlayState::Playing).await;
+    r.write(false).await;
+    assert!(r.fake.is_open());
+    assert_eq!(r.fake.requests().len(), opens + 1);
+    let log = power.log();
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert_eq!(
+        log[2],
+        (PowerMode::Eco, false, opens),
+        "Eco before the open"
+    );
+    assert!(!r.h.state().output.idle);
+}
+
+// (c) I1, the guard in reopen itself: an output switch from EcoIdle opens in the same turn.
+#[tokio::test(start_paused = true)]
+async fn an_output_switch_from_eco_idle_leaves_it_before_the_open() {
+    let fake = pause_output();
+    let power = Arc::new(OrderedPower {
+        fake: fake.clone(),
+        log: Mutex::new(Vec::new()),
+    });
+    let r = power_rig(fake, OutputMode::Shared, power.clone(), true).await;
+    hidden_and_stopped(&r).await;
+    let opens = r.fake.requests().len();
+    r.h.dispatch(PlayerAction::SetOutput {
+        device: None,
+        mode: OutputMode::Shared,
+    });
+    settle_until(&r.h, "reopened", |s| !s.output.idle).await;
+    assert!(r.fake.is_open());
+    let log = power.log();
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert_eq!(
+        log[2],
+        (PowerMode::Eco, false, opens),
+        "Eco before the open"
+    );
+}
+
+// (d)
+#[tokio::test(start_paused = true)]
+async fn showing_from_eco_idle_is_normal_and_keeps_the_output_released() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), true).await;
+    hidden_and_stopped(&r).await;
+    let opens = r.fake.requests().len();
+    show(&r).await;
+    mode_is(&r, PowerMode::Normal).await;
+    settle().await;
+    assert_eq!(
+        power.calls(),
+        [PowerMode::Eco, PowerMode::EcoIdle, PowerMode::Normal]
+    );
+    assert!(!r.fake.is_open());
+    assert!(r.h.state().output.idle);
+    assert_eq!(r.fake.requests().len(), opens);
+}
+
+// (e) I4
+#[tokio::test(start_paused = true)]
+async fn disabled_changes_nothing() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), false).await;
+    hide(&r).await;
+    pause_now(&r).await;
+    advance(MIN * 3).await;
+    assert!(r.fake.is_open());
+    r.h.dispatch(PlayerAction::Stop);
+    settle_until(&r.h, "stopped", |s| s.play_state == PlayState::Stopped).await;
+    settle().await;
+    let s = r.h.state();
+    assert!(r.fake.is_open());
+    assert!(!s.output.idle);
+    assert!(!s.power.enabled);
+    assert_eq!(s.power.mode, PowerMode::Normal);
+    assert!(power.calls().is_empty(), "{:?}", power.calls());
+}
+
+// (f) I4
+#[tokio::test(start_paused = true)]
+async fn switching_off_from_eco_is_normal() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), true).await;
+    hide(&r).await;
+    mode_is(&r, PowerMode::Eco).await;
+    r.h.dispatch(PlayerAction::SetEfficiency(false));
+    mode_is(&r, PowerMode::Normal).await;
+    settle().await;
+    assert_eq!(power.calls(), [PowerMode::Eco, PowerMode::Normal]);
+    assert!(!r.h.state().power.enabled);
+    assert!(r.fake.is_open());
+}
+
+// (g)
+#[tokio::test(start_paused = true)]
+async fn exclusive_pause_releases_at_10_min_shown_and_60_s_hidden() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Exclusive, power.clone(), true).await;
+    // Shown: the 10-minute release (H28).
+    pause_now(&r).await;
+    advance(MIN * 10 - Duration::from_secs(1)).await;
+    assert!(r.fake.is_open(), "released before 10 min");
+    advance(Duration::from_secs(1)).await;
+    settle_until(&r.h, "released", |s| s.output.idle).await;
+    assert!(!r.fake.is_open());
+    assert!(power.calls().is_empty(), "shown: {:?}", power.calls());
+    // Resume, hide, pause: 60 s.
+    r.h.dispatch(PlayerAction::Play);
+    settle_until(&r.h, "playing", |s| s.play_state == PlayState::Playing).await;
+    r.write(false).await;
+    assert!(r.fake.is_open());
+    hide(&r).await;
+    pause_now(&r).await;
+    advance(MIN - Duration::from_secs(1)).await;
+    assert!(r.fake.is_open(), "released before 60 s");
+    advance(Duration::from_secs(1)).await;
+    settle_until(&r.h, "released", |s| s.output.idle).await;
+    assert!(!r.fake.is_open());
+    mode_is(&r, PowerMode::EcoIdle).await;
+    assert_eq!(power.calls(), [PowerMode::Eco, PowerMode::EcoIdle]);
+}
+
+// (h) I2
+#[tokio::test(start_paused = true)]
+async fn loading_while_hidden_is_eco() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), true).await;
+    hidden_and_stopped(&r).await;
+    r.provider.set_load_delay(Some(Duration::from_millis(300)));
+    r.h.dispatch(PlayerAction::PlayItem {
+        context: vec![track_of(TWO)],
+        index: 0,
+    });
+    settle_until(&r.h, "loading", |s| s.play_state == PlayState::Loading).await;
+    assert_eq!(r.h.state().power.mode, PowerMode::Eco);
+    assert!(!r.fake.is_open());
+    assert_eq!(
+        power.calls(),
+        [PowerMode::Eco, PowerMode::EcoIdle, PowerMode::Eco]
+    );
+}
+
+// (i)
+#[tokio::test(start_paused = true)]
+async fn a_remote_paused_while_hidden_is_never_released() {
+    const R: &str = "faker";
+    let fake = pause_output();
+    let setup = EngineSetup::Output {
+        output: Box::new(fake.clone()),
+        request: OutputRequest::default(),
+    };
+    let (ctx, wiring) = player::wiring(setup, 64);
+    let remote = Arc::new(
+        FakeProvider::new(R, true)
+            .with_context(ctx.clone())
+            .with_remote("faker.remote"),
+    );
+    let mut registry = ProviderRegistry::new();
+    registry.register(remote.clone()).unwrap();
+    let power = Arc::new(FakePower::new("fake"));
+    let h = Player::start(
+        registry,
+        wiring,
+        PlayerConfig::default().with_power(power.clone(), true),
+        &tokio::runtime::Handle::current(),
+    );
+    remote.emit(UiEvent::RemoteStarted { provider: R.into() });
+    settle_until(&h, "remote mode", |s| s.remote == Some(R)).await;
+    remote.emit(UiEvent::RemoteTrack {
+        provider: R.into(),
+        track: track_of("faker:track:1"),
+    });
+    remote.emit(UiEvent::RemoteState {
+        provider: R.into(),
+        uri: "faker:track:1".into(),
+        state: RemotePlay::Paused,
+        position_ms: 1_000,
+    });
+    settle_until(&h, "the remote paused", |s| {
+        s.play_state == PlayState::Paused
+    })
+    .await;
+    assert!(fake.is_open());
+    h.dispatch(PlayerAction::SetShown(false));
+    settle_until(&h, "hidden", |s| !s.power.shown).await;
+    advance(MIN * 3).await;
+    let s = h.state();
+    assert!(fake.is_open());
+    assert!(!s.output.idle);
+    assert_eq!(s.power.mode, PowerMode::Eco);
+    assert_eq!(power.calls(), [PowerMode::Eco]);
+}
+
+// (j) I3
+#[tokio::test(start_paused = true)]
+async fn a_refused_set_shows_and_is_retried_only_on_a_change() {
+    let power = Arc::new(FakePower::new("fake"));
+    power.fail_with(Some(PowerError::Refused));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), true).await;
+    hide(&r).await;
+    settle_until(&r.h, "the refusal", |s| {
+        s.power.error == Some(PowerError::Refused)
+    })
+    .await;
+    assert_eq!(r.h.state().power.mode, PowerMode::Eco);
+    // Turns that do not change the wanted mode do not retry.
+    r.h.dispatch(PlayerAction::SetVolume(50));
+    settle_until(&r.h, "the volume", |s| s.volume == 50).await;
+    advance(Duration::from_secs(5)).await;
+    assert_eq!(power.calls(), [PowerMode::Eco]);
+    // A change asks again: still refused.
+    r.h.dispatch(PlayerAction::Stop);
+    mode_is(&r, PowerMode::EcoIdle).await;
+    assert_eq!(power.calls(), [PowerMode::Eco, PowerMode::EcoIdle]);
+    assert_eq!(r.h.state().power.error, Some(PowerError::Refused));
+    // A success clears the error.
+    power.fail_with(None);
+    show(&r).await;
+    mode_is(&r, PowerMode::Normal).await;
+    settle_until(&r.h, "the error cleared", |s| s.power.error.is_none()).await;
+    assert_eq!(
+        power.calls(),
+        [PowerMode::Eco, PowerMode::EcoIdle, PowerMode::Normal]
+    );
+}
+
+// (k)
+#[tokio::test(start_paused = true)]
+async fn flipping_shown_every_30_s_never_releases() {
+    let power = Arc::new(FakePower::new("fake"));
+    let r = power_rig(pause_output(), OutputMode::Shared, power.clone(), true).await;
+    pause_now(&r).await;
+    for i in 0..6 {
+        if i % 2 == 0 {
+            hide(&r).await;
+        } else {
+            show(&r).await;
+        }
+        advance(Duration::from_secs(30)).await;
+        assert!(r.fake.is_open(), "released at flip {i}");
+        assert!(!r.h.state().output.idle);
+    }
 }

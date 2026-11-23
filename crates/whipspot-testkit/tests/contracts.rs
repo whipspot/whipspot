@@ -23,14 +23,15 @@ use whipspot_core::skin::{
     MAX_SKIN_BYTES, PanelWindows, ScreenPoint, ScreenRect, Skin, SkinEngine, SkinError, SkinSource,
 };
 use whipspot_testkit::{
-    ClockedOutput, DemoProvider, FakeArt, FakeFolders, FakeLyrics, FakeOutput, FakeProvider,
-    FakeSkinEngine, FakeSkinSource, FakeWindows, LyricsOutcome, MemoryStore, demo_images,
-    demo_lyrics, run_art_error_contract, run_art_source_contract, run_audio_output_contract,
-    run_credential_store_contract, run_fake_windows_contract, run_lyrics_outcome_contract,
-    run_lyrics_source_contract, run_music_folders_contract, run_panel_windows_contract,
-    run_provider_contract, run_provider_playback_contract, run_provider_session_contract,
-    run_remote_contract, run_skin_caps_contract, run_skin_engine_contract,
-    run_skin_source_contract, run_skin_source_size_contract,
+    ClockedOutput, DemoProvider, FakeArt, FakeFolders, FakeLyrics, FakeOutput, FakePower,
+    FakeProvider, FakeSkinEngine, FakeSkinSource, FakeWindows, LyricsOutcome, MemoryStore,
+    demo_images, demo_lyrics, run_art_error_contract, run_art_source_contract,
+    run_audio_output_contract, run_credential_store_contract, run_fake_windows_contract,
+    run_lyrics_outcome_contract, run_lyrics_source_contract, run_music_folders_contract,
+    run_panel_windows_contract, run_power_control_contract, run_provider_contract,
+    run_provider_playback_contract, run_provider_session_contract, run_remote_contract,
+    run_skin_caps_contract, run_skin_engine_contract, run_skin_source_contract,
+    run_skin_source_size_contract,
 };
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -961,6 +962,46 @@ fn music_folders_contract_notices_a_list_that_forgets_the_order_or_accepts_a_fil
     }));
     let text = panic_text(r);
     assert!(text.contains("music folders contract"), "{text}");
+}
+
+#[test]
+fn power_control_contract_on_fake_power() {
+    run_power_control_contract(&FakePower::new("fake power control"));
+}
+
+#[test]
+fn power_control_contract_notices_an_empty_name_or_a_refused_normal() {
+    use whipspot_core::power::{PowerControl, PowerError, PowerMode};
+
+    /// Names itself with nothing.
+    struct Nameless;
+    impl PowerControl for Nameless {
+        fn name(&self) -> &'static str {
+            ""
+        }
+        fn set(&self, _mode: PowerMode) -> Result<(), PowerError> {
+            Ok(())
+        }
+    }
+
+    /// Refuses everything, Normal included.
+    struct Refusing;
+    impl PowerControl for Refusing {
+        fn name(&self) -> &'static str {
+            "refusing power control"
+        }
+        fn set(&self, _mode: PowerMode) -> Result<(), PowerError> {
+            Err(PowerError::Refused)
+        }
+    }
+
+    let r = std::panic::catch_unwind(|| run_power_control_contract(&Nameless));
+    let text = panic_text(r);
+    assert!(text.contains("power control contract"), "{text}");
+
+    let r = std::panic::catch_unwind(|| run_power_control_contract(&Refusing));
+    let text = panic_text(r);
+    assert!(text.contains("power control contract"), "{text}");
 }
 
 /// A logged-in demo provider that declares no auth steps: always ready, like a local-file one.

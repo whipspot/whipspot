@@ -34,14 +34,17 @@ anyhow = "1"
 gethostname = "1"
 getrandom = "0.3"
 
-# One FFI call (platform_windows.rs, D5); the package is already in the lock through wasapi.
+# FFI calls with no safe binding (platform_windows.rs, D5; power_windows.rs, efficiency mode
+# R1-D3); the package is already in the lock through wasapi.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader", "Win32_System_Threading"] }
 
 # The OS's own mouse-button state for the skin panels (platform_macos.rs); safe calls only. The
 # package is already in the lock through luneui and rfd (0.3.2).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent"] }
+# A thread's own QoS class for efficiency mode (power_macos.rs, R1-D3, R1-D4); already in the lock.
+libc = "0.2"
 
 [dev-dependencies]
 whipspot-testkit = { path = "../whipspot-testkit" }
@@ -49,8 +52,9 @@ whipspot-skin-winamp = { path = "../whipspot-skin-winamp", features = ["demo"] }
 # Reads the demo's golden screenshots (already in the lock through luneui's dump writer).
 png = "0.18"
 
-# The workspace table plus one exception (D5): `forbid` cannot be relaxed per module, so this
-# crate denies `unsafe_code` and `platform_windows` alone allows it. Keep the rest in step with
+# The workspace table plus granted exceptions (D5, efficiency mode R1-D3): `forbid` cannot be
+# relaxed per module, so this crate denies `unsafe_code` and only `platform_windows`,
+# `power_windows` and `power_macos` allow it. Keep the rest in step with
 # `[workspace.lints]`.
 [lints.rust]
 unsafe_code = "deny"

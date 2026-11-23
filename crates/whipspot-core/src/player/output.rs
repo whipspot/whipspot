@@ -28,12 +28,14 @@ pub(crate) fn chain(
     requests
 }
 
-/// The summary while the exclusive output is released: "Exclusive mode, <device>, idle".
-pub(crate) fn idle_summary(device: Option<&str>) -> String {
-    format!(
-        "Exclusive mode, {}, idle",
-        device.unwrap_or("default device")
-    )
+/// The summary while the output is released: "<Shared|Exclusive> mode, <device>, idle", with
+/// the mode chosen.
+pub(crate) fn idle_summary(mode: OutputMode, device: Option<&str>) -> String {
+    let mode = match mode {
+        OutputMode::Shared => "Shared",
+        OutputMode::Exclusive => "Exclusive",
+    };
+    format!("{mode} mode, {}, idle", device.unwrap_or("default device"))
 }
 
 /// What a [`chain`] reopen came to, for the state and the notices.
@@ -249,7 +251,17 @@ mod tests {
         assert_eq!(o.summary, "No audio output");
         assert_eq!((o.opened, o.fallback), (None, None));
         // Idle.
-        assert_eq!(idle_summary(None), "Exclusive mode, default device, idle");
-        assert_eq!(idle_summary(Some("dac")), "Exclusive mode, dac, idle");
+        assert_eq!(
+            idle_summary(OutputMode::Exclusive, None),
+            "Exclusive mode, default device, idle"
+        );
+        assert_eq!(
+            idle_summary(OutputMode::Exclusive, Some("dac")),
+            "Exclusive mode, dac, idle"
+        );
+        assert_eq!(
+            idle_summary(OutputMode::Shared, Some("dac")),
+            "Shared mode, dac, idle"
+        );
     }
 }

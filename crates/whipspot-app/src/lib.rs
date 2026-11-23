@@ -8,5 +8,10 @@ pub mod paths;
 pub(crate) mod platform_macos;
 #[cfg(windows)]
 pub mod platform_windows;
+pub mod power;
+#[cfg(target_os = "macos")]
+mod power_macos;
+#[cfg(windows)]
+mod power_windows;
 pub mod selftest;
 pub mod settings;

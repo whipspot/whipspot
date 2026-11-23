@@ -45,6 +45,7 @@ use crate::engine::{
 };
 use crate::events::UiEvent;
 use crate::lyrics::LyricsSource;
+use crate::power::{PowerControl, PowerStatus};
 use crate::provider::{ProviderContext, ProviderRegistry};
 
 /// The fixed texts of [`PlayerNotice::Error`].
@@ -85,11 +86,18 @@ pub struct PlayerConfig {
     lyrics: Option<Arc<dyn LyricsSource>>,
     lyrics_enabled: bool,
     exclusive_pause_release: Duration,
+    power: Option<Arc<dyn PowerControl>>,
+    power_enabled: bool,
+    hidden_pause_release: Duration,
 }
 
 /// How long an exclusive output stays open while paused before the device is given back
 /// (H28, D14).
 pub const EXCLUSIVE_PAUSE_RELEASE: Duration = Duration::from_secs(10 * 60);
+
+/// How long any output stays open while paused with every window hidden and the efficiency
+/// setting on, before it is given back so the OS sees the app as silent (efficiency mode D3).
+pub const HIDDEN_PAUSE_RELEASE: Duration = Duration::from_secs(60);
 
 impl Default for PlayerConfig {
     fn default() -> Self {
@@ -98,6 +106,9 @@ impl Default for PlayerConfig {
             lyrics: None,
             lyrics_enabled: true,
             exclusive_pause_release: EXCLUSIVE_PAUSE_RELEASE,
+            power: None,
+            power_enabled: true,
+            hidden_pause_release: HIDDEN_PAUSE_RELEASE,
         }
     }
 }
@@ -122,6 +133,22 @@ impl PlayerConfig {
         self.exclusive_pause_release = after;
         self
     }
+
+    /// Ask the OS for a power mode through `control` (efficiency mode); `enabled` is the initial
+    /// setting. The player calls [`PowerControl::set`] only when the wanted mode changes.
+    pub fn with_power(mut self, control: Arc<dyn PowerControl>, enabled: bool) -> Self {
+        self.power = Some(control);
+        self.power_enabled = enabled;
+        self
+    }
+
+    /// Give any output back after this long paused while every window is hidden and the
+    /// efficiency setting is on (default [`HIDDEN_PAUSE_RELEASE`]); an exclusive output uses
+    /// the shorter of this and its own release.
+    pub fn with_hidden_pause_release(mut self, after: Duration) -> Self {
+        self.hidden_pause_release = after;
+        self
+    }
 }
 
 impl std::fmt::Debug for PlayerConfig {
@@ -131,6 +158,9 @@ impl std::fmt::Debug for PlayerConfig {
             .field("lyrics", &self.lyrics.is_some())
             .field("lyrics_enabled", &self.lyrics_enabled)
             .field("exclusive_pause_release", &self.exclusive_pause_release)
+            .field("power", &self.power.as_ref().map(|p| p.name()))
+            .field("power_enabled", &self.power_enabled)
+            .field("hidden_pause_release", &self.hidden_pause_release)
             .finish()
     }
 }
@@ -310,6 +340,11 @@ impl Player {
             lyrics: lyrics.idle(),
             lyrics_enabled: lyrics.enabled(),
             remote: None,
+            power: PowerStatus {
+                name: config.power.as_ref().map(|p| p.name()),
+                enabled: config.power_enabled,
+                ..PowerStatus::default()
+            },
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(Arc::new(initial)),
@@ -335,7 +370,12 @@ impl Player {
             ttx,
             itx,
             lyrics,
-            config.exclusive_pause_release,
+            control::Policy {
+                pause_release: config.exclusive_pause_release,
+                hidden_pause_release: config.hidden_pause_release,
+                power: config.power.clone(),
+                power_enabled: config.power_enabled,
+            },
         );
         control.init_output(request);
         rt.spawn(control.run(rx, irx, events));

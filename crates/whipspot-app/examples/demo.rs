@@ -129,8 +129,8 @@ use whipspot_core::skin::{PanelWindows, SkinEngine, SkinRegistry, SkinSource, Wi
 use whipspot_skin_winamp::WinampEngine;
 use whipspot_skin_winamp::demo::demo_skin;
 use whipspot_testkit::{
-    ClockedOutput, DemoProvider, FakeArt, FakeLyrics, FakeProvider, FakeSkinSource, demo_images,
-    demo_lyrics, run_panel_windows_contract,
+    ClockedOutput, DemoProvider, FakeArt, FakeLyrics, FakePower, FakeProvider, FakeSkinSource,
+    demo_images, demo_lyrics, run_panel_windows_contract,
 };
 use whipspot_ui::diagnostics;
 use whipspot_ui::skin::{
@@ -433,7 +433,9 @@ fn player(rt: &tokio::runtime::Runtime, setup: Setup) -> anyhow::Result<PlayerHa
     for track in &context {
         fake_lyrics.with(&track.name, demo_lyrics());
     }
-    let mut config = PlayerConfig::default().with_lyrics(Arc::new(fake_lyrics), lyrics);
+    let mut config = PlayerConfig::default()
+        .with_lyrics(Arc::new(fake_lyrics), lyrics)
+        .with_power(Arc::new(FakePower::new("Demo power")), true);
     if art {
         config = config.with_art(Arc::new(if light_art {
             FakeArt::paper()
@@ -1354,6 +1356,9 @@ fn print_diagnostics(rt: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     for part in [
         "
 Verdict: ",
+        "
+Power
+Efficiency mode: ",
         "
 Source
 ",

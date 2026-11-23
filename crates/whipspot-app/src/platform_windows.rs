@@ -1,7 +1,9 @@
 //! Windows start-up hardening (M2-P1, D5): restrict where DLLs are searched for before the GPU
 //! stack loads anything.
 //!
-//! This is the only `unsafe` in our crates (hard rule 7): one FFI call that has no safe binding.
+//! This is one of the `unsafe` exceptions in our crates (hard rule 7): one FFI call that has no
+//! safe binding. The others are `power_windows.rs`, `power_macos.rs` and the testkit's counting
+//! allocator.
 //! `whipspot-app`'s lint table denies `unsafe_code` (a `forbid` cannot be relaxed per module);
 //! the allow below is on this module alone.
 #![allow(unsafe_code)]
