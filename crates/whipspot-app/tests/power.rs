@@ -79,6 +79,37 @@ fn a_thread_that_never_syncs_stays_unmarked() {
 }
 
 #[test]
+fn a_thread_spawned_by_a_marked_thread_starts_unmarked() {
+    // The real audio threads (`whipspot-cpal-out`, `whipspot-wasapi-out`, the decode threads) are
+    // spawned from marked threads, a tokio worker in Eco. I5 rests on the OS not handing a
+    // thread's mark to the threads it creates; this pins that on the machine running the test.
+    let _serial = serial();
+    let power = OsPower::new();
+    let (parent, child) = std::thread::scope(|s| {
+        s.spawn(|| {
+            let _ = power.set(PowerMode::Eco);
+            sync_current_thread();
+            let parent = current_thread_saving();
+            let child = std::thread::spawn(current_thread_saving).join().unwrap();
+            (parent, child)
+        })
+        .join()
+        .unwrap()
+    });
+    let _ = power.set(PowerMode::Normal);
+    if supported() {
+        assert_eq!(parent, Some(true), "the parent marked itself in Eco");
+        assert_eq!(
+            child,
+            Some(false),
+            "a thread spawned by a marked thread (every audio thread, I5) starts unmarked"
+        );
+    } else {
+        assert_eq!((parent, child), (None, None));
+    }
+}
+
+#[test]
 fn eco_marks_and_normal_restores_the_main_flow_across_repeats() {
     // Eco -> EcoIdle -> Eco keeps a synced thread marked; Normal restores it once.
     let _serial = serial();

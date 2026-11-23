@@ -4,7 +4,7 @@
 //! `OsPower::set` does the process-level part at once (Windows only: EcoQoS and the idle priority
 //! class for `EcoIdle`, both handed back for `Normal` and `Eco`) and then publishes the thread
 //! mode. Each marked thread applies that mode to itself in [`sync_current_thread`], which only
-//! two places call (I5): the main event-loop thread from the host's `about_to_wait`, and the
+//! two places call (I5): the main event-loop thread from the host's `new_events` and `about_to_wait`, and the
 //! workers of the app's tokio runtime through its `on_thread_unpark` hook. No audio thread runs
 //! there, so none is ever marked. Windows marks a thread with thread EcoQoS (its priority is never
 //! changed); macOS with QoS `utility`, restored to the class the thread had before. The FFI lives

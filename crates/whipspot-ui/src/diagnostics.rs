@@ -111,7 +111,7 @@ pub(crate) fn power_text(power: &PowerStatus) -> String {
     match (power.mode, power.shown) {
         (PowerMode::Eco, _) => format!("{name}, saving power (hidden, music at full speed)"),
         (PowerMode::EcoIdle, _) => format!("{name}, saving power (hidden, nothing playing)"),
-        (PowerMode::Normal, false) => format!("{name}, normal (audio open)"),
+        (PowerMode::Normal, false) => format!("{name}, normal"),
         (PowerMode::Normal, true) => format!("{name}, normal (window shown)"),
     }
 }
@@ -621,7 +621,7 @@ mod tests {
         );
         assert_eq!(
             power_text(&power(Some("Demo power"), true, false, PowerMode::Normal)),
-            "Demo power, normal (audio open)"
+            "Demo power, normal"
         );
         assert_eq!(
             power_text(&power(Some("Demo power"), true, true, PowerMode::Normal)),

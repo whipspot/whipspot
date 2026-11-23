@@ -1456,6 +1456,9 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
     }
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        // Apply the published power mode before this wake's events are handled, so the first frame
+        // after a restore does not run marked (I5).
+        crate::power::sync_current_thread();
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
             let now = Instant::now();
             for win in self.wins.values_mut() {
