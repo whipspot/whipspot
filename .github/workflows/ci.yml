@@ -35,9 +35,8 @@ jobs:
       - name: Crate boundaries self-test
         shell: bash
         run: bash scripts/check-boundaries-selftest.sh
-      - name: Clippy for macOS (aarch64-apple-darwin)
-        shell: bash
-        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      # No cross clippy for aarch64-apple-darwin here: ring (through lunepack) does not cross-compile
+      # to macOS from Windows; gate-macos runs clippy natively on an aarch64 runner.
 
   # Compiles and runs the fake-based tests only; no GUI is run.
   gate-macos:
