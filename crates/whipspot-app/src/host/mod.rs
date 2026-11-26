@@ -37,6 +37,7 @@ use lune_ui::ui::Ui;
 use lune_ui::window::{glass_attributes, panel_attributes};
 use whipspot_core::player::{PlayerAction, PlayerHandle};
 use whipspot_core::skin::{PanelWindows, ScreenPoint};
+use whipspot_core::update::UpdateStatus;
 use whipspot_ui::skin::{
     FrontChange, OPEN_FAILED, PanelPlan, SkinStatus, SkinUi, pixel_scale, trace,
 };
@@ -307,6 +308,9 @@ pub struct HostOptions {
     pub switch_back: bool,
     /// Add the OS fallback font files (emoji, CJK) after the bundled faces.
     pub system_fonts: bool,
+    /// Called once, on the UI thread, right after the first frame of any window was presented
+    /// (the update lifecycle's health confirmation, D9). It must not block.
+    pub first_frame: Option<fn()>,
 }
 
 /// What the loop leaves behind.
@@ -867,6 +871,11 @@ impl<'p, 'a> App<'p, 'a> {
             self.first_maximized = maximized;
         }
         self.frames += 1;
+        if self.frames == 1
+            && let Some(hook) = self.opts.first_frame
+        {
+            hook();
+        }
         // With a panel check, only panel windows of an open set count (the native window's
         // frames before the set exists must not end the run); in the later phases only the
         // native window's frames with no set open, after the failure when one is forced.
@@ -1433,6 +1442,12 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
                 }
                 self.poll_front(event_loop);
                 self.set_flow(event_loop);
+                // An update was handed over to be installed: leave the loop like a Quit, so the
+                // settings are saved and everything is released before the installer swaps the
+                // version.
+                if self.player.state().update == UpdateStatus::Restarting {
+                    event_loop.exit();
+                }
             }
             HostEvent::Tray(click) => {
                 if let Some(tray) = &mut self.tray

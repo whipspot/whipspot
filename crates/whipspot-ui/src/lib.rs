@@ -323,6 +323,8 @@ pub struct NativeUi {
     skins: Option<SkinsLink>,
     /// The Settings page's Music folders card; `None` hides it.
     folders: Option<FoldersLink>,
+    /// The app's version text, shown in About (the composition root sets it).
+    app_version: &'static str,
 }
 
 impl NativeUi {
@@ -362,7 +364,14 @@ impl NativeUi {
             accent: None,
             skins: None,
             folders: None,
+            app_version: "unknown",
         }
+    }
+
+    /// Shows `version` (the app's own, not this crate's) as the Version row of About.
+    pub fn with_app_version(mut self, version: &'static str) -> Self {
+        self.app_version = version;
+        self
     }
 
     /// Shares the library provider choice (the switch in the top bar sets it; the skinned
@@ -874,6 +883,7 @@ impl NativeUi {
                 auto_hide: self.auto_hide,
                 skins,
                 folders,
+                app_version: self.app_version,
             };
             let force = self.force;
             // The sheet's per-widget state (the scroll offsets of the grids, the home page and the

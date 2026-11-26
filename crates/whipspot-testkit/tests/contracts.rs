@@ -24,14 +24,14 @@ use whipspot_core::skin::{
 };
 use whipspot_testkit::{
     ClockedOutput, DemoProvider, FakeArt, FakeFolders, FakeLyrics, FakeOutput, FakePower,
-    FakeProvider, FakeSkinEngine, FakeSkinSource, FakeWindows, LyricsOutcome, MemoryStore,
-    demo_images, demo_lyrics, run_art_error_contract, run_art_source_contract,
+    FakeProvider, FakeSkinEngine, FakeSkinSource, FakeUpdater, FakeWindows, LyricsOutcome,
+    MemoryStore, demo_images, demo_lyrics, run_art_error_contract, run_art_source_contract,
     run_audio_output_contract, run_credential_store_contract, run_fake_windows_contract,
     run_lyrics_outcome_contract, run_lyrics_source_contract, run_music_folders_contract,
     run_panel_windows_contract, run_power_control_contract, run_provider_contract,
     run_provider_playback_contract, run_provider_session_contract, run_remote_contract,
     run_skin_caps_contract, run_skin_engine_contract, run_skin_source_contract,
-    run_skin_source_size_contract,
+    run_skin_source_size_contract, run_updater_contract,
 };
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -1002,6 +1002,95 @@ fn power_control_contract_notices_an_empty_name_or_a_refused_normal() {
     let r = std::panic::catch_unwind(|| run_power_control_contract(&Refusing));
     let text = panic_text(r);
     assert!(text.contains("power control contract"), "{text}");
+}
+
+#[test]
+fn updater_contract_on_fake_updater() {
+    run_updater_contract(&FakeUpdater::new("1.2.3"));
+}
+
+#[test]
+fn updater_contract_on_a_fake_that_cannot_update() {
+    use whipspot_core::update::UpdateError;
+    // Every call says Unavailable: the contract's second branch (download and apply too).
+    struct Uninstalled;
+    impl whipspot_core::update::Updater for Uninstalled {
+        fn current_version(&self) -> &str {
+            "0.2.4"
+        }
+        fn check(&self) -> Result<Option<whipspot_core::update::UpdateOffer>, UpdateError> {
+            Err(UpdateError::Unavailable)
+        }
+        fn download(
+            &self,
+            _: &whipspot_core::update::UpdateOffer,
+            _: &dyn Fn(u64, u64),
+            _: &whipspot_core::update::CancelFlag,
+        ) -> Result<(), UpdateError> {
+            Err(UpdateError::Unavailable)
+        }
+        fn apply_and_restart(&self) -> Result<(), UpdateError> {
+            Err(UpdateError::Unavailable)
+        }
+    }
+    run_updater_contract(&Uninstalled);
+}
+
+#[test]
+fn updater_contract_notices_an_empty_version_and_a_half_unavailable_copy() {
+    use whipspot_core::update::{CancelFlag, UpdateError, UpdateOffer, Updater};
+
+    /// Names no version.
+    struct Nameless;
+    impl Updater for Nameless {
+        fn current_version(&self) -> &str {
+            ""
+        }
+        fn check(&self) -> Result<Option<UpdateOffer>, UpdateError> {
+            Ok(None)
+        }
+        fn download(
+            &self,
+            _: &UpdateOffer,
+            _: &dyn Fn(u64, u64),
+            _: &CancelFlag,
+        ) -> Result<(), UpdateError> {
+            Ok(())
+        }
+        fn apply_and_restart(&self) -> Result<(), UpdateError> {
+            Ok(())
+        }
+    }
+
+    /// Cannot update, but downloads anyway.
+    struct Half;
+    impl Updater for Half {
+        fn current_version(&self) -> &str {
+            "1.0.0"
+        }
+        fn check(&self) -> Result<Option<UpdateOffer>, UpdateError> {
+            Err(UpdateError::Unavailable)
+        }
+        fn download(
+            &self,
+            _: &UpdateOffer,
+            _: &dyn Fn(u64, u64),
+            _: &CancelFlag,
+        ) -> Result<(), UpdateError> {
+            Ok(())
+        }
+        fn apply_and_restart(&self) -> Result<(), UpdateError> {
+            Err(UpdateError::Unavailable)
+        }
+    }
+
+    let r = std::panic::catch_unwind(|| run_updater_contract(&Nameless));
+    let text = panic_text(r);
+    assert!(text.contains("updater contract"), "{text}");
+
+    let r = std::panic::catch_unwind(|| run_updater_contract(&Half));
+    let text = panic_text(r);
+    assert!(text.contains("updater contract"), "{text}");
 }
 
 /// A logged-in demo provider that declares no auth steps: always ready, like a local-file one.

@@ -15,3 +15,8 @@ CLAUDE.local.md
 *.pcm
 *.f32
 /dist
+# release work dirs and keys (keys belong outside the repository; release/README.md)
+/release/work/
+/release/.lunepack-*.toml
+/release/*.key
+/release/*.pem

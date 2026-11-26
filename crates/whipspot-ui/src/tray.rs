@@ -15,6 +15,7 @@ use lune_ui::widgets::menu::{MenuItem, MenuRow};
 use lune_ui::widgets::tone::Tone;
 use whipspot_core::player::{PlayState, PlayerAction, PlayerHandle, PlayerState};
 use whipspot_core::text::display_text;
+use whipspot_core::update::{UpdateStatus, UpdateStep};
 
 use crate::settings::current_skin;
 use crate::skin::{SkinLibrary, SkinStatus};
@@ -42,6 +43,23 @@ const NOTHING_PLAYING_HINT: &str = "Choose something to play";
 const TIP_TRACK_CHARS: usize = 60;
 const TIP_ARTIST_CHARS: usize = 40;
 
+/// The update row's label while an update is offered or staged, or its last step failed and
+/// can be taken again (what `InstallUpdate` does next, the same rule as the About card's button).
+fn update_row_text(status: &UpdateStatus) -> Option<String> {
+    status.next_step().map(|step| match step {
+        UpdateStep::Download { version } => {
+            format!("Update to {}", display_text(&version, UPDATE_VERSION_CHARS))
+        }
+        UpdateStep::Install { version } => format!(
+            "Restart to update to {}",
+            display_text(&version, UPDATE_VERSION_CHARS)
+        ),
+    })
+}
+
+/// Characters of a version text kept in the update row before the width cut.
+const UPDATE_VERSION_CHARS: usize = 40;
+
 /// Which page the menu shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -60,6 +78,8 @@ pub enum Pick {
     OpenSkins,
     /// The main page.
     Back,
+    /// Download the offered update, or install the staged one and restart.
+    InstallUpdate,
     /// The native look.
     Native,
     /// The skin of this file name.
@@ -210,7 +230,7 @@ impl TrayMenu {
         if let Row::Item { chevron, .. } = &mut skin {
             *chevron = true;
         }
-        vec![
+        let mut rows = vec![
             header,
             Row::Separator,
             Row::item(if running { "Pause" } else { "Play" }, Pick::Toggle)
@@ -220,9 +240,16 @@ impl TrayMenu {
             Row::Separator,
             skin,
             Row::Separator,
-            Row::item("Show Whipspot", Pick::Show),
-            Row::item("Quit Whipspot", Pick::Quit),
-        ]
+        ];
+        // An update waits for the user: its row sits above Show and Quit and only while there is
+        // one to take.
+        if let Some(text) = update_row_text(&state.update) {
+            rows.push(Row::item(text, Pick::InstallUpdate));
+            rows.push(Row::Separator);
+        }
+        rows.push(Row::item("Show Whipspot", Pick::Show));
+        rows.push(Row::item("Quit Whipspot", Pick::Quit));
+        rows
     }
 
     fn skin_rows(&self) -> Vec<Row> {
@@ -300,6 +327,7 @@ impl TrayMenu {
             Pick::Toggle => (Outcome::Close, Some(PlayerAction::Toggle)),
             Pick::Next => (Outcome::Close, Some(PlayerAction::Next)),
             Pick::Previous => (Outcome::Close, Some(PlayerAction::Previous)),
+            Pick::InstallUpdate => (Outcome::Close, Some(PlayerAction::InstallUpdate)),
             Pick::OpenSkins => {
                 self.page = Page::Skins;
                 self.library.refresh();
@@ -467,18 +495,18 @@ pub fn is_current(status: &SkinStatus, name: &str) -> bool {
 
 /// The icon's grid, in units; the picture is this scaled to the requested size.
 const GRID: f32 = 16.0;
-/// The square: inset half a unit, corner radius 3.5.
+/// The square: inset half a unit, corner radius 3.5 (the master's 1 and 7 on its 32 grid).
 const SQUARE_INSET: f32 = 0.5;
 const SQUARE_RADIUS: f32 = 3.5;
-/// The gradient's top and bottom (theme A's ramp: 40 % of the way from its first to its second
-/// stop, and its first stop).
-const TOP: [f32; 3] = [32.0, 158.0, 134.0];
-const BOTTOM: [f32; 3] = [22.0, 122.0, 106.0];
-/// The bars: left unit, height in units; all 2 wide, bottoms at unit 13, top corners 0.5.
-const BARS: [(f32, f32); 3] = [(3.0, 6.0), (7.0, 9.0), (11.0, 4.0)];
-const BAR_W: f32 = 2.0;
-const BAR_BOTTOM: f32 = 13.0;
-const BAR_RADIUS: f32 = 0.5;
+/// The gradient's top and bottom: the app icon's teal, #2DB898 to #11665A.
+const TOP: [f32; 3] = [45.0, 184.0, 152.0];
+const BOTTOM: [f32; 3] = [17.0, 102.0, 90.0];
+/// The bars, the small master's (assets/icon/whipspot-small.svg, a 32 grid, halved): left unit and
+/// height in units for tall, mid and tall; all 2.5 wide, bottoms at unit 12.5, fully rounded ends.
+const BARS: [(f32, f32); 3] = [(3.0, 9.0), (6.75, 6.0), (10.5, 9.0)];
+const BAR_W: f32 = 2.5;
+const BAR_BOTTOM: f32 = 12.5;
+const BAR_RADIUS: f32 = BAR_W / 2.0;
 /// Samples per pixel side for the coverage.
 const SAMPLES: u32 = 8;
 
@@ -510,7 +538,8 @@ fn in_rounded(x: f32, y: f32, r: (f32, f32, f32, f32), top: f32, bottom: f32) ->
 }
 
 /// The tray icon as `size` x `size` straight-alpha RGBA, drawn by code: a rounded teal square with
-/// three white bars (D9). Edges are anti-aliased by coverage (8 x 8 samples a pixel).
+/// three white bars, tall, mid, tall: the small master of the app icon (D9). Edges are
+/// anti-aliased by coverage (8 x 8 samples a pixel).
 pub fn icon_rgba(size: u32) -> Vec<u8> {
     let size = size.max(1);
     let unit = GRID / size as f32;
@@ -538,7 +567,7 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
                             y,
                             (left, BAR_BOTTOM - height, left + BAR_W, BAR_BOTTOM),
                             BAR_RADIUS,
-                            0.0,
+                            BAR_RADIUS,
                         )
                     });
                     if bar {
@@ -630,6 +659,8 @@ mod tests {
             lyrics_enabled: false,
             remote: None,
             power: Default::default(),
+            update: Default::default(),
+            update_check: true,
         }
     }
 
@@ -690,6 +721,68 @@ mod tests {
             item(&rows, "Skin"),
             Row::Item { chevron: true, .. }
         ));
+    }
+
+    #[test]
+    fn the_update_row_shows_only_while_an_update_is_offered_or_staged() {
+        let mut m = menu(true);
+        let mut st = state(None, PlayState::Stopped, 0);
+        for quiet in [
+            UpdateStatus::Unavailable,
+            UpdateStatus::Idle,
+            UpdateStatus::Checking,
+            UpdateStatus::Failed {
+                text: "x",
+                retry: None,
+            },
+            UpdateStatus::Restarting,
+        ] {
+            st.update = quiet;
+            let rows = m.rows(&st);
+            assert_eq!(rows.len(), 10);
+            assert!(m.index_of(&st, &Pick::InstallUpdate).is_none());
+        }
+        st.update = UpdateStatus::Available {
+            version: "0.3.0".into(),
+        };
+        let rows = m.rows(&st);
+        assert_eq!(rows.len(), 12);
+        assert!(!disabled(&rows, "Update to 0.3.0"));
+        // Above Show and Quit, behind a separator on each side.
+        let at = m.index_of(&st, &Pick::InstallUpdate).unwrap();
+        assert_eq!(rows[at - 1], Row::Separator);
+        assert_eq!(rows[at + 1], Row::Separator);
+        assert_eq!(rows[at + 2].text(), Some("Show Whipspot"));
+        // A pick sends the action and closes the menu.
+        let (outcome, action) = m.pick_at(at, &st);
+        assert_eq!(outcome, Outcome::Close);
+        assert!(matches!(action, Some(PlayerAction::InstallUpdate)));
+        st.update = UpdateStatus::Downloading {
+            version: "0.3.0".into(),
+            done: 1,
+            total: 2,
+        };
+        assert!(m.index_of(&st, &Pick::InstallUpdate).is_none());
+        st.update = UpdateStatus::Ready {
+            version: "0.3.0".into(),
+        };
+        let rows = m.rows(&st);
+        assert!(!disabled(&rows, "Restart to update to 0.3.0"));
+        // A failed step that can be taken again keeps its row.
+        st.update = UpdateStatus::Failed {
+            text: "x",
+            retry: Some(UpdateStep::Download {
+                version: "0.3.0".into(),
+            }),
+        };
+        assert!(!disabled(&m.rows(&st), "Update to 0.3.0"));
+        st.update = UpdateStatus::Failed {
+            text: "x",
+            retry: Some(UpdateStep::Install {
+                version: "0.3.0".into(),
+            }),
+        };
+        assert!(!disabled(&m.rows(&st), "Restart to update to 0.3.0"));
     }
 
     #[test]
@@ -988,6 +1081,33 @@ mod tests {
         let [r, g, b, a] = at(12, 22);
         assert_eq!(a, 255);
         assert!(g > r && b < g, "{r} {g} {b}");
+    }
+
+    #[test]
+    fn tray_icon_has_three_bars_tall_mid_tall_on_the_teal_gradient() {
+        let size = 64u32;
+        let px = icon_rgba(size);
+        let at = |x: u32, y: u32| {
+            let i = ((y * size + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let white = |x, y| at(x, y) == [255, 255, 255, 255];
+        // A row through the bars' middle: exactly three white runs.
+        let y = 40; // grid unit 10.1
+        let runs = (0..size)
+            .filter(|&x| white(x, y) && (x == 0 || !white(x - 1, y)))
+            .count();
+        assert_eq!(runs, 3);
+        // Tall bars reach unit 3.5, the mid bar only 6.5: pixel row 20 (unit 5) is white in the
+        // first and third bars and the gradient in the middle one.
+        assert!(white(14, 20) && white(46, 20), "outer bars");
+        assert!(!white(32, 20), "mid bar is shorter");
+        // The gradient runs from #2DB898 at the top to #11665A at the bottom.
+        let top = at(32, 3);
+        let bottom = at(32, 60);
+        assert!(top[0] > bottom[0] && top[1] > bottom[1] && top[2] > bottom[2]);
+        assert!(top[1].abs_diff(184) <= 10, "{top:?}");
+        assert!(bottom[1].abs_diff(102) <= 10, "{bottom:?}");
     }
 
     #[test]

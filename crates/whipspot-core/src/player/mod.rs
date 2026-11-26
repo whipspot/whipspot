@@ -22,6 +22,7 @@ mod queue;
 mod spectrum;
 mod state;
 mod transport;
+mod updates;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +48,7 @@ use crate::events::UiEvent;
 use crate::lyrics::LyricsSource;
 use crate::power::{PowerControl, PowerStatus};
 use crate::provider::{ProviderContext, ProviderRegistry};
+use crate::update::{self, Updater};
 
 /// The fixed texts of [`PlayerNotice::Error`].
 pub mod texts {
@@ -89,6 +91,8 @@ pub struct PlayerConfig {
     power: Option<Arc<dyn PowerControl>>,
     power_enabled: bool,
     hidden_pause_release: Duration,
+    updater: Option<Arc<dyn Updater>>,
+    update_check: bool,
 }
 
 /// How long an exclusive output stays open while paused before the device is given back
@@ -109,6 +113,8 @@ impl Default for PlayerConfig {
             power: None,
             power_enabled: true,
             hidden_pause_release: HIDDEN_PAUSE_RELEASE,
+            updater: None,
+            update_check: true,
         }
     }
 }
@@ -149,6 +155,16 @@ impl PlayerConfig {
         self.hidden_pause_release = after;
         self
     }
+
+    /// Update the app through `updater`; `check` is the initial scheduled-checks setting (the
+    /// first check runs [`update::FIRST_CHECK_AFTER`] after start, then every
+    /// [`update::CHECK_EVERY`]). Without one the update status stays `Unavailable` and no check
+    /// ever runs.
+    pub fn with_updater(mut self, updater: Arc<dyn Updater>, check: bool) -> Self {
+        self.updater = Some(updater);
+        self.update_check = check;
+        self
+    }
 }
 
 impl std::fmt::Debug for PlayerConfig {
@@ -161,6 +177,8 @@ impl std::fmt::Debug for PlayerConfig {
             .field("power", &self.power.as_ref().map(|p| p.name()))
             .field("power_enabled", &self.power_enabled)
             .field("hidden_pause_release", &self.hidden_pause_release)
+            .field("updater", &self.updater.is_some())
+            .field("update_check", &self.update_check)
             .finish()
     }
 }
@@ -345,6 +363,11 @@ impl Player {
                 enabled: config.power_enabled,
                 ..PowerStatus::default()
             },
+            update: match config.updater {
+                Some(_) => update::UpdateStatus::Idle,
+                None => update::UpdateStatus::Unavailable,
+            },
+            update_check: config.update_check,
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(Arc::new(initial)),
@@ -375,6 +398,10 @@ impl Player {
                 hidden_pause_release: config.hidden_pause_release,
                 power: config.power.clone(),
                 power_enabled: config.power_enabled,
+                update: config.updater.clone().map(|updater| updates::UpdateSetup {
+                    updater,
+                    check: config.update_check,
+                }),
             },
         );
         control.init_output(request);

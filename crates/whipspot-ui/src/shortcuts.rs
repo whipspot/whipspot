@@ -241,6 +241,8 @@ mod tests {
             lyrics_enabled: false,
             remote: None,
             power: Default::default(),
+            update: Default::default(),
+            update_check: true,
         }
     }
 

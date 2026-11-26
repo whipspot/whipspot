@@ -14,6 +14,7 @@ mod fake_output;
 mod fake_power;
 mod fake_provider;
 mod fake_skin;
+mod fake_update;
 mod fake_windows;
 mod memory_store;
 pub mod rng;
@@ -25,6 +26,7 @@ pub use contract::{
     run_power_control_contract, run_provider_contract, run_provider_playback_contract,
     run_provider_session_contract, run_remote_contract, run_skin_caps_contract,
     run_skin_engine_contract, run_skin_source_contract, run_skin_source_size_contract,
+    run_updater_contract,
 };
 pub use demo::DemoProvider;
 pub use fake_art::{FakeArt, Gate, GateWait, demo_images};
@@ -34,5 +36,6 @@ pub use fake_output::{ClockedOutput, FakeOutput};
 pub use fake_power::FakePower;
 pub use fake_provider::FakeProvider;
 pub use fake_skin::{FakeSkinEngine, FakeSkinSource};
+pub use fake_update::{FakeUpdater, UpdateCall};
 pub use fake_windows::FakeWindows;
 pub use memory_store::MemoryStore;
