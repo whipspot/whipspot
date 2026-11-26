@@ -15,7 +15,7 @@ version = 1
 threshold = 1
 keys = [
     # Replaced by `bash scripts/publish-update.sh bootstrap` with the new root's public key.
-    "ROOT-KEY-PLACEHOLDER-run-publish-update-bootstrap",
+    "6044f290a681ad4f22f3a9b18b2efde7881f4444d42c805de8330a985165e87e",
 ]
 
 # Signs manifests and feeds. The root key signs only at bootstrap, through
