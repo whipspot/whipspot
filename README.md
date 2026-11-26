@@ -39,10 +39,21 @@ flowchart LR
 
 ## Install
 
-Get the latest build from [**Releases**](../../releases).
+Get the latest installer from [**Releases**](../../releases).
 
-- **Windows:** unzip and run `whipspot.exe`. If SmartScreen warns you, click *More info* → *Run anyway*.
-- **macOS:** unzip and move `Whipspot.app` to Applications. The app isn't notarised yet, so right-click it and choose *Open* the first time.
+- **Windows:** run `whipspot-<version>-windows-x86_64-setup.exe`. It installs for your user only. The installer isn't code-signed yet, so if SmartScreen warns you, click *More info* → *Run anyway*.
+- **macOS:** open `whipspot-<version>-macos-universal.dmg` and drag Whipspot to Applications. The app isn't notarised yet, so right-click it and choose *Open* the first time.
+
+> The installers are built by CI, and no installer has been run on a real Windows 11 or macOS machine yet. Treat the first install as a test.
+
+## Updates
+
+An installed Whipspot updates itself through [lunepack](https://github.com/lune-rs/lunepack). A minute after it starts, and every 6 hours after that, it asks `updates.izzat.dev` whether a newer version exists. If one does, **Settings → About** and the tray menu say so. Nothing is downloaded until you click **Download update**, and Whipspot restarts only when you click **Install and restart**. Every download is checked against signing keys built into the app before it is used.
+
+- **Check now** in **Settings → About** asks straight away. Turn off **Check for updates automatically** there to stop the timed checks.
+- The server keeps the 10 newest versions.
+- Updating works only in a copy the installer put on your machine. A copy you built yourself, or run from a build folder, says "Updates work in installed copies".
+- Nothing about updating has been run against the real update server or on a real install yet; it is built and tested on fakes only.
 
 ## Getting started
 
@@ -67,6 +78,8 @@ Press `Ctrl+Shift+N` to go back to the normal look.
 ```
 cargo run --release -p whipspot-app
 ```
+
+The app icon's sources are the SVGs in `assets/icon/`; `bash scripts/make-icons.sh` (macOS; needs `rsvg-convert`, ImageMagick and `iconutil`) regenerates the `.icns`, `.ico` and `.png` files committed beside them.
 
 Want to try it without any account? `cargo run -p whipspot-app --example demo` runs the player on made-up music.
 
