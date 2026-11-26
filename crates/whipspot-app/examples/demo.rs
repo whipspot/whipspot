@@ -1057,13 +1057,15 @@ fn script_for<'a>(
     handle: &'a PlayerHandle,
     force: Force,
 ) -> anyhow::Result<Script<'a>> {
-    let mut view = NativeUi::new(host::chrome(), Tab::Home).with_prefs(UiPrefs {
-        theme: shot.theme,
-        auto_hide: shot.auto_hide,
-        // Every shot is without the tour but the ones that force a card (Force.tour).
-        tour_seen: true,
-        ..UiPrefs::default()
-    });
+    let mut view = NativeUi::new(host::chrome(), Tab::Home)
+        .with_app_version(whipspot_app::APP_VERSION)
+        .with_prefs(UiPrefs {
+            theme: shot.theme,
+            auto_hide: shot.auto_hide,
+            // Every shot is without the tour but the ones that force a card (Force.tour).
+            tour_seen: true,
+            ..UiPrefs::default()
+        });
     if let Some(scanning) = shot.folders {
         view = view.with_music_folders(demo_folders(scanning), || None);
     }
@@ -2036,6 +2038,7 @@ fn capture_settings_skins(rt: &tokio::runtime::Runtime, path: &Path) -> anyhow::
     }
     let shot = Shot::new("c-settings-skins@1x", ThemeId::C, Route::Settings);
     let mut view = NativeUi::new(host::chrome(), Tab::Home)
+        .with_app_version(whipspot_app::APP_VERSION)
         .with_prefs(UiPrefs {
             theme: shot.theme,
             auto_hide: shot.auto_hide,
@@ -2134,7 +2137,8 @@ fn smoke_skin(rt: &tokio::runtime::Runtime, check_fails: bool) -> anyhow::Result
     let library = demo_library()?;
     library.choose(DEMO_SKIN);
     let mut skin = SkinUi::new(library, SkinPrefs::default());
-    let mut view = NativeUi::new(host::chrome(), Tab::default());
+    let mut view =
+        NativeUi::new(host::chrome(), Tab::default()).with_app_version(whipspot_app::APP_VERSION);
     let spec = WindowSpec {
         key: "main",
         open_at_start: true,
@@ -2929,7 +2933,8 @@ fn run() -> anyhow::Result<()> {
                     ..Setup::new(!logged_out)
                 },
             )?;
-            let mut view = NativeUi::new(host::chrome(), Tab::default());
+            let mut view = NativeUi::new(host::chrome(), Tab::default())
+                .with_app_version(whipspot_app::APP_VERSION);
             let spec = WindowSpec {
                 key: "main",
                 open_at_start: true,

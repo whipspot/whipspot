@@ -348,6 +348,7 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
     // The tray icon's menu chooses from the same library; its Skin row needs the skins folder.
     let tray_menu = TrayMenu::new(library.clone(), folder.is_some());
     let mut view = NativeUi::new(host::chrome(), Tab::from_key(&settings.last_view))
+        .with_app_version(whipspot_app::APP_VERSION)
         .with_prefs(prefs)
         .with_skins(library, folder)
         .with_provider_choice(provider_choice.clone());

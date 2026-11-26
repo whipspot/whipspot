@@ -214,6 +214,8 @@ pub(crate) struct SettingsView<'a> {
     pub(crate) skins: Option<SkinsView<'a>>,
     /// The Music folders card; `None` hides it (no folders seam).
     pub(crate) folders: Option<FoldersView<'a>>,
+    /// The app's version text for the About card.
+    pub(crate) app_version: &'static str,
 }
 
 /// What the page asks of the shell in a frame.
@@ -457,7 +459,7 @@ impl SettingsPane {
             y = bottom + CARD_GAP;
             y = accounts_card(ui, k, state, at(y), &mut out) + CARD_GAP;
             y = shortcuts_card(ui, k, view.shortcuts, at(y)) + CARD_GAP;
-            y = about_card(ui, k, at(y), &mut out);
+            y = about_card(ui, k, view.app_version, at(y), &mut out);
             (
                 (),
                 Extent::new(f64::from(rect.w), f64::from(y + BOTTOM_PAD - rect.y)),
@@ -1057,7 +1059,7 @@ fn shortcuts_card(ui: &mut Ui<'_>, k: &Look, shortcuts: &[(&str, &str)], at: Rec
 }
 
 /// The About card. Returns the card's bottom.
-fn about_card(ui: &mut Ui<'_>, k: &Look, at: Rect, out: &mut SettingsOut) -> f32 {
+fn about_card(ui: &mut Ui<'_>, k: &Look, version: &str, at: Rect, out: &mut SettingsOut) -> f32 {
     let r = Rect::new(
         at.x,
         at.y,
@@ -1073,10 +1075,7 @@ fn about_card(ui: &mut Ui<'_>, k: &Look, at: Rect, out: &mut SettingsOut) -> f32
     let p = ui.painter();
     row_value(p, "Whipspot", k.ink.text, true, 15.0, x0, y - 2.0, 0.0);
     y += ROW_PITCH;
-    for (label, value) in [
-        ("Version", env!("CARGO_PKG_VERSION")),
-        ("Licence", "Apache-2.0"),
-    ] {
+    for (label, value) in [("Version", version), ("Licence", "Apache-2.0")] {
         row_label(p, k, label, x0, y);
         row_value(p, value, k.ink.text, false, 13.0, x0 + VALUE_DX, y, 0.0);
         y += ROW_PITCH;
