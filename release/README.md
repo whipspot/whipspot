@@ -53,7 +53,10 @@ bash scripts/publish-update.sh publish <version>
 ```
 
 `pack` fetches the previous release's pack of the target for a delta and writes
-`dist/update/<version>/`. `publish` fetches the state and the retained releases, adds the version to
+`dist/update/<version>/`.
+In CI the jobs that sign (`pack`, `setup`) set `WHIPSPOT_R2_PUBLIC=https://updates.izzat.dev/`: they
+read the public feed over https and hold no R2 key; only the `publish` job has the write keys (and
+the release key), and no job that compiles has any secret. `publish` fetches the state and the retained releases, adds the version to
 the `stable` feed, drops all but the 10 newest (by lunepack's version precedence, read from the
 verified feed), verifies, uploads packs, then manifests, then keys, then the feed, and only then
 deletes the dropped version folders and saves the state. A failure before the feed upload deletes

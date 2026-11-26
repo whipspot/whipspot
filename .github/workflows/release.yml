@@ -4,10 +4,15 @@
 # the installers to a draft GitHub Release. Unsigned: no Apple Developer ID or notarisation, no
 # Windows code signing (see README, Install).
 #
-# A manual run (workflow_dispatch) builds the lunepack tools and the app and nothing else: packing
-# needs the release key and the bucket, which only a tag push may use. Secrets appear only in the
-# `env:` of the steps that run publish-update.sh (pack and publish: R2 keys and the release key;
-# setup: R2 keys), never in a build step and never on a manual run.
+# Secrets never meet a job that compiles anything. Three kinds of job:
+#   build  (tools-*, build-*): cargo runs here, with every build script and proc macro of the
+#          dependency tree; no secret, no environment; they hand over unsigned artifacts only.
+#   pack   (pack-*): environment `release`; runs only prebuilt binaries (the lunepack CLI from the
+#          tools-* job) on the unsigned artifacts; holds LUNEPACK_RELEASE_KEY and nothing else. The
+#          previous release (for the delta) is read from the public feed over https, so no R2 key.
+#   publish: environment `release`; the release key and the R2 keys; runs only the lunepack CLI.
+# A manual run (workflow_dispatch) runs the build jobs and nothing else: packing needs the release
+# key and the bucket, which only a tag push may use.
 name: release
 
 on:
@@ -159,24 +164,93 @@ jobs:
           path: dist/lunepack-tools
           if-no-files-found: error
 
-  macos:
-    needs: [version, tools-macos]
+  # Builds the app. cargo runs here, so there is no secret and no environment in this job. The
+  # bundle goes out as a tar (an artifact zip drops the executable bits); pack-macos checks it.
+  build-macos:
+    needs: [version]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build dist/Whipspot.app (universal, unsealed for lunepack)
+        run: bash scripts/package-macos.sh --arch universal --unsealed
+      - name: Tar the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -d dist/Whipspot.app ] || { echo "no dist/Whipspot.app" >&2; exit 1; }
+          COPYFILE_DISABLE=1 tar -C dist -cf dist/Whipspot-app.tar Whipspot.app
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-macos
+          path: dist/Whipspot-app.tar
+          if-no-files-found: error
+
+  build-windows:
+    needs: [version]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p whipspot-app
+      - name: Lay out the install tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/input
+          cp target/release/whipspot-app.exe dist/input/whipspot.exe
+          cp LICENSE dist/input/LICENSE.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-windows
+          path: dist/input
+          if-no-files-found: error
+
+  # Packs the macOS build and makes the .dmg. Compiles nothing: only the lunepack CLI built by
+  # tools-macos and rclone (checked against its SHA-256) run here. The release key is in the pack
+  # step's env alone; the setup step needs no secret. The previous release is read from the public
+  # feed (WHIPSPOT_R2_PUBLIC as a URL: no R2 key, and the delta is kept).
+  pack-macos:
+    if: github.event_name == 'push'
+    needs: [version, tools-macos, build-macos]
+    runs-on: macos-latest
+    environment: release
+    env:
+      WHIPSPOT_R2_PUBLIC: https://updates.izzat.dev/
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tools-macos
           path: dist/lunepack-tools
-      - name: Make the downloaded tools executable
-        run: chmod +x dist/lunepack-tools/lunepack dist/lunepack-tools/lunepack-runtime dist/lunepack-tools/lunepack-ui
-      - name: Build dist/Whipspot.app (universal, unsealed for lunepack)
-        run: bash scripts/package-macos.sh --arch universal --unsealed
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: app-macos
+          path: dist/app-tar
+      - name: Unpack the bundle (only Whipspot.app, no path leaves it)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x dist/lunepack-tools/lunepack dist/lunepack-tools/lunepack-runtime dist/lunepack-tools/lunepack-ui
+          tar=dist/app-tar/Whipspot-app.tar
+          [ -f "$tar" ] || { echo "no app tar" >&2; exit 1; }
+          names=$(tar -tf "$tar")
+          [ -n "$names" ] || { echo "the app tar is empty" >&2; exit 1; }
+          outside=$(grep -Ev '^Whipspot\.app(/|$)' <<<"$names" || true)
+          [ -z "$outside" ] || { echo "the app tar holds a path outside Whipspot.app" >&2; exit 1; }
+          if grep -Eq '(^|/)\.\.(/|$)' <<<"$names"; then echo "the app tar holds a .. path" >&2; exit 1; fi
+          mkdir -p dist
+          tar -xf "$tar" -C dist
+          [ -x dist/Whipspot.app/Contents/MacOS/Whipspot ] || { echo "the bundle has no executable" >&2; exit 1; }
       - name: Install rclone
-        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
@@ -188,64 +262,56 @@ jobs:
           unzip -q "$d/rclone.zip" -d "$d"
           echo "$d/rclone-v${RCLONE_VERSION}-osx-arm64" >> "$GITHUB_PATH"
       - name: Pack the update (the previous release gives a delta)
-        if: github.event_name == 'push'
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
           LUNEPACK: dist/lunepack-tools/lunepack
           LUNEPACK_BIN_DIR: dist/lunepack-tools
           LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: bash scripts/publish-update.sh pack macos-universal dist/Whipspot.app "$VERSION"
       - name: Make the installer (.dmg)
-        if: github.event_name == 'push'
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
           LUNEPACK: dist/lunepack-tools/lunepack
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: bash scripts/publish-update.sh setup macos-universal "$VERSION"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: github.event_name == 'push'
         with:
           name: update-macos
           path: dist/update
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: github.event_name == 'push'
         with:
           name: installer-macos
           path: dist/*.dmg
           if-no-files-found: error
 
-  windows:
-    needs: [version, tools-windows]
+  pack-windows:
+    if: github.event_name == 'push'
+    needs: [version, tools-windows, build-windows]
     runs-on: windows-latest
+    environment: release
+    env:
+      WHIPSPOT_R2_PUBLIC: https://updates.izzat.dev/
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tools-windows
           path: dist/lunepack-tools
-      - name: Build
-        shell: bash
-        run: cargo build --release --locked -p whipspot-app
-      - name: Lay out the install tree
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: app-windows
+          path: dist/input
+      - name: Check the install tree
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist/input
-          cp target/release/whipspot-app.exe dist/input/whipspot.exe
-          cp LICENSE dist/input/LICENSE.txt
+          [ -f dist/input/whipspot.exe ] && [ -f dist/input/LICENSE.txt ] || { echo "the install tree lacks whipspot.exe or LICENSE.txt" >&2; exit 1; }
+          [ "$(ls -A dist/input | wc -l | tr -d ' ')" = 2 ] || { echo "the install tree holds more than whipspot.exe and LICENSE.txt" >&2; exit 1; }
       - name: Install rclone
-        if: github.event_name == 'push'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -257,46 +323,37 @@ jobs:
           Expand-Archive -LiteralPath $zip -DestinationPath $d
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $d "rclone-v$env:RCLONE_VERSION-windows-amd64")
       - name: Pack the update (the previous release gives a delta)
-        if: github.event_name == 'push'
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
           LUNEPACK: dist/lunepack-tools/lunepack.exe
           LUNEPACK_BIN_DIR: dist/lunepack-tools
           LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: bash scripts/publish-update.sh pack windows-x86_64 dist/input "$VERSION"
       - name: Make the installer (setup .exe)
-        if: github.event_name == 'push'
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
           LUNEPACK: dist/lunepack-tools/lunepack.exe
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: bash scripts/publish-update.sh setup windows-x86_64 "$VERSION"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: github.event_name == 'push'
         with:
           name: update-windows
           path: dist/update
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: github.event_name == 'push'
         with:
           name: installer-windows
           path: dist/*-setup.exe
           if-no-files-found: error
 
   # Adds the version to the stable feed, drops all but the 10 newest, uploads, deletes the dropped
-  # folders, saves the publisher state (all inside publish-update.sh). The CLI is the macOS one:
-  # this job runs on a Mac runner, so no Linux CLI is built.
+  # folders, saves the publisher state (all inside publish-update.sh). The only job with the R2
+  # write keys. It compiles nothing: the CLI is the macOS one from tools-macos (this job runs on a
+  # Mac runner, so no Linux CLI is built) and rclone, checked against its SHA-256.
   publish:
     if: github.event_name == 'push'
-    needs: [version, tools-macos, macos, windows]
+    needs: [version, tools-macos, pack-macos, pack-windows]
     runs-on: macos-latest
     environment: release
     steps:
@@ -348,7 +405,7 @@ jobs:
   # refuses a version that is already in the feed.
   release:
     if: github.event_name == 'push'
-    needs: [publish, macos, windows]
+    needs: [publish, pack-macos, pack-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

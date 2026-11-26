@@ -2,7 +2,7 @@
 # Tests scripts/publish-update.sh against local folders standing in for the R2 buckets: bootstrap,
 # 12 packs and publishes of a tiny fake app for this Mac's target, keep-10 pruning by lunepack's
 # version precedence, the refusals, an injected upload failure and that no key or secret is printed.
-# Builds the lunepack CLI and runtime from $LUNEPACK_SRC (default: lunepack-rs beside this checkout)
+# Builds the lunepack CLI, runtime and UI from $LUNEPACK_SRC (default: lunepack-rs beside this checkout)
 # offline. Throwaway keys only; no network. macOS only (the runtime must be a Mach-O of the host).
 set -euo pipefail
 
@@ -32,9 +32,9 @@ pinned=$(sed -n 's/^lunepack = .*rev = "\([0-9a-f]*\)".*/\1/p' "$REPO/crates/whi
 have=$(git -C "$LUNEPACK_SRC" rev-parse HEAD 2>/dev/null || echo unknown)
 [ "$have" = "$pinned" ] || echo "test-publish-update: note: lunepack-rs is at $have, the app pins $pinned"
 TOOLS="$REPO/target/lunepack-tools"
-(cd "$LUNEPACK_SRC" && cargo build --quiet --offline --locked --release -p lunepack-cli -p lunepack-runtime --target-dir "$TOOLS")
+(cd "$LUNEPACK_SRC" && cargo build --quiet --offline --locked --release -p lunepack-cli -p lunepack-runtime -p lunepack-ui --target-dir "$TOOLS")
 BIN="$TOOLS/release"
-[ -x "$BIN/lunepack" ] && [ -x "$BIN/lunepack-runtime" ] || fail "the lunepack build left no binaries"
+[ -x "$BIN/lunepack" ] && [ -x "$BIN/lunepack-runtime" ] && [ -x "$BIN/lunepack-ui" ] || fail "the lunepack build left no binaries"
 
 # ---- a scratch world ---------------------------------------------------------------------------
 T=$(mktemp -d "${TMPDIR:-/tmp}/whipspot-publish-test.XXXXXX")
@@ -226,6 +226,80 @@ run pack "$TARGET" "$(make_app 0.2.12)" 0.2.12 || fail "pack 0.2.12"
 WHIPSPOT_R2_PUBLIC=whipspotr2:izzat-updates WHIPSPOT_R2_PRIVATE=whipspotr2:izzat-updates-publisher \
   refuse "an unreachable R2 remote" "no publisher state" publish 0.2.12
 [ -e "$T/r2-remote-defined" ] || fail "the rclone R2 remote was not defined from the environment"
+
+# ---- the keyless public feed: pack and setup read it over http, with no R2 key ------------------
+# A server that lists no directory (like the real bucket's domain) over a copy of the public bucket.
+command -v python3 >/dev/null || fail "python3 is not installed"
+cat >"$T/nolist.py" <<'PY'
+import functools, http.server, sys
+class H(http.server.SimpleHTTPRequestHandler):
+    def list_directory(self, path):
+        self.send_error(404, "no listing")
+    def log_message(self, *a):
+        pass
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(H, directory=sys.argv[1]))
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+python3 "$T/nolist.py" "$PUB" >"$T/http-port" 2>"$T/http-err" &
+HTTP_PID=$!
+trap 'kill "$HTTP_PID" 2>/dev/null || true; [ -n "${WHIPSPOT_TEST_KEEP:-}" ] || rm -rf "$T"' EXIT
+for _ in $(seq 1 50); do [ -s "$T/http-port" ] && break; sleep 0.1; done
+HTTP_PORT=$(head -n 1 "$T/http-port")
+[[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || fail "the test http server did not start"
+URL="http://127.0.0.1:$HTTP_PORT/"
+nokeys() { env -u R2_ACCOUNT_ID -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u WHIPSPOT_R2_PRIVATE \
+  WHIPSPOT_R2_PUBLIC="$URL" "$@"; }
+run_nokeys() { nokeys bash "$FAKE/scripts/publish-update.sh" "$@" >>"$LOG" 2>&1; }
+before_pub=$(snap "$PUB") before_priv=$(snap "$PRIV")
+set_app_version 0.2.12
+HTTP_PACKED="$T/packed-http"
+mkdir -p "$HTTP_PACKED"
+WHIPSPOT_PACKED="$HTTP_PACKED" run_nokeys pack "$TARGET" "$(make_app 0.2.12)" 0.2.12 || fail "pack over the public URL, without R2 keys"
+[ -f "$HTTP_PACKED/0.2.12/$TARGET.manifest.json" ] || fail "pack over the public URL wrote no manifest"
+compgen -G "$HTTP_PACKED/0.2.12/*.delta" >/dev/null || echo "test-publish-update: note: no delta over http (the fake app may be too small to patch)"
+WHIPSPOT_PACKED="$HTTP_PACKED" WHIPSPOT_DIST="$T/dist-http" run_nokeys setup "$TARGET" 0.2.12 || fail "setup over the public URL, without R2 keys"
+ls "$T/dist-http/"*.dmg >/dev/null 2>&1 || fail "setup over the public URL made no installer"
+[ "$(snap "$PUB")" = "$before_pub" ] && [ "$(snap "$PRIV")" = "$before_priv" ] || fail "a keyless run changed a bucket"
+[ ! -e "$FAKE/release/work" ] || fail "release/work was left behind"
+ok "pack and setup over the public URL without R2 keys"
+# A pack made that way is the one publish takes (local folders stand in for R2 here).
+WHIPSPOT_PACKED="$HTTP_PACKED" run publish 0.2.12 || fail "publish of the pack made over the URL"
+[ "$(feed_list | tr ' ' '\n' | tail -n 1)" = 0.2.12 ] || fail "the feed does not end with 0.2.12"
+ok "publish of a pack made over the URL"
+# Writers and other URLs are refused; a dead server fails closed (no key, no silent skip).
+refuse_nokeys() { # <what> <reason> <args...>
+  local what=$1 reason=$2 mark
+  shift 2
+  mark=$(wc -l <"$LOG")
+  if run_nokeys "$@"; then fail "$what: it did not refuse"; fi
+  tail -n +"$((mark + 1))" "$LOG" | grep -qF -- "$reason" || fail "$what: refused, but not with \"$reason\""
+  [ ! -e "$FAKE/release/work" ] || fail "$what: release/work was left behind"
+  ok "refused: $what"
+}
+set_app_version 0.2.12
+refuse_nokeys "publish to a URL" "cannot use a URL" publish 0.2.12
+refuse_nokeys "bootstrap to a URL" "cannot use a URL" bootstrap
+mark=$(wc -l <"$LOG")
+if env -u R2_ACCOUNT_ID -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u WHIPSPOT_R2_PRIVATE WHIPSPOT_R2_PUBLIC="http://127.0.0.1:1/" \
+  WHIPSPOT_PACKED="$T/packed-http2" bash "$FAKE/scripts/publish-update.sh" pack "$TARGET" "$(make_app 0.2.12)" 0.2.12 >>"$LOG" 2>&1; then
+  fail "a dead feed server: pack did not fail"
+fi
+tail -n +"$((mark + 1))" "$LOG" | grep -qF "cannot read the public bucket" || fail "a dead feed server: failed, but not closed with its own reason"
+[ ! -e "$FAKE/release/work" ] || fail "a dead feed server: release/work was left behind"
+ok "a dead feed server fails closed"
+for u in "http://example.com/" "https://example.com/x y" "https://ex'ample.com/"; do
+  mark=$(wc -l <"$LOG")
+  if WHIPSPOT_R2_PUBLIC="$u" bash "$FAKE/scripts/publish-update.sh" pack "$TARGET" "$(make_app 0.2.12)" 0.2.12 >>"$LOG" 2>&1; then fail "a public URL that is not a plain https host was accepted"; fi
+  tail -n +"$((mark + 1))" "$LOG" | grep -qF "not a plain https host" || fail "a bad public URL was refused for another reason"
+done
+ok "bad public URLs refused"
+# With the R2 remote as the public bucket, pack still needs the R2 keys (the control for the above).
+(unset R2_SECRET_ACCESS_KEY; WHIPSPOT_R2_PUBLIC=whipspotr2:izzat-updates bash "$FAKE/scripts/publish-update.sh" pack "$TARGET" "$(make_app 0.2.12)" 0.2.12 >>"$LOG" 2>&1) &&
+  fail "pack against R2 ran without R2 keys"
+kill "$HTTP_PID" 2>/dev/null || true
+wait "$HTTP_PID" 2>/dev/null || true
+check_siblings "keyless feed"
 
 # ---- nothing secret was printed ----------------------------------------------------------------
 check_absent() { # <what> <needle file>: the needle is in the file (control) and not in the log

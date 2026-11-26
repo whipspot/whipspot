@@ -8,11 +8,15 @@
 #   publish-update.sh publish <ver>                add <ver> to the stable feed, keep the newest 10
 #
 # Environment:
-#   WHIPSPOT_R2_PUBLIC    public bucket: an rclone path or a local folder (default whipspotr2:izzat-updates)
+#   WHIPSPOT_R2_PUBLIC    public bucket: an rclone path or a local folder (default whipspotr2:izzat-updates),
+#                         or the public feed's base URL (https://updates.izzat.dev/), which is read-only
+#                         and needs no key: pack and setup read it that way in CI, so the jobs that sign
+#                         hold no R2 key (publish and bootstrap refuse a URL)
 #   WHIPSPOT_R2_PRIVATE   private bucket, the publisher state (default whipspotr2:izzat-updates-publisher)
 #   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 #                         define the rclone remote `whipspotr2:` (S3 on R2) in the environment only,
-#                         used only when a bucket path starts with `whipspotr2:`
+#                         used only when a bucket the command touches starts with `whipspotr2:` (pack
+#                         and setup touch the public bucket only, publish and bootstrap both)
 #   LUNEPACK_RELEASE_KEY  the release key (PKCS#8 PEM), or WHIPSPOT_RELEASE_KEY_FILE naming its file
 #   WHIPSPOT_ROOT_KEY     bootstrap only: path of the new root key file (outside the repository)
 #   LUNEPACK              the lunepack CLI (default `lunepack` on PATH)
@@ -40,6 +44,18 @@ DIST=${WHIPSPOT_DIST:-$REPO/dist}
 
 die() { echo "publish-update: $*" >&2; exit 1; }
 say() { echo "publish-update: $*"; }
+
+# The public bucket as a URL: read through rclone's http backend (no listing, no key). Only https,
+# or http on 127.0.0.1 for the tests; nothing else can reach a connection string.
+PUBLIC_HTTP=0
+case "$PUBLIC" in
+  http://* | https://*)
+    [[ "$PUBLIC" =~ ^(https://[A-Za-z0-9.-]+(:[0-9]+)?|http://127\.0\.0\.1:[0-9]+)/?$ ]] ||
+      die "WHIPSPOT_R2_PUBLIC is a URL that is not a plain https host (or http://127.0.0.1:<port>)"
+    PUBLIC=":http,url='${BASH_REMATCH[1]}/':"
+    PUBLIC_HTTP=1
+    ;;
+esac
 
 # ---- checks -------------------------------------------------------------------------------------
 
@@ -99,8 +115,18 @@ bucket_ref() {
   BP="${bucket%/}/$rel"
 }
 
+# setup_rclone <pub|priv>...: the buckets the command touches. The R2 remote and its keys are
+# required only when one of those is an R2 path.
 setup_rclone() {
-  case "$PUBLIC$PRIVATE" in
+  local used="" b
+  for b in "$@"; do
+    case "$b" in
+      pub) used+=" $PUBLIC" ;;
+      priv) used+=" $PRIVATE" ;;
+      *) die "setup_rclone: unknown bucket $b" ;;
+    esac
+  done
+  case "$used" in
     *whipspotr2:*) ;;
     *) return 0 ;;
   esac
@@ -150,9 +176,31 @@ fetch_file() { # <@pub|@priv> <rel> <local file>
   rc copyto "$1:$2" "$3"
 }
 
+# Fetches @pub:<rel> to <local file>: 0 when fetched, 1 when the server has no such file; anything
+# else (a refused connection, a 403, a 5xx) is not "absent" and ends the script.
+fetch_optional() { # <rel> <local file>
+  local status=0
+  rc copyto "@pub:$1" "$2" 2>/dev/null || status=$?
+  case "$status" in
+    0) return 0 ;;
+    3 | 4) return 1 ;;
+    *) die "cannot read the public bucket (rclone exit $status)" ;;
+  esac
+}
+
 # keys.json, root-*.json and the channel's feed into $WORK/rel (the feed may be absent).
 fetch_trust_docs() {
   mkdir -p "$WORK/rel"
+  if [ "$PUBLIC_HTTP" = 1 ]; then
+    # A URL has no listing: the documents are fetched by name. The root documents are root-1.json,
+    # root-2.json, ... (a root rotation adds one); the first missing one ends the run.
+    local n=1
+    fetch_optional "$PREFIX/keys.json" "$WORK/rel/keys.json" ||
+      die "no $PREFIX/keys.json at the public feed; run bootstrap first"
+    fetch_optional "$PREFIX/feed-$CHANNEL.json" "$WORK/rel/feed-$CHANNEL.json" || true
+    while [ "$n" -le 64 ] && fetch_optional "$PREFIX/root-$n.json" "$WORK/rel/root-$n.json"; do n=$((n + 1)); done
+    return 0
+  fi
   rc copy "@pub:$PREFIX/keys.json" "$WORK/rel" 2>/dev/null ||
     die "no $PREFIX/keys.json in the public bucket; run bootstrap first"
   rc copy "@pub:$PREFIX/" "$WORK/rel" --max-depth 1 \
@@ -240,6 +288,7 @@ feed_file_versions() { # <feed file> [<target>]
 
 cmd_bootstrap() {
   local root_key=${WHIPSPOT_ROOT_KEY:-} rel_key=${WHIPSPOT_RELEASE_KEY_FILE:-} f app_id root_pub rel_pub
+  [ "$PUBLIC_HTTP" = 0 ] || die "bootstrap writes the public bucket: it cannot use a URL"
   [ -n "$root_key" ] || die "set WHIPSPOT_ROOT_KEY to the path of the new root key file"
   [ -n "$rel_key" ] || die "set WHIPSPOT_RELEASE_KEY_FILE to the path of the new release key file"
   for f in "$root_key" "$rel_key"; do
@@ -253,7 +302,7 @@ cmd_bootstrap() {
     die "release/lunepack.toml holds no root key placeholder: already bootstrapped"
   app_id=$(sed -n 's/^app_id = "\([a-z0-9._-]*\)"$/\1/p' "$CONFIG")
   [ -n "$app_id" ] || die "no app_id in release/lunepack.toml"
-  setup_rclone
+  setup_rclone pub priv
   if bucket_has @pub "$PREFIX" keys.json; then die "$PREFIX/keys.json already exists in the public bucket"; fi
   if bucket_has @priv "$PREFIX" lunepack-state.json; then die "$PREFIX/lunepack-state.json already exists in the private bucket"; fi
   lock_work
@@ -291,7 +340,7 @@ cmd_pack() {
   out="$PACKED/$version"
   [ ! -e "$out/$target.manifest.json" ] && [ ! -e "$out/$target.pack" ] || die "$version/$target is already packed"
   need_release_key
-  setup_rclone
+  setup_rclone pub
   lock_work
   fetch_trust_docs
   cfg=$(config_for "$target")
@@ -330,7 +379,7 @@ cmd_setup() {
   check_app_version "$version"
   check_no_placeholder
   [ -f "$PACKED/$version/$target.manifest.json" ] || die "$version/$target is not packed"
-  setup_rclone
+  setup_rclone pub
   lock_work
   fetch_trust_docs
   cfg=$(config_for "$target")
@@ -353,8 +402,9 @@ cmd_publish() {
   check_app_version "$version"
   check_no_placeholder
   ls "$PACKED/$version/"*.manifest.json >/dev/null 2>&1 || die "nothing packed for $version"
+  [ "$PUBLIC_HTTP" = 0 ] || die "publish writes the public bucket: it cannot use a URL"
   need_release_key
-  setup_rclone
+  setup_rclone pub priv
   lock_work
 
   # The publisher state: never rebuilt from the public bucket.
