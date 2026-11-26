@@ -103,8 +103,55 @@ pub enum UpdateStatus {
     },
     /// `version` is downloaded and staged: installing restarts into it.
     Ready { version: String },
-    /// The last step failed; `text` is one of [`texts`].
-    Failed { text: &'static str },
+    /// The last step failed; `text` is one of [`texts`]. `retry` is the step that can be taken
+    /// again without a new check (the offered version is still there, or the download is still
+    /// staged); `None` when only a new check helps.
+    Failed {
+        text: &'static str,
+        retry: Option<UpdateStep>,
+    },
+    /// The staged update was handed over to be installed: the front-end ends the app, and the
+    /// new version starts in its place. Nothing else is accepted from here.
+    Restarting,
+}
+
+/// What `InstallUpdate` does next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateStep {
+    /// Download and stage `version`.
+    Download { version: String },
+    /// Install the staged `version` and restart.
+    Install { version: String },
+}
+
+impl UpdateStatus {
+    /// The step `InstallUpdate` takes in this status, when it takes one: an offered version is
+    /// downloaded, a staged one installed, and a failed step is taken again. The one rule the
+    /// core and every front-end's install button follow.
+    pub fn next_step(&self) -> Option<UpdateStep> {
+        match self {
+            UpdateStatus::Available { version } => Some(UpdateStep::Download {
+                version: version.clone(),
+            }),
+            UpdateStatus::Ready { version } => Some(UpdateStep::Install {
+                version: version.clone(),
+            }),
+            UpdateStatus::Failed { retry, .. } => retry.clone(),
+            _ => None,
+        }
+    }
+
+    /// Whether `CheckForUpdate` starts a check in this status (nothing is running, and nothing
+    /// is staged to install): the one rule the core and the "Check now" button follow.
+    pub fn can_check(&self) -> bool {
+        match self {
+            UpdateStatus::Idle | UpdateStatus::UpToDate { .. } => true,
+            UpdateStatus::Failed { retry, .. } => {
+                !matches!(retry, Some(UpdateStep::Install { .. }))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Updates the running app. Held as `Arc<dyn Updater>` by the player.
@@ -125,7 +172,10 @@ pub trait Updater: Send + Sync {
         progress: &dyn Fn(u64, u64),
         cancel: &CancelFlag,
     ) -> Result<(), UpdateError>;
-    /// Install the staged update and restart the app. Returns only when it did not restart.
+    /// Hand the staged update over to be installed once this app has ended, and return `Ok`
+    /// without ending the process: the player puts up [`UpdateStatus::Restarting`] and the
+    /// front-end leaves its loop the normal way, so settings are saved and the output released.
+    /// The installer waits for the app to end. `Err` when it could not be handed over.
     fn apply_and_restart(&self) -> Result<(), UpdateError>;
 }
 

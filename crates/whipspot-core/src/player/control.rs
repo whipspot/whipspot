@@ -91,7 +91,7 @@ pub(crate) enum Internal {
     },
     /// The updater's `download` ended.
     UpdateDownloaded(Result<(), UpdateError>),
-    /// The updater's `apply_and_restart` returned (it did not restart, or failed).
+    /// The updater's `apply_and_restart` returned (handed over, or failed).
     UpdateApplied(Result<(), UpdateError>),
 }
 

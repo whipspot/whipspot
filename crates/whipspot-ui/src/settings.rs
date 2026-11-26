@@ -20,7 +20,7 @@ use whipspot_core::folders::ScanStatus;
 use whipspot_core::player::{EqState, PlayerAction, PlayerHandle, PlayerState, ProviderEntry};
 use whipspot_core::provider::model::LoginState;
 use whipspot_core::text::display_text;
-use whipspot_core::update::UpdateStatus;
+use whipspot_core::update::{UpdateStatus, UpdateStep};
 
 use crate::StreamQuality;
 use crate::draw::{
@@ -1093,26 +1093,25 @@ pub(crate) fn update_line(status: &UpdateStatus) -> String {
             }
         }
         UpdateStatus::Ready { .. } => "Ready to restart".to_owned(),
-        UpdateStatus::Failed { text } => (*text).to_owned(),
+        UpdateStatus::Failed { text, .. } => (*text).to_owned(),
+        UpdateStatus::Restarting => "Restarting\u{2026}".to_owned(),
     }
 }
 
-/// Whether "Check now" works in `status`: nothing runs and the copy can update.
+/// Whether "Check now" works in `status`: the core's own rule, so the button is never live
+/// while the core would ignore it.
 pub(crate) fn update_check_enabled(status: &UpdateStatus) -> bool {
-    matches!(
-        status,
-        UpdateStatus::Idle | UpdateStatus::UpToDate { .. } | UpdateStatus::Failed { .. }
-    )
+    status.can_check()
 }
 
-/// The label of the install button in `status`, when there is one: an offered version is
-/// downloaded first, a staged one is installed by restarting.
+/// The label of the install button in `status`, when there is one: what the core's
+/// `InstallUpdate` does next (an offered version is downloaded first, a staged one is installed
+/// by restarting; after a failure the same step again).
 pub(crate) fn update_install_label(status: &UpdateStatus) -> Option<&'static str> {
-    match status {
-        UpdateStatus::Available { .. } => Some("Download update"),
-        UpdateStatus::Ready { .. } => Some("Install and restart"),
-        _ => None,
-    }
+    status.next_step().map(|step| match step {
+        UpdateStep::Download { .. } => "Download update",
+        UpdateStep::Install { .. } => "Install and restart",
+    })
 }
 
 /// A button that does nothing: the same pill as a live secondary one, dimmed.
@@ -1302,10 +1301,12 @@ mod tests {
         );
         assert_eq!(
             update_line(&UpdateStatus::Failed {
-                text: whipspot_core::update::texts::NETWORK
+                text: whipspot_core::update::texts::NETWORK,
+                retry: None,
             }),
             whipspot_core::update::texts::NETWORK
         );
+        assert_eq!(update_line(&UpdateStatus::Restarting), "Restarting\u{2026}");
     }
 
     #[test]
@@ -1314,7 +1315,20 @@ mod tests {
         let up = UpdateStatus::UpToDate {
             checked_at: SystemTime::UNIX_EPOCH,
         };
-        let failed = UpdateStatus::Failed { text: "x" };
+        let failed = UpdateStatus::Failed {
+            text: "x",
+            retry: None,
+        };
+        // The retry the core's `InstallUpdate` takes again: a failed download downloads, a
+        // failed apply installs (and there "Check now" stays dim, as in the core).
+        let failed_download = UpdateStatus::Failed {
+            text: "x",
+            retry: Some(UpdateStep::Download { version: v() }),
+        };
+        let failed_install = UpdateStatus::Failed {
+            text: "x",
+            retry: Some(UpdateStep::Install { version: v() }),
+        };
         let available = UpdateStatus::Available { version: v() };
         let downloading = UpdateStatus::Downloading {
             version: v(),
@@ -1328,6 +1342,9 @@ mod tests {
             (UpdateStatus::Checking, false, None),
             (up, true, None),
             (failed, true, None),
+            (failed_download, true, Some("Download update")),
+            (failed_install, false, Some("Install and restart")),
+            (UpdateStatus::Restarting, false, None),
             (available, false, Some("Download update")),
             (downloading, false, None),
             (ready, false, Some("Install and restart")),

@@ -37,6 +37,7 @@ use lune_ui::ui::Ui;
 use lune_ui::window::{glass_attributes, panel_attributes};
 use whipspot_core::player::{PlayerAction, PlayerHandle};
 use whipspot_core::skin::{PanelWindows, ScreenPoint};
+use whipspot_core::update::UpdateStatus;
 use whipspot_ui::skin::{
     FrontChange, OPEN_FAILED, PanelPlan, SkinStatus, SkinUi, pixel_scale, trace,
 };
@@ -1441,6 +1442,12 @@ impl<'p, 'a> ApplicationHandler<HostEvent> for App<'p, 'a> {
                 }
                 self.poll_front(event_loop);
                 self.set_flow(event_loop);
+                // An update was handed over to be installed: leave the loop like a Quit, so the
+                // settings are saved and everything is released before the installer swaps the
+                // version.
+                if self.player.state().update == UpdateStatus::Restarting {
+                    event_loop.exit();
+                }
             }
             HostEvent::Tray(click) => {
                 if let Some(tray) = &mut self.tray

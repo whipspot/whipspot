@@ -367,10 +367,6 @@ impl Player {
                 Some(_) => update::UpdateStatus::Idle,
                 None => update::UpdateStatus::Unavailable,
             },
-            app_version: config
-                .updater
-                .as_ref()
-                .map_or_else(String::new, |u| u.current_version().to_owned()),
             update_check: config.update_check,
         };
         let shared = Arc::new(Shared {

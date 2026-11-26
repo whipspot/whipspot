@@ -15,7 +15,8 @@ use super::Shared;
 use super::control::Internal;
 use super::state::PlayerState;
 use crate::update::{
-    CHECK_EVERY, CancelFlag, FIRST_CHECK_AFTER, UpdateError, UpdateOffer, UpdateStatus, Updater,
+    CHECK_EVERY, CancelFlag, FIRST_CHECK_AFTER, UpdateError, UpdateOffer, UpdateStatus, UpdateStep,
+    Updater,
 };
 
 /// What [`super::PlayerConfig`] hands the flow.
@@ -81,15 +82,9 @@ impl Updates {
         self.shared.update(|s| s.update = status);
     }
 
-    /// Whether a check may start now: nothing runs, nothing is offered or staged, and the copy
-    /// can update.
+    /// Whether a check may start now: nothing runs and the status allows one.
     fn can_check(&self) -> bool {
-        !self.busy
-            && match self.status() {
-                UpdateStatus::Idle | UpdateStatus::UpToDate { .. } => true,
-                UpdateStatus::Failed { .. } => !self.staged,
-                _ => false,
-            }
+        !self.busy && self.status().can_check()
     }
 
     /// `CheckForUpdate`.
@@ -114,15 +109,10 @@ impl Updates {
         if self.busy {
             return;
         }
-        let ready = match self.status() {
-            UpdateStatus::Ready { .. } => true,
-            UpdateStatus::Available { .. } | UpdateStatus::Failed { .. } => self.staged,
-            _ => return,
-        };
-        if ready {
-            self.apply();
-        } else if self.offer.is_some() {
-            self.download();
+        match self.status().next_step() {
+            Some(UpdateStep::Install { .. }) => self.apply(),
+            Some(UpdateStep::Download { .. }) => self.download(),
+            None => {}
         }
     }
 
@@ -205,7 +195,18 @@ impl Updates {
         if error == UpdateError::Unavailable {
             self.unavailable();
         } else {
-            self.set_status(UpdateStatus::Failed { text: error.text() });
+            // What a second `InstallUpdate` may take again: installing when the download is
+            // staged, downloading while the offer stands.
+            let version = self.offer.as_ref().map(|o| o.version.clone());
+            let retry = match version {
+                Some(version) if self.staged => Some(UpdateStep::Install { version }),
+                Some(version) => Some(UpdateStep::Download { version }),
+                None => None,
+            };
+            self.set_status(UpdateStatus::Failed {
+                text: error.text(),
+                retry,
+            });
         }
     }
 
@@ -257,10 +258,11 @@ impl Updates {
 
     pub(crate) fn on_applied(&mut self, result: Result<(), UpdateError>) {
         self.busy = false;
-        // Ok without a restart (a fake, or an installer that left the app running): the update
-        // stays staged and Ready.
-        if let Err(e) = result {
-            self.failed(e);
+        // Handed over: the app is about to end and the installer waits for that. The status
+        // accepts nothing more, so a second click cannot hand over a second time.
+        match result {
+            Ok(()) => self.set_status(UpdateStatus::Restarting),
+            Err(e) => self.failed(e),
         }
     }
 }

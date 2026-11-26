@@ -120,8 +120,6 @@ pub struct PlayerState {
     pub power: PowerStatus,
     /// Where the app's own update stands (`Unavailable` without an updater).
     pub update: UpdateStatus,
-    /// The running version's text, as the updater reports it (empty without an updater).
-    pub app_version: String,
     /// Scheduled update checks are on (the setting; a manual check works either way).
     pub update_check: bool,
 }

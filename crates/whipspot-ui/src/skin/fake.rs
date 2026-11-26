@@ -164,7 +164,6 @@ pub(crate) fn player_state() -> PlayerState {
         remote: None,
         power: Default::default(),
         update: Default::default(),
-        app_version: String::new(),
         update_check: true,
     }
 }

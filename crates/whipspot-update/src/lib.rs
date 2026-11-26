@@ -203,10 +203,11 @@ impl Updater for LunepackUpdater {
             ..ApplyOptions::default()
         })
         .map_err(|e| map_error(&e))?;
-        // The runtime waits for this process to end, then swaps the version and starts the new
-        // one: leave now. Nothing the app holds needs a clean close (settings are written at
-        // each change that matters, the output device is the OS's to release).
-        std::process::exit(0)
+        // The applier is scheduled and waits for this process to end (up to its own limit), then
+        // swaps the version and starts the new one. The process is not ended here: the player
+        // shows `Restarting`, the host leaves its loop as on a quit, and `main` saves the
+        // settings and returns.
+        Ok(())
     }
 }
 

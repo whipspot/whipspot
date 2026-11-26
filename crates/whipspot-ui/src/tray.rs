@@ -15,7 +15,7 @@ use lune_ui::widgets::menu::{MenuItem, MenuRow};
 use lune_ui::widgets::tone::Tone;
 use whipspot_core::player::{PlayState, PlayerAction, PlayerHandle, PlayerState};
 use whipspot_core::text::display_text;
-use whipspot_core::update::UpdateStatus;
+use whipspot_core::update::{UpdateStatus, UpdateStep};
 
 use crate::settings::current_skin;
 use crate::skin::{SkinLibrary, SkinStatus};
@@ -43,19 +43,18 @@ const NOTHING_PLAYING_HINT: &str = "Choose something to play";
 const TIP_TRACK_CHARS: usize = 60;
 const TIP_ARTIST_CHARS: usize = 40;
 
-/// The update row's label while an update is offered or staged.
+/// The update row's label while an update is offered or staged, or its last step failed and
+/// can be taken again (what `InstallUpdate` does next, the same rule as the About card's button).
 fn update_row_text(status: &UpdateStatus) -> Option<String> {
-    match status {
-        UpdateStatus::Available { version } => Some(format!(
-            "Update to {}",
-            display_text(version, UPDATE_VERSION_CHARS)
-        )),
-        UpdateStatus::Ready { version } => Some(format!(
+    status.next_step().map(|step| match step {
+        UpdateStep::Download { version } => {
+            format!("Update to {}", display_text(&version, UPDATE_VERSION_CHARS))
+        }
+        UpdateStep::Install { version } => format!(
             "Restart to update to {}",
-            display_text(version, UPDATE_VERSION_CHARS)
-        )),
-        _ => None,
-    }
+            display_text(&version, UPDATE_VERSION_CHARS)
+        ),
+    })
 }
 
 /// Characters of a version text kept in the update row before the width cut.
@@ -661,7 +660,6 @@ mod tests {
             remote: None,
             power: Default::default(),
             update: Default::default(),
-            app_version: String::new(),
             update_check: true,
         }
     }
@@ -733,7 +731,11 @@ mod tests {
             UpdateStatus::Unavailable,
             UpdateStatus::Idle,
             UpdateStatus::Checking,
-            UpdateStatus::Failed { text: "x" },
+            UpdateStatus::Failed {
+                text: "x",
+                retry: None,
+            },
+            UpdateStatus::Restarting,
         ] {
             st.update = quiet;
             let rows = m.rows(&st);
@@ -766,6 +768,21 @@ mod tests {
         };
         let rows = m.rows(&st);
         assert!(!disabled(&rows, "Restart to update to 0.3.0"));
+        // A failed step that can be taken again keeps its row.
+        st.update = UpdateStatus::Failed {
+            text: "x",
+            retry: Some(UpdateStep::Download {
+                version: "0.3.0".into(),
+            }),
+        };
+        assert!(!disabled(&m.rows(&st), "Update to 0.3.0"));
+        st.update = UpdateStatus::Failed {
+            text: "x",
+            retry: Some(UpdateStep::Install {
+                version: "0.3.0".into(),
+            }),
+        };
+        assert!(!disabled(&m.rows(&st), "Restart to update to 0.3.0"));
     }
 
     #[test]

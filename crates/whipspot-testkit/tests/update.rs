@@ -12,7 +12,8 @@ use whipspot_core::player::{
 };
 use whipspot_core::provider::ProviderRegistry;
 use whipspot_core::update::{
-    CHECK_EVERY, FIRST_CHECK_AFTER, UpdateError, UpdateOffer, UpdateStatus, Updater, texts,
+    CHECK_EVERY, FIRST_CHECK_AFTER, UpdateError, UpdateOffer, UpdateStatus, UpdateStep, Updater,
+    texts,
 };
 use whipspot_testkit::{FakeOutput, FakeProvider, FakeUpdater, UpdateCall};
 
@@ -93,16 +94,34 @@ fn ready(v: &str) -> UpdateStatus {
 }
 
 fn failed(text: &'static str) -> UpdateStatus {
-    UpdateStatus::Failed { text }
+    UpdateStatus::Failed { text, retry: None }
+}
+
+fn failed_retrying(text: &'static str, retry: UpdateStep) -> UpdateStatus {
+    UpdateStatus::Failed {
+        text,
+        retry: Some(retry),
+    }
+}
+
+fn download_step(v: &str) -> UpdateStep {
+    UpdateStep::Download {
+        version: v.to_owned(),
+    }
+}
+
+fn install_step(v: &str) -> UpdateStep {
+    UpdateStep::Install {
+        version: v.to_owned(),
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_state_starts_idle_with_the_updaters_version() {
+async fn the_state_starts_idle() {
     let u = Arc::new(FakeUpdater::new("1.2.3"));
     let h = with_updater(&u, true);
     let s = h.state();
     assert_eq!(s.update, UpdateStatus::Idle);
-    assert_eq!(s.app_version, "1.2.3");
     assert!(s.update_check);
     assert!(u.calls().is_empty());
 }
@@ -156,8 +175,8 @@ async fn the_status_walks_idle_checking_up_to_date_or_available_downloading_read
             UpdateCall::Apply
         ]
     );
-    // The fake did not restart: the update stays staged.
-    assert_eq!(h.state().update, ready("1.1.0"));
+    // Handed over: the status accepts nothing more and the front-end ends the app.
+    status(&h, "restarting", UpdateStatus::Restarting).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -175,7 +194,12 @@ async fn failures_show_their_fixed_texts() {
 
     u.script_download(Err(UpdateError::Verify));
     h.dispatch(PlayerAction::InstallUpdate);
-    status(&h, "download failed", failed(texts::VERIFY)).await;
+    status(
+        &h,
+        "download failed",
+        failed_retrying(texts::VERIFY, download_step("2.0.0")),
+    )
+    .await;
 
     // Install after a failed download tries the same offer again.
     u.script_download(Ok(()));
@@ -184,12 +208,15 @@ async fn failures_show_their_fixed_texts() {
 
     u.script_apply(Err(UpdateError::Other));
     h.dispatch(PlayerAction::InstallUpdate);
-    status(&h, "apply failed", failed(texts::OTHER)).await;
-
-    // Install after a failed apply applies again; a Check does not drop the staged update.
+    let apply_failed = failed_retrying(texts::OTHER, install_step("2.0.0"));
+    status(&h, "apply failed", apply_failed.clone()).await;
+    // The status offers the install again and no check; a Check does not drop the staged update.
+    assert_eq!(apply_failed.next_step(), Some(install_step("2.0.0")));
+    assert!(!apply_failed.can_check());
     h.dispatch(PlayerAction::CheckForUpdate);
     settle().await;
-    assert_eq!(h.state().update, failed(texts::OTHER));
+    assert_eq!(h.state().update, apply_failed);
+    // Install after a failed apply applies again.
     h.dispatch(PlayerAction::InstallUpdate);
     until(&h, "second apply", |_| {
         u.calls()
@@ -262,6 +289,7 @@ async fn a_second_action_while_one_runs_is_ignored() {
     );
 
     // And during the apply: the status stays Ready, so only the running call stops a second one.
+    // Once it returned, Restarting takes no more.
     u.hold(true);
     h.dispatch(PlayerAction::InstallUpdate);
     until(&h, "apply running", |_| {
@@ -279,7 +307,19 @@ async fn a_second_action_while_one_runs_is_ignored() {
         .filter(|c| **c == UpdateCall::Apply)
         .count();
     assert_eq!(applies, 1, "apply called once");
-    assert_eq!(h.state().update, ready("1.1.0"));
+    assert_eq!(h.state().update, UpdateStatus::Restarting);
+    h.dispatch(PlayerAction::InstallUpdate);
+    h.dispatch(PlayerAction::CheckForUpdate);
+    settle().await;
+    assert_eq!(h.state().update, UpdateStatus::Restarting);
+    assert_eq!(
+        u.calls()
+            .iter()
+            .filter(|c| **c == UpdateCall::Apply)
+            .count(),
+        1,
+        "no second apply once restarting"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -287,7 +327,6 @@ async fn a_copy_that_cannot_update_stays_unavailable_and_asks_no_more() {
     // No updater wired: every action leaves the state alone.
     let h = start(PlayerConfig::default());
     assert_eq!(h.state().update, UpdateStatus::Unavailable);
-    assert_eq!(h.state().app_version, "");
     let revision = h.state().revision;
     h.dispatch(PlayerAction::CheckForUpdate);
     h.dispatch(PlayerAction::InstallUpdate);
