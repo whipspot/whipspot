@@ -161,8 +161,11 @@ jobs:
           path: dist/lunepack-tools
           if-no-files-found: error
 
-  # Builds the app. cargo runs here, so there is no secret and no environment in this job. The
-  # bundle goes out as a tar (an artifact zip drops the executable bits); pack-macos checks it.
+  # Builds the app. cargo runs here, so there is no secret and no environment in this job. No build
+  # cache either: ci.yml writes main's caches from jobs that also compile dev-dependencies, test
+  # binaries and CI tools the release never builds, and a cache restored here could carry code from
+  # them into the signed app. A clean build every time. The bundle goes out as a tar (an artifact
+  # zip drops the executable bits); pack-macos checks it.
   build-macos:
     needs: [version]
     runs-on: macos-latest
@@ -170,7 +173,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build dist/Whipspot.app (universal, unsealed for lunepack)
         run: bash scripts/package-macos.sh --arch universal --unsealed
       - name: Tar the bundle
@@ -192,7 +194,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build
         shell: bash
         run: cargo build --release --locked -p whipspot-app

@@ -320,9 +320,17 @@ done
 if grep -q "/whipspot/root-1.json " "$T/roots-requests.log"; then fail "the keyless fetch asked for root-1.json (the config's root is never published)"; fi
 if grep -q "/whipspot/root-5.json " "$T/roots-requests.log"; then fail "the keyless fetch walked past the first missing root document"; fi
 ok "the keyless fetch walks root-2, root-3, ... from the config's root version + 1"
-# With the R2 remote as the public bucket, pack still needs the R2 keys (the control for the above).
-(unset R2_SECRET_ACCESS_KEY; WHIPSPOT_R2_PUBLIC=whipspotr2:izzat-updates bash "$FAKE/scripts/publish-update.sh" pack "$TARGET" "$(make_app 0.2.12)" 0.2.12 >>"$LOG" 2>&1) &&
+# Control: with the R2 remote as the public bucket, pack still needs the R2 keys. A fresh packed
+# folder and the app's current version, so the run gets as far as the key check and no earlier
+# refusal can stand in for it.
+mark=$(wc -l <"$LOG")
+if (unset R2_SECRET_ACCESS_KEY; WHIPSPOT_PACKED="$T/packed-r2" WHIPSPOT_R2_PUBLIC=whipspotr2:izzat-updates \
+  bash "$FAKE/scripts/publish-update.sh" pack "$TARGET" "$(make_app 0.2.13)" 0.2.13 >>"$LOG" 2>&1); then
   fail "pack against R2 ran without R2 keys"
+fi
+tail -n +"$((mark + 1))" "$LOG" | grep -qF "set R2_ACCOUNT_ID" || fail "pack against R2 without keys was refused, but not for the missing R2 keys"
+[ ! -e "$FAKE/release/work" ] || fail "pack against R2 without keys left release/work behind"
+ok "pack against R2 without R2 keys is refused for the keys"
 kill "$HTTP_PID" 2>/dev/null || true
 wait "$HTTP_PID" 2>/dev/null || true
 check_siblings "keyless feed"
