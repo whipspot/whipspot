@@ -29,9 +29,20 @@ channel = "stable"
 
 [install]
 # The Windows layout. A macOS pack uses a copy of this file that publish-update.sh writes beside
-# it with entry = "Contents/MacOS/Whipspot" (lunepack.toml has one entry for every target).
+# it with entry = "Contents/MacOS/Whipspot" and icon = "Contents/Resources/whipspot-256.png"
+# (lunepack.toml has one entry and one icon for every target). The icon must be a file of the packed
+# tree: scripts/package-macos.sh puts it in the bundle, `publish-update.sh pack` adds it to a tree
+# that lacks it. Made by scripts/make-icons.sh from the SVG masters.
 entry = "whipspot.exe"
+icon = "whipspot-256.png"
 name = "Whipspot"
 publisher = "Whipspot"
 comment = "A desktop music player"
 categories = ["AudioVideo", "Audio", "Player"]
+
+# Inputs of the installers' stamping (not part of any signed document), relative to this file.
+[windows]
+icon = "../assets/icon/whipspot.ico"
+
+[macos]
+icon = "../assets/icon/whipspot.icns"

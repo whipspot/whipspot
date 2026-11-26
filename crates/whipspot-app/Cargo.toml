@@ -59,3 +59,6 @@ png = "0.18"
 # `[workspace.lints]`.
 [lints.rust]
 unsafe_code = "deny"
+
+[build-dependencies]
+winresource = "0.1"

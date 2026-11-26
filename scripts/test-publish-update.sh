@@ -44,6 +44,8 @@ mkdir -p "$FAKE/scripts" "$FAKE/release" "$FAKE/crates/whipspot-app" "$PUB" "$PR
 chmod 700 "$KEYS"
 cp "$REPO/scripts/publish-update.sh" "$FAKE/scripts/"
 cp "$REPO/release/lunepack.toml" "$FAKE/release/"
+mkdir -p "$FAKE/assets"
+cp -R "$REPO/assets/icon" "$FAKE/assets/icon"
 set_app_version() { printf '[package]\nname = "whipspot-app"\nversion = "%s"\nedition = "2024"\n' "$1" >"$FAKE/crates/whipspot-app/Cargo.toml"; }
 set_app_version 0.0.0
 

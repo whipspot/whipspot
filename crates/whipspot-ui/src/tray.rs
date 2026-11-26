@@ -496,18 +496,18 @@ pub fn is_current(status: &SkinStatus, name: &str) -> bool {
 
 /// The icon's grid, in units; the picture is this scaled to the requested size.
 const GRID: f32 = 16.0;
-/// The square: inset half a unit, corner radius 3.5.
+/// The square: inset half a unit, corner radius 3.5 (the master's 1 and 7 on its 32 grid).
 const SQUARE_INSET: f32 = 0.5;
 const SQUARE_RADIUS: f32 = 3.5;
-/// The gradient's top and bottom (theme A's ramp: 40 % of the way from its first to its second
-/// stop, and its first stop).
-const TOP: [f32; 3] = [32.0, 158.0, 134.0];
-const BOTTOM: [f32; 3] = [22.0, 122.0, 106.0];
-/// The bars: left unit, height in units; all 2 wide, bottoms at unit 13, top corners 0.5.
-const BARS: [(f32, f32); 3] = [(3.0, 6.0), (7.0, 9.0), (11.0, 4.0)];
-const BAR_W: f32 = 2.0;
-const BAR_BOTTOM: f32 = 13.0;
-const BAR_RADIUS: f32 = 0.5;
+/// The gradient's top and bottom: the app icon's teal, #2DB898 to #11665A.
+const TOP: [f32; 3] = [45.0, 184.0, 152.0];
+const BOTTOM: [f32; 3] = [17.0, 102.0, 90.0];
+/// The bars, the small master's (assets/icon/whipspot-small.svg, a 32 grid, halved): left unit and
+/// height in units for tall, mid and tall; all 2.5 wide, bottoms at unit 12.5, fully rounded ends.
+const BARS: [(f32, f32); 3] = [(3.0, 9.0), (6.75, 6.0), (10.5, 9.0)];
+const BAR_W: f32 = 2.5;
+const BAR_BOTTOM: f32 = 12.5;
+const BAR_RADIUS: f32 = BAR_W / 2.0;
 /// Samples per pixel side for the coverage.
 const SAMPLES: u32 = 8;
 
@@ -539,7 +539,8 @@ fn in_rounded(x: f32, y: f32, r: (f32, f32, f32, f32), top: f32, bottom: f32) ->
 }
 
 /// The tray icon as `size` x `size` straight-alpha RGBA, drawn by code: a rounded teal square with
-/// three white bars (D9). Edges are anti-aliased by coverage (8 x 8 samples a pixel).
+/// three white bars, tall, mid, tall: the small master of the app icon (D9). Edges are
+/// anti-aliased by coverage (8 x 8 samples a pixel).
 pub fn icon_rgba(size: u32) -> Vec<u8> {
     let size = size.max(1);
     let unit = GRID / size as f32;
@@ -567,7 +568,7 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
                             y,
                             (left, BAR_BOTTOM - height, left + BAR_W, BAR_BOTTOM),
                             BAR_RADIUS,
-                            0.0,
+                            BAR_RADIUS,
                         )
                     });
                     if bar {
@@ -1063,6 +1064,33 @@ mod tests {
         let [r, g, b, a] = at(12, 22);
         assert_eq!(a, 255);
         assert!(g > r && b < g, "{r} {g} {b}");
+    }
+
+    #[test]
+    fn tray_icon_has_three_bars_tall_mid_tall_on_the_teal_gradient() {
+        let size = 64u32;
+        let px = icon_rgba(size);
+        let at = |x: u32, y: u32| {
+            let i = ((y * size + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let white = |x, y| at(x, y) == [255, 255, 255, 255];
+        // A row through the bars' middle: exactly three white runs.
+        let y = 40; // grid unit 10.1
+        let runs = (0..size)
+            .filter(|&x| white(x, y) && (x == 0 || !white(x - 1, y)))
+            .count();
+        assert_eq!(runs, 3);
+        // Tall bars reach unit 3.5, the mid bar only 6.5: pixel row 20 (unit 5) is white in the
+        // first and third bars and the gradient in the middle one.
+        assert!(white(14, 20) && white(46, 20), "outer bars");
+        assert!(!white(32, 20), "mid bar is shorter");
+        // The gradient runs from #2DB898 at the top to #11665A at the bottom.
+        let top = at(32, 3);
+        let bottom = at(32, 60);
+        assert!(top[0] > bottom[0] && top[1] > bottom[1] && top[2] > bottom[2]);
+        assert!(top[1].abs_diff(184) <= 10, "{top:?}");
+        assert!(bottom[1].abs_diff(102) <= 10, "{bottom:?}");
     }
 
     #[test]

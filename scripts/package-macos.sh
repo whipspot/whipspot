@@ -24,12 +24,17 @@ done
 
 app=dist/Whipspot.app
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 if [ "${#bins[@]}" -gt 1 ]; then
   lipo -create -output "$app/Contents/MacOS/Whipspot" "${bins[@]}"
 else
   cp "${bins[0]}" "$app/Contents/MacOS/Whipspot"
 fi
+
+# The app icon (scripts/make-icons.sh), and the PNG lunepack names as install.icon (release/lunepack.toml);
+# both go in before the signature so the seal covers them.
+cp assets/icon/whipspot.icns "$app/Contents/Resources/Whipspot.icns"
+cp assets/icon/whipspot-256.png "$app/Contents/Resources/whipspot-256.png"
 
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -40,6 +45,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Whipspot</string>
   <key>CFBundleIdentifier</key><string>io.github.whipspot</string>
   <key>CFBundleExecutable</key><string>Whipspot</string>
+  <key>CFBundleIconFile</key><string>Whipspot.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${version}</string>
   <key>CFBundleVersion</key><string>${version}</string>

@@ -166,7 +166,16 @@ lock_work() {
   trap 'rm -rf "$WORK" "$MACOS_CONFIG"' EXIT
 }
 
-# The config for a target: a macOS bundle's entry is Contents/MacOS/Whipspot.
+# The icon file of the packed tree: a PNG at the root for Windows, inside the bundle for macOS.
+icon_rel_for() {
+  case "$1" in
+    windows-*) printf '%s' "whipspot-256.png" ;;
+    macos-*) printf '%s' "Contents/Resources/whipspot-256.png" ;;
+  esac
+}
+
+# The config for a target: a macOS bundle's entry is Contents/MacOS/Whipspot and its icon sits in
+# Contents/Resources.
 config_for() {
   case "$1" in
     windows-*) printf '%s' "$CONFIG" ;;
@@ -174,10 +183,28 @@ config_for() {
       local n
       n=$(grep -c '^entry = "whipspot.exe"$' "$CONFIG" || true)
       [ "$n" = 1 ] || die "release/lunepack.toml has no single [install] entry line to adapt for macOS"
-      sed 's|^entry = "whipspot.exe"$|entry = "Contents/MacOS/Whipspot"|' "$CONFIG" >"$MACOS_CONFIG"
+      n=$(grep -c '^icon = "whipspot-256.png"$' "$CONFIG" || true)
+      [ "$n" = 1 ] || die "release/lunepack.toml has no single [install] icon line to adapt for macOS"
+      sed -e 's|^entry = "whipspot.exe"$|entry = "Contents/MacOS/Whipspot"|' \
+        -e "s|^icon = \"whipspot-256.png\"\$|icon = \"$(icon_rel_for "$1")\"|" "$CONFIG" >"$MACOS_CONFIG"
       printf '%s' "$MACOS_CONFIG"
       ;;
   esac
+}
+
+# The tree to pack: the input itself when it holds the install icon, else a copy of it with the
+# icon added (the input is never changed). Prints the tree's path.
+tree_with_icon() {
+  local target=$1 input=$2 rel src="$REPO/assets/icon/whipspot-256.png"
+  rel=$(icon_rel_for "$target")
+  if [ -f "$input/$rel" ] && [ ! -L "$input/$rel" ]; then printf '%s' "$input"; return; fi
+  [ ! -e "$input/$rel" ] || die "the install icon in the input is not a regular file"
+  [ -f "$src" ] && [ ! -L "$src" ] || die "assets/icon/whipspot-256.png is missing (scripts/make-icons.sh makes it)"
+  mkdir -p "$WORK/tree"
+  cp -Rp "$input/." "$WORK/tree/"
+  mkdir -p "$WORK/tree/$(dirname "$rel")"
+  cp "$src" "$WORK/tree/$rel"
+  printf '%s' "$WORK/tree"
 }
 
 lp() { "$LUNEPACK" "$@"; }
@@ -268,6 +295,7 @@ cmd_pack() {
   lock_work
   fetch_trust_docs
   cfg=$(config_for "$target")
+  input=$(tree_with_icon "$target" "$input")
 
   # The previous release of this target, for a delta (D7: from the previous version only).
   prev=$(feed_file_versions "$WORK/rel/feed-$CHANNEL.json" "$target") || die "cannot read the $CHANNEL feed"
