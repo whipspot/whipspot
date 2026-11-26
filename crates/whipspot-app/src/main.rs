@@ -41,6 +41,7 @@ use whipspot_ui::skin::{SavedLayout, SavedPanel, SkinLibrary, SkinPrefs, SkinRep
 use whipspot_ui::theme::ThemeId;
 use whipspot_ui::tray::TrayMenu;
 use whipspot_ui::{DiagnosticsUi, NativeUi, ProviderChoice, StreamQuality, Tab, UiPrefs};
+use whipspot_update::{LunepackUpdater, Start};
 use whipspot_ytmusic::http::ReqwestHttp;
 use whipspot_ytmusic::run::ProcessRunner;
 use whipspot_ytmusic::tools::ToolEnv;
@@ -63,6 +64,13 @@ fn main() -> ExitCode {
     // First, before any window, GPU or audio library loads a DLL (M2-P1, D5).
     #[cfg(windows)]
     let dll_search_restricted = whipspot_app::platform_windows::restrict_dll_search();
+    // The update lifecycle's start (D10): an installed copy that was rolled back hands over to the
+    // previous version and exits; a copy that is not installed goes on. Before the arguments, so
+    // every start of an installed copy is counted. Logged below, once the log is up.
+    let (start, start_note) = whipspot_update::lifecycle_startup();
+    if start == Start::Exit {
+        return ExitCode::SUCCESS;
+    }
     // `--self-test` (H21) returns before the settings, the credential store or any provider
     // exists: it only plays a tone through the output and prints (hard rule 2).
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -82,6 +90,7 @@ fn main() -> ExitCode {
     // No directory root known: no settings file and no log, the app still runs.
     let paths = AppPaths::from_os();
     logging::init(paths.as_ref());
+    log::info!("{}", start_note.text());
     #[cfg(windows)]
     if !dll_search_restricted {
         log::warn!("could not restrict the DLL search path");
@@ -94,6 +103,18 @@ fn main() -> ExitCode {
             eprintln!("Whipspot: the app stopped");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The first frame is up and the player is built (D9): tells the update lifecycle this version
+/// works, off the UI thread (the call may wait for the install lock). Without it an installed
+/// version that was just updated is rolled back after three starts.
+fn confirm_update_health() {
+    let spawned = std::thread::Builder::new()
+        .name("whipspot-update-confirm".into())
+        .spawn(|| log::info!("{}", whipspot_update::confirm_healthy().text()));
+    if spawned.is_err() {
+        log::warn!("could not start the update confirmation");
     }
 }
 
@@ -307,6 +328,12 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
         }
         config = config.with_art(Arc::new(art));
     }
+    // The updater (D4): only for a copy the installer put on the machine; any other copy leaves
+    // the status at Unavailable and nothing runs. The app crate's own version is the running one.
+    let updater = LunepackUpdater::new(whipspot_app::APP_VERSION);
+    if updater.available() {
+        config = config.with_updater(Arc::new(updater), settings.update_check);
+    }
     // The skin engines and the skins folder (D4, MD100). Built here only: the folder is created
     // if missing and listed once for the count; skins load on the library's worker (D5). No skin
     // name or path is logged.
@@ -371,6 +398,7 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
     let opts = HostOptions {
         smoke_frames: None,
         system_fonts: true,
+        first_frame: Some(confirm_update_health),
         ..HostOptions::default()
     };
     log::info!("window opening");
@@ -411,6 +439,7 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
     settings.balance = handle.state().balance;
     settings.lyrics = handle.state().lyrics_enabled;
     settings.efficiency_mode = handle.state().power.enabled;
+    settings.update_check = handle.state().update_check;
     // The Connect step's state, when the Accounts page ever read it (D7); else what was loaded.
     if let Some(on) = step_logged_in(&handle.state().providers, SPOTIFY_ID, STEP_CONNECT) {
         settings.spotify_connect = on;

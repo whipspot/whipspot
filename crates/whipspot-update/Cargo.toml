@@ -1,0 +1,17 @@
+[package]
+name = "whipspot-update"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+whipspot-core = { path = "../whipspot-core" }
+# The updater (D2 of the auto-update task): a git dependency pinned to one commit, so a build
+# never moves with the repository's branch. Cargo's fetch of it is the second named exception to
+# hard rule 2; nothing here contacts the update server unless the user runs an installed copy.
+lunepack = { git = "https://github.com/lune-rs/lunepack", rev = "a3d23376a89b3825f9cc92e674af8ce04bfc09e4" }
+log = "0.4"
+
+[lints]
+workspace = true

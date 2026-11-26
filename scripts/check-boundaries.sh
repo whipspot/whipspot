@@ -94,20 +94,20 @@ fi
 # Dependency names banned in whipspot-core / whipspot-ui (by package name).
 banned_in_core() {
   case "$1" in
-    librespot* | keyring* | lune* | winit | wgpu | zip | miniz_oxide | flate2 | cpal | rodio | wasapi | reqwest | png | zune-* | jpeg-decoder | image | bmp | tinybmp | whipspot-*) return 0 ;;
+    librespot* | keyring* | lune* | lunepack* | winit | wgpu | zip | miniz_oxide | flate2 | cpal | rodio | wasapi | reqwest | png | zune-* | jpeg-decoder | image | bmp | tinybmp | whipspot-*) return 0 ;;
   esac
   return 1
 }
 banned_in_ui() {
   case "$1" in
     whipspot-core) return 1 ;; # the views drive the core (D31)
-    librespot* | keyring* | winit | wgpu | zip | miniz_oxide | flate2 | cpal | rodio | wasapi | reqwest | png | zune-* | jpeg-decoder | image | bmp | tinybmp | whipspot-*) return 0 ;;
+    librespot* | keyring* | lunepack* | winit | wgpu | zip | miniz_oxide | flate2 | cpal | rodio | wasapi | reqwest | png | zune-* | jpeg-decoder | image | bmp | tinybmp | whipspot-*) return 0 ;;
   esac
   return 1
 }
 is_adapter() {
   case "$1" in
-    whipspot-spotify | whipspot-local | whipspot-credentials | whipspot-audio-out | whipspot-net | whipspot-ytmusic | whipspot-ui | whipspot-skin-fs | whipspot-skin-winamp | whipspot-skin-wmp) return 0 ;;
+    whipspot-spotify | whipspot-local | whipspot-credentials | whipspot-audio-out | whipspot-net | whipspot-ytmusic | whipspot-update | whipspot-ui | whipspot-skin-fs | whipspot-skin-winamp | whipspot-skin-wmp) return 0 ;;
   esac
   return 1
 }
@@ -116,8 +116,8 @@ is_adapter() {
 # The decoder crates are named by their zune and jpeg-decoder paths only: a bare `image` or `png`
 # would also match `lune_ui::image::` (the toolkit's own module), so those two are held by the
 # manifest rule alone.
-SRC_NAMES_CORE='librespot[A-Za-z0-9_]*|keyring[A-Za-z0-9_]*|lune[A-Za-z0-9_]*|winit|wgpu|zip|miniz_oxide|flate2|cpal|rodio|wasapi|reqwest|zune_jpeg|zune_core|jpeg_decoder|whipspot_(spotify|local|ytmusic|credentials|testkit|audio_out|net|ui|skin_fs|skin_kit|skin_winamp|skin_wmp)'
-SRC_NAMES_UI='librespot[A-Za-z0-9_]*|keyring[A-Za-z0-9_]*|winit|wgpu|zip|miniz_oxide|flate2|cpal|rodio|wasapi|reqwest|zune_jpeg|zune_core|jpeg_decoder|whipspot_(spotify|local|ytmusic|credentials|testkit|audio_out|net|skin_fs|skin_kit|skin_winamp|skin_wmp)'
+SRC_NAMES_CORE='librespot[A-Za-z0-9_]*|keyring[A-Za-z0-9_]*|lune[A-Za-z0-9_]*|lunepack[A-Za-z0-9_]*|winit|wgpu|zip|miniz_oxide|flate2|cpal|rodio|wasapi|reqwest|zune_jpeg|zune_core|jpeg_decoder|whipspot_(spotify|local|ytmusic|update|credentials|testkit|audio_out|net|ui|skin_fs|skin_kit|skin_winamp|skin_wmp)'
+SRC_NAMES_UI='librespot[A-Za-z0-9_]*|keyring[A-Za-z0-9_]*|lunepack[A-Za-z0-9_]*|winit|wgpu|zip|miniz_oxide|flate2|cpal|rodio|wasapi|reqwest|zune_jpeg|zune_core|jpeg_decoder|whipspot_(spotify|local|ytmusic|update|credentials|testkit|audio_out|net|skin_fs|skin_kit|skin_winamp|skin_wmp)'
 SKIN_WORDS='wsz|winamp|pledit|viscolor|text\.bmp|region\.txt|wmz|wms|wmp'
 
 # src_rule <rule> <names> <dir>: crate names (case-sensitive) as a path or `use` in Rust source.

@@ -67,6 +67,9 @@ pub struct Settings {
     pub lyrics: bool,
     /// Let the OS save power while every window is hidden and nothing plays (D7); on by default.
     pub efficiency_mode: bool,
+    /// Look for a newer version on a schedule (60 s after start, then every 6 h); on by default.
+    /// A check the user asks for does not depend on it.
+    pub update_check: bool,
     /// The theme's key, `"a"`, `"b"` or `"c"`; any other value loads as `"c"` (MD89).
     pub theme: String,
     /// `"high"`, `"normal"` or `"low"` (MD88); any other value loads as `"high"`.
@@ -149,6 +152,7 @@ impl Default for Settings {
             output_mode: OUTPUT_MODE_SHARED.to_owned(),
             lyrics: true,
             efficiency_mode: true,
+            update_check: true,
             theme: ThemeId::default().key().to_owned(),
             stream_quality: StreamQuality::default().key().to_owned(),
             auto_hide: true,
@@ -464,6 +468,7 @@ mod tests {
             output_mode: OUTPUT_MODE_EXCLUSIVE.to_owned(),
             lyrics: false,
             efficiency_mode: false,
+            update_check: false,
             theme: "b".to_owned(),
             stream_quality: "low".to_owned(),
             auto_hide: false,
@@ -550,6 +555,16 @@ mod tests {
             br#"{"version":1,"efficiency_mode":false}"#,
         );
         assert!(!off.efficiency_mode);
+    }
+
+    #[test]
+    fn update_check_default_on_and_a_file_without_the_field_loads_on() {
+        assert!(Settings::default().update_check);
+        let old = load_text("update-check-missing", br#"{"version":1,"volume":30}"#);
+        assert!(old.update_check);
+        assert_eq!(old.volume, 30);
+        let off = load_text("update-check-off", br#"{"version":1,"update_check":false}"#);
+        assert!(!off.update_check);
     }
 
     /// MD116: the `audio_output` key of the deleted rodio fallback is ignored on load and absent
@@ -1132,6 +1147,7 @@ mod tests {
             output_mode: ["shared", "exclusive", "", "bogus"][rng.below(4)].to_owned(),
             lyrics: maybe(rng),
             efficiency_mode: maybe(rng),
+            update_check: maybe(rng),
             theme: ["a", "b", "c", "z", ""][rng.below(5)].to_owned(),
             stream_quality: ["high", "normal", "low", "ultra"][rng.below(4)].to_owned(),
             auto_hide: maybe(rng),

@@ -23,7 +23,7 @@ TMP="$(mktemp -d)" || {
 trap 'rm -rf "$TMP"' EXIT
 
 # The workspace crates of the fixture, in the real names.
-PKGS="whipspot-core whipspot-ui whipspot-testkit whipspot-skin-fs whipspot-skin-kit whipspot-spotify whipspot-local whipspot-ytmusic whipspot-credentials whipspot-audio-out whipspot-net whipspot-skin-winamp whipspot-skin-wmp whipspot-app"
+PKGS="whipspot-core whipspot-ui whipspot-testkit whipspot-skin-fs whipspot-skin-kit whipspot-spotify whipspot-local whipspot-ytmusic whipspot-update whipspot-credentials whipspot-audio-out whipspot-net whipspot-skin-winamp whipspot-skin-wmp whipspot-app"
 
 # clean_deps <package>: its dependency objects in the cargo metadata shape (kind null = normal).
 # The clean graph follows the real one: adapters depend on the core (and the testkit as dev only),
@@ -33,7 +33,7 @@ clean_deps() {
     whipspot-core) ;;
     whipspot-ui) printf '%s' '{"name":"whipspot-core","kind":null},{"name":"lune-ui","kind":null}' ;;
     whipspot-testkit | whipspot-skin-kit) printf '%s' '{"name":"whipspot-core","kind":null}' ;;
-    whipspot-spotify | whipspot-local | whipspot-ytmusic | whipspot-net | whipspot-skin-fs)
+    whipspot-spotify | whipspot-local | whipspot-ytmusic | whipspot-update | whipspot-net | whipspot-skin-fs)
       printf '%s' '{"name":"whipspot-core","kind":null},{"name":"whipspot-testkit","kind":"dev"}'
       ;;
     whipspot-skin-winamp | whipspot-skin-wmp)
@@ -43,7 +43,7 @@ clean_deps() {
       printf '%s' '{"name":"whipspot-core","kind":null}'
       ;;
     whipspot-app)
-      printf '%s' '{"name":"whipspot-core","kind":null},{"name":"whipspot-spotify","kind":null},{"name":"whipspot-local","kind":null},{"name":"whipspot-ytmusic","kind":null},{"name":"whipspot-credentials","kind":null},{"name":"whipspot-audio-out","kind":null},{"name":"whipspot-net","kind":null},{"name":"whipspot-ui","kind":null},{"name":"whipspot-skin-fs","kind":null},{"name":"whipspot-skin-winamp","kind":null},{"name":"whipspot-skin-wmp","kind":null},{"name":"whipspot-testkit","kind":"dev"}'
+      printf '%s' '{"name":"whipspot-core","kind":null},{"name":"whipspot-spotify","kind":null},{"name":"whipspot-local","kind":null},{"name":"whipspot-ytmusic","kind":null},{"name":"whipspot-update","kind":null},{"name":"whipspot-credentials","kind":null},{"name":"whipspot-audio-out","kind":null},{"name":"whipspot-net","kind":null},{"name":"whipspot-ui","kind":null},{"name":"whipspot-skin-fs","kind":null},{"name":"whipspot-skin-winamp","kind":null},{"name":"whipspot-skin-wmp","kind":null},{"name":"whipspot-testkit","kind":"dev"}'
       ;;
   esac
 }
@@ -231,6 +231,42 @@ printf '%s
 ' '// YouTube fake' >>"$D/crates/whipspot-testkit/src/lib.rs"
 run_check "$D" "$D/metadata.json"
 expect_rule R8
+
+# R1: the core depends on lunepack.
+new_case R1-lunepack
+write_meta "$D/metadata.json" whipspot-core '{"name":"lunepack","kind":null}'
+run_check "$D" "$D/metadata.json"
+expect_rule R1
+
+# R2: the core's source names lunepack.
+new_case R2-lunepack
+printf '%s\n' 'use lunepack::Updater;' >>"$D/crates/whipspot-core/src/lib.rs"
+run_check "$D" "$D/metadata.json"
+expect_rule R2
+
+# R2: the core's source names the update adapter.
+new_case R2-update
+printf '%s\n' 'use whipspot_update::LunepackUpdater;' >>"$D/crates/whipspot-core/src/lib.rs"
+run_check "$D" "$D/metadata.json"
+expect_rule R2
+
+# R4: the UI depends on lunepack.
+new_case R4-lunepack
+write_meta "$D/metadata.json" whipspot-ui '{"name":"lunepack","kind":null}'
+run_check "$D" "$D/metadata.json"
+expect_rule R4
+
+# R4: the UI's source names lunepack.
+new_case R4-lunepack-src
+printf '%s\n' 'use lunepack::Updater;' >>"$D/crates/whipspot-ui/src/lib.rs"
+run_check "$D" "$D/metadata.json"
+expect_rule R4
+
+# R5: the update adapter depends on another adapter.
+new_case R5-update
+write_meta "$D/metadata.json" whipspot-update '{"name":"whipspot-net","kind":null}'
+run_check "$D" "$D/metadata.json"
+expect_rule R5
 
 # R7: the lock file names rodio.
 new_case R7

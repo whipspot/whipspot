@@ -2158,6 +2158,7 @@ fn smoke_skin(rt: &tokio::runtime::Runtime, check_fails: bool) -> anyhow::Result
         system_fonts: false,
         panel_check: Some(check),
         switch_back: true,
+        first_frame: None,
     };
     let report = host::run(
         &handle,
@@ -2949,6 +2950,7 @@ fn run() -> anyhow::Result<()> {
                 system_fonts: !smoke,
                 panel_check: None,
                 switch_back: false,
+                first_frame: None,
             };
             let mut diagnostics = DiagnosticsUi::new(host::chrome());
             let diagnostics_spec = WindowSpec {
