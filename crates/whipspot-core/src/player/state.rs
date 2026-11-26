@@ -10,6 +10,7 @@ use crate::provider::{
     AlbumDetail, AlbumPage, ArtistPage, LibraryError, LoginInput, PlaylistPage, ProviderAuthStatus,
     ProviderInfo, ReleaseGroup, Track, TrackPage,
 };
+use crate::update::UpdateStatus;
 
 /// Identifies one library or prefill request; the matching notice carries it back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +118,12 @@ pub struct PlayerState {
     pub remote: Option<&'static str>,
     /// Efficiency mode: the setting, whether a window is shown, and the power mode asked for.
     pub power: PowerStatus,
+    /// Where the app's own update stands (`Unavailable` without an updater).
+    pub update: UpdateStatus,
+    /// The running version's text, as the updater reports it (empty without an updater).
+    pub app_version: String,
+    /// Scheduled update checks are on (the setting; a manual check works either way).
+    pub update_check: bool,
 }
 
 /// The output the user chose and what the player knows about it.
@@ -289,6 +296,14 @@ pub enum PlayerAction {
     SetShown(bool),
     /// Switch efficiency mode on or off (the setting).
     SetEfficiency(bool),
+    /// Ask the updater whether a newer version exists. Ignored while another update step runs, a
+    /// version is staged, or the copy cannot update itself.
+    CheckForUpdate,
+    /// Download and stage the offered version; once it is staged, install it and restart.
+    /// Ignored while another update step runs or when there is nothing to install.
+    InstallUpdate,
+    /// Switch the scheduled update checks on or off (the setting).
+    SetUpdateCheck(bool),
 }
 
 /// Something that happened once, for the front-end to show or route. Error texts are this

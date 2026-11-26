@@ -28,6 +28,7 @@ use super::state::{
     RepeatMode, RequestId,
 };
 use super::transport::{Op, TransportCmd, TransportReport, can_take_over};
+use super::updates::{UpdateSetup, Updates};
 use super::{OUTPUT_STOPPED, texts};
 use crate::engine::{BAND_COUNT, Engine, EqSettings, OutputMode, OutputRequest};
 use crate::events::{RemotePlay, UiEvent};
@@ -37,6 +38,7 @@ use crate::provider::{
     AuthFailure, LibErrorKind, LibraryError, Provider, ProviderAuthStatus, ProviderRegistry,
     RemoteCommand, Track,
 };
+use crate::update::{UpdateError, UpdateOffer};
 
 /// Results sent back to the control loop by the transport task and the request tasks.
 pub(crate) enum Internal {
@@ -80,6 +82,17 @@ pub(crate) enum Internal {
         saved: Option<Vec<bool>>,
         writable: bool,
     },
+    /// The updater's `check` ended.
+    UpdateChecked(Result<Option<UpdateOffer>, UpdateError>),
+    /// The updater's `download` reported progress.
+    UpdateProgress {
+        done: u64,
+        total: u64,
+    },
+    /// The updater's `download` ended.
+    UpdateDownloaded(Result<(), UpdateError>),
+    /// The updater's `apply_and_restart` returned (it did not restart, or failed).
+    UpdateApplied(Result<(), UpdateError>),
 }
 
 /// The fallback states already announced, so each notice is posted once per change (MD40).
@@ -204,6 +217,8 @@ pub(crate) struct Policy {
     pub(crate) power: Option<Arc<dyn PowerControl>>,
     /// The efficiency setting at start.
     pub(crate) power_enabled: bool,
+    /// The updater and its schedule, if one is wired.
+    pub(crate) update: Option<UpdateSetup>,
 }
 
 pub(crate) struct Control {
@@ -252,6 +267,8 @@ pub(crate) struct Control {
     /// provider (the takeover took it), so the track shown (the remote's) is loaded nowhere and
     /// an op would reach no one. [`Control::op`] handles the ops itself then.
     unloaded: bool,
+    /// The update flow; `None` without an updater (the status stays `Unavailable`).
+    updates: Option<Updates>,
 }
 
 const DB_MAX: f32 = 12.0;
@@ -270,6 +287,9 @@ impl Control {
         lyrics: LyricsLookups,
         policy: Policy,
     ) -> Self {
+        let updates = policy
+            .update
+            .map(|setup| Updates::new(setup, shared.clone(), internal.clone()));
         Control {
             shared,
             registry,
@@ -297,6 +317,7 @@ impl Control {
             applied: PowerMode::Normal,
             remote: None,
             unloaded: false,
+            updates,
         }
     }
 
@@ -539,6 +560,7 @@ impl Control {
         let mut events_open = true;
         loop {
             let deadline = self.pause_deadline;
+            let update_due = self.updates.as_ref().and_then(Updates::deadline);
             tokio::select! {
                 a = actions.recv() => match a {
                     Some(a) => {
@@ -561,10 +583,23 @@ impl Control {
                         None => std::future::pending().await,
                     }
                 } => self.pause_timed_out(),
+                () = async {
+                    match update_due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(u) = &mut self.updates {
+                        u.timed_out();
+                    }
+                }
             }
             self.check_output();
             self.arm_pause_timer();
             self.sync_power();
+        }
+        if let Some(u) = &self.updates {
+            u.stop();
         }
     }
 
@@ -827,6 +862,20 @@ impl Control {
             PlayerAction::CheckLibrary => self.check_library(),
             PlayerAction::SetShown(shown) => self.set_shown(shown),
             PlayerAction::SetEfficiency(on) => self.set_efficiency(on),
+            PlayerAction::CheckForUpdate => {
+                if let Some(u) = &mut self.updates {
+                    u.check_now();
+                }
+            }
+            PlayerAction::InstallUpdate => {
+                if let Some(u) = &mut self.updates {
+                    u.install();
+                }
+            }
+            PlayerAction::SetUpdateCheck(on) => match &mut self.updates {
+                Some(u) => u.set_check(on),
+                None => self.update(|s| s.update_check = on),
+            },
         }
     }
 
@@ -1641,6 +1690,26 @@ impl Control {
                     self.shared.notify(PlayerNotice::Liked(pairs));
                 }
                 self.set_writable(provider, writable);
+            }
+            Internal::UpdateChecked(result) => {
+                if let Some(u) = &mut self.updates {
+                    u.on_checked(result);
+                }
+            }
+            Internal::UpdateProgress { done, total } => {
+                if let Some(u) = &mut self.updates {
+                    u.on_progress(done, total);
+                }
+            }
+            Internal::UpdateDownloaded(result) => {
+                if let Some(u) = &mut self.updates {
+                    u.on_downloaded(result);
+                }
+            }
+            Internal::UpdateApplied(result) => {
+                if let Some(u) = &mut self.updates {
+                    u.on_applied(result);
+                }
             }
         }
     }

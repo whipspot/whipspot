@@ -162,6 +162,9 @@ fn state_for(info: &OutputInfo, modes: &[OutputMode]) -> PlayerState {
         lyrics_enabled: false,
         remote: None,
         power: Default::default(),
+        update: Default::default(),
+        app_version: String::new(),
+        update_check: true,
     }
 }
 

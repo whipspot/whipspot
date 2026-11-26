@@ -13,3 +13,4 @@ pub mod provider;
 pub mod secret;
 pub mod skin;
 pub mod text;
+pub mod update;

@@ -35,6 +35,7 @@ use whipspot_core::{
         MAX_WIDGETS_PER_PANEL, PanelId, PanelWindows, Point, Rect, Rgb, ScreenPoint, ScreenRect,
         Shape, Size, Skin, SkinEngine, SkinError, SkinSource, SpriteRect, VisPalette,
     },
+    update::{CancelFlag, UpdateError, UpdateOffer, Updater},
 };
 
 use crate::FakeWindows;
@@ -2646,4 +2647,105 @@ pub fn run_power_control_contract(p: &dyn PowerControl) {
         first,
         "power control contract: the suite ends at Normal, with the answer it gave before"
     );
+}
+
+/// Updater cases. `u` is any implementation: a fake, or the adapter on this machine, which then
+/// runs from a copy that may or may not be installed. Cases that would change the machine (a real
+/// download or install) are left out; a copy that cannot update answers `Unavailable` to every
+/// call.
+///
+/// | method | case |
+/// |---|---|
+/// | `current_version` | not empty, at most 48 characters, no control character, the same twice |
+/// | `check` | `Ok(None)`, `Ok(Some(offer))` with a printable non-empty version, or an `Err` of the closed set |
+/// | `check` | a second check answers the same kind as the first (an error stays the same error, a missing offer stays missing) |
+/// | `check` | 4 threads × 3 calls do not panic |
+/// | `download`, `apply_and_restart` | when `check` said `Unavailable`, both say `Unavailable` too, without a progress report |
+/// | `UpdateError::text` | every error has a non-empty fixed text |
+pub fn run_updater_contract(u: &dyn Updater) {
+    let version = u.current_version();
+    assert!(
+        !version.is_empty()
+            && version.chars().count() <= 48
+            && !version.chars().any(char::is_control),
+        "updater contract: the version is short, printable and not empty ({version:?})"
+    );
+    assert_eq!(
+        version,
+        u.current_version(),
+        "updater contract: the version does not change between calls"
+    );
+
+    let first = u.check();
+    if let Ok(Some(offer)) = &first {
+        let v = &offer.version;
+        assert!(
+            !v.is_empty() && v.chars().count() <= 48 && !v.chars().any(char::is_control),
+            "updater contract: an offered version is short, printable and not empty ({v:?})"
+        );
+    }
+    for e in [
+        UpdateError::Unavailable,
+        UpdateError::Network,
+        UpdateError::Verify,
+        UpdateError::Busy,
+        UpdateError::Cancelled,
+        UpdateError::Other,
+    ] {
+        assert_fixed_text(e.text(), "updater contract: an update error");
+    }
+    let second = u.check();
+    // A server error may differ between two calls; a copy that cannot update never changes.
+    if first == Err(UpdateError::Unavailable) {
+        assert_eq!(
+            second,
+            Err(UpdateError::Unavailable),
+            "updater contract: a copy that cannot update says so every time"
+        );
+    } else if let (Ok(a), Ok(b)) = (&first, &second) {
+        assert_eq!(
+            a.is_some(),
+            b.is_some(),
+            "updater contract: a second check answers the same kind as the first"
+        );
+    }
+
+    let joined = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                s.spawn(|| {
+                    for _ in 0..3 {
+                        let _ = u.check();
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().all(|h| h.join().is_ok())
+    });
+    assert!(joined, "updater contract: concurrent checks do not panic");
+
+    if first == Err(UpdateError::Unavailable) {
+        let reported = std::sync::atomic::AtomicBool::new(false);
+        let download = u.download(
+            &UpdateOffer {
+                version: "0.0.0".to_owned(),
+            },
+            &|_, _| reported.store(true, std::sync::atomic::Ordering::Relaxed),
+            &CancelFlag::new(),
+        );
+        assert_eq!(
+            download,
+            Err(UpdateError::Unavailable),
+            "updater contract: download on a copy that cannot update says so"
+        );
+        assert!(
+            !reported.load(std::sync::atomic::Ordering::Relaxed),
+            "updater contract: no progress is reported when nothing downloads"
+        );
+        assert_eq!(
+            u.apply_and_restart(),
+            Err(UpdateError::Unavailable),
+            "updater contract: apply on a copy that cannot update says so"
+        );
+    }
 }
