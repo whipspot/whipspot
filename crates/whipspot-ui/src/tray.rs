@@ -15,6 +15,7 @@ use lune_ui::widgets::menu::{MenuItem, MenuRow};
 use lune_ui::widgets::tone::Tone;
 use whipspot_core::player::{PlayState, PlayerAction, PlayerHandle, PlayerState};
 use whipspot_core::text::display_text;
+use whipspot_core::update::UpdateStatus;
 
 use crate::settings::current_skin;
 use crate::skin::{SkinLibrary, SkinStatus};
@@ -42,6 +43,24 @@ const NOTHING_PLAYING_HINT: &str = "Choose something to play";
 const TIP_TRACK_CHARS: usize = 60;
 const TIP_ARTIST_CHARS: usize = 40;
 
+/// The update row's label while an update is offered or staged.
+fn update_row_text(status: &UpdateStatus) -> Option<String> {
+    match status {
+        UpdateStatus::Available { version } => Some(format!(
+            "Update to {}",
+            display_text(version, UPDATE_VERSION_CHARS)
+        )),
+        UpdateStatus::Ready { version } => Some(format!(
+            "Restart to update to {}",
+            display_text(version, UPDATE_VERSION_CHARS)
+        )),
+        _ => None,
+    }
+}
+
+/// Characters of a version text kept in the update row before the width cut.
+const UPDATE_VERSION_CHARS: usize = 40;
+
 /// Which page the menu shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -60,6 +79,8 @@ pub enum Pick {
     OpenSkins,
     /// The main page.
     Back,
+    /// Download the offered update, or install the staged one and restart.
+    InstallUpdate,
     /// The native look.
     Native,
     /// The skin of this file name.
@@ -210,7 +231,7 @@ impl TrayMenu {
         if let Row::Item { chevron, .. } = &mut skin {
             *chevron = true;
         }
-        vec![
+        let mut rows = vec![
             header,
             Row::Separator,
             Row::item(if running { "Pause" } else { "Play" }, Pick::Toggle)
@@ -220,9 +241,16 @@ impl TrayMenu {
             Row::Separator,
             skin,
             Row::Separator,
-            Row::item("Show Whipspot", Pick::Show),
-            Row::item("Quit Whipspot", Pick::Quit),
-        ]
+        ];
+        // An update waits for the user: its row sits above Show and Quit and only while there is
+        // one to take.
+        if let Some(text) = update_row_text(&state.update) {
+            rows.push(Row::item(text, Pick::InstallUpdate));
+            rows.push(Row::Separator);
+        }
+        rows.push(Row::item("Show Whipspot", Pick::Show));
+        rows.push(Row::item("Quit Whipspot", Pick::Quit));
+        rows
     }
 
     fn skin_rows(&self) -> Vec<Row> {
@@ -300,6 +328,7 @@ impl TrayMenu {
             Pick::Toggle => (Outcome::Close, Some(PlayerAction::Toggle)),
             Pick::Next => (Outcome::Close, Some(PlayerAction::Next)),
             Pick::Previous => (Outcome::Close, Some(PlayerAction::Previous)),
+            Pick::InstallUpdate => (Outcome::Close, Some(PlayerAction::InstallUpdate)),
             Pick::OpenSkins => {
                 self.page = Page::Skins;
                 self.library.refresh();
@@ -693,6 +722,49 @@ mod tests {
             item(&rows, "Skin"),
             Row::Item { chevron: true, .. }
         ));
+    }
+
+    #[test]
+    fn the_update_row_shows_only_while_an_update_is_offered_or_staged() {
+        let mut m = menu(true);
+        let mut st = state(None, PlayState::Stopped, 0);
+        for quiet in [
+            UpdateStatus::Unavailable,
+            UpdateStatus::Idle,
+            UpdateStatus::Checking,
+            UpdateStatus::Failed { text: "x" },
+        ] {
+            st.update = quiet;
+            let rows = m.rows(&st);
+            assert_eq!(rows.len(), 10);
+            assert!(m.index_of(&st, &Pick::InstallUpdate).is_none());
+        }
+        st.update = UpdateStatus::Available {
+            version: "0.3.0".into(),
+        };
+        let rows = m.rows(&st);
+        assert_eq!(rows.len(), 12);
+        assert!(!disabled(&rows, "Update to 0.3.0"));
+        // Above Show and Quit, behind a separator on each side.
+        let at = m.index_of(&st, &Pick::InstallUpdate).unwrap();
+        assert_eq!(rows[at - 1], Row::Separator);
+        assert_eq!(rows[at + 1], Row::Separator);
+        assert_eq!(rows[at + 2].text(), Some("Show Whipspot"));
+        // A pick sends the action and closes the menu.
+        let (outcome, action) = m.pick_at(at, &st);
+        assert_eq!(outcome, Outcome::Close);
+        assert!(matches!(action, Some(PlayerAction::InstallUpdate)));
+        st.update = UpdateStatus::Downloading {
+            version: "0.3.0".into(),
+            done: 1,
+            total: 2,
+        };
+        assert!(m.index_of(&st, &Pick::InstallUpdate).is_none());
+        st.update = UpdateStatus::Ready {
+            version: "0.3.0".into(),
+        };
+        let rows = m.rows(&st);
+        assert!(!disabled(&rows, "Restart to update to 0.3.0"));
     }
 
     #[test]

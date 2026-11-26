@@ -20,10 +20,11 @@ use whipspot_core::folders::ScanStatus;
 use whipspot_core::player::{EqState, PlayerAction, PlayerHandle, PlayerState, ProviderEntry};
 use whipspot_core::provider::model::LoginState;
 use whipspot_core::text::display_text;
+use whipspot_core::update::UpdateStatus;
 
 use crate::StreamQuality;
 use crate::draw::{
-    P, alpha, caps, caps_width, disc, glass, hgradient, led, outline, shadow, text, width,
+    P, alpha, caps, caps_width, disc, glass, hgradient, led, outline, shadow, text, text_c, width,
 };
 use crate::equalizer::preset_of;
 use crate::grid;
@@ -459,7 +460,7 @@ impl SettingsPane {
             y = bottom + CARD_GAP;
             y = accounts_card(ui, k, state, at(y), &mut out) + CARD_GAP;
             y = shortcuts_card(ui, k, view.shortcuts, at(y)) + CARD_GAP;
-            y = about_card(ui, k, view.app_version, at(y), &mut out);
+            y = about_card(ui, k, view.app_version, state, player, at(y), &mut out);
             (
                 (),
                 Extent::new(f64::from(rect.w), f64::from(y + BOTTOM_PAD - rect.y)),
@@ -1058,19 +1059,98 @@ fn shortcuts_card(ui: &mut Ui<'_>, k: &Look, shortcuts: &[(&str, &str)], at: Rec
     r.bottom()
 }
 
+/// The Updates block's height inside the About card: its hairline, the status row, the buttons
+/// row, the hairline and the switch row.
+const ABOUT_UPDATES_H: f32 = 17.0 + ROW_PITCH + 42.0 + 15.0 + SWITCH_ROW_H + 10.0;
+
+/// The most characters of a version text shown in an update line.
+const VERSION_TEXT_MAX: usize = 40;
+
+/// The Updates status line for `status`: one fixed text per state, the version number apart.
+pub(crate) fn update_line(status: &UpdateStatus) -> String {
+    match status {
+        UpdateStatus::Unavailable => "Updates work in installed copies".to_owned(),
+        UpdateStatus::Idle => "Not checked yet".to_owned(),
+        UpdateStatus::Checking => "Checking\u{2026}".to_owned(),
+        UpdateStatus::UpToDate { .. } => "Up to date".to_owned(),
+        UpdateStatus::Available { version } => {
+            format!(
+                "Version {} is available",
+                display_text(version, VERSION_TEXT_MAX)
+            )
+        }
+        UpdateStatus::Downloading {
+            version,
+            done,
+            total,
+        } => {
+            let version = display_text(version, VERSION_TEXT_MAX);
+            if *total > 0 {
+                let percent = (done.saturating_mul(100) / total).min(100);
+                format!("Downloading {version} \u{2014} {percent} %")
+            } else {
+                format!("Downloading {version}\u{2026}")
+            }
+        }
+        UpdateStatus::Ready { .. } => "Ready to restart".to_owned(),
+        UpdateStatus::Failed { text } => (*text).to_owned(),
+    }
+}
+
+/// Whether "Check now" works in `status`: nothing runs and the copy can update.
+pub(crate) fn update_check_enabled(status: &UpdateStatus) -> bool {
+    matches!(
+        status,
+        UpdateStatus::Idle | UpdateStatus::UpToDate { .. } | UpdateStatus::Failed { .. }
+    )
+}
+
+/// The label of the install button in `status`, when there is one: an offered version is
+/// downloaded first, a staged one is installed by restarting.
+pub(crate) fn update_install_label(status: &UpdateStatus) -> Option<&'static str> {
+    match status {
+        UpdateStatus::Available { .. } => Some("Download update"),
+        UpdateStatus::Ready { .. } => Some("Install and restart"),
+        _ => None,
+    }
+}
+
+/// A button that does nothing: the same pill as a live secondary one, dimmed.
+fn dim_button(p: &mut P<'_>, k: &Look, r: Rect, label: &str) {
+    p.fill(r, 6.0, k.ink.wash);
+    text_c(
+        p,
+        label,
+        12.5,
+        k.ink.faint,
+        false,
+        r.x + r.w / 2.0,
+        r.y + 6.0,
+    );
+}
+
 /// The About card. Returns the card's bottom.
-fn about_card(ui: &mut Ui<'_>, k: &Look, version: &str, at: Rect, out: &mut SettingsOut) -> f32 {
+fn about_card(
+    ui: &mut Ui<'_>,
+    k: &Look,
+    version: &str,
+    state: &PlayerState,
+    player: &PlayerHandle,
+    at: Rect,
+    out: &mut SettingsOut,
+) -> f32 {
     let r = Rect::new(
         at.x,
         at.y,
         at.w,
-        BODY_Y + 3.0 * ROW_PITCH + 18.0 + PAD_BOTTOM,
+        BODY_Y + 3.0 * ROW_PITCH + ABOUT_UPDATES_H + 18.0 + PAD_BOTTOM,
     );
     card(ui.painter(), k, r, "About");
     if header_button(ui, r, "show-tips", "Show tips again") {
         out.restart_tour = true;
     }
     let x0 = r.x + PAD_X;
+    let inner_w = (r.w - 2.0 * PAD_X).max(0.0);
     let mut y = r.y + BODY_Y;
     let p = ui.painter();
     row_value(p, "Whipspot", k.ink.text, true, 15.0, x0, y - 2.0, 0.0);
@@ -1080,8 +1160,92 @@ fn about_card(ui: &mut Ui<'_>, k: &Look, version: &str, at: Rect, out: &mut Sett
         row_value(p, value, k.ink.text, false, 13.0, x0 + VALUE_DX, y, 0.0);
         y += ROW_PITCH;
     }
-    text(
+
+    // The Updates block: the status, the buttons, the automatic-check switch.
+    y += 2.0;
+    p.fill(Rect::new(x0, y, inner_w, 1.0), 0.0, k.ink.line_soft);
+    y += 15.0;
+    row_label(p, k, "Updates", x0, y);
+    let status = &state.update;
+    let line = update_line(status);
+    let failed = matches!(status, UpdateStatus::Failed { .. });
+    let color = if failed { k.ink.text } else { k.ink.text2 };
+    row_value(
         p,
+        &line,
+        color,
+        false,
+        13.0,
+        x0 + VALUE_DX,
+        y,
+        (inner_w - VALUE_DX).max(0.0),
+    );
+    y += ROW_PITCH;
+    let (bh, gap) = (28.0, 10.0);
+    let mut bx = x0 + VALUE_DX;
+    let check = "Check now";
+    let cw = button_width(ui.painter(), check);
+    let cr = Rect::new(bx, y, cw, bh);
+    if update_check_enabled(status) {
+        if ui
+            .button("update-check", cr, check, ButtonKind::Secondary)
+            .clicked
+        {
+            player.dispatch(PlayerAction::CheckForUpdate);
+        }
+    } else {
+        dim_button(ui.painter(), k, cr, check);
+    }
+    bx += cw + gap;
+    if let Some(label) = update_install_label(status) {
+        let iw = button_width(ui.painter(), label);
+        if ui
+            .button(
+                "update-install",
+                Rect::new(bx, y, iw, bh),
+                label,
+                ButtonKind::Primary,
+            )
+            .clicked
+        {
+            player.dispatch(PlayerAction::InstallUpdate);
+        }
+    }
+    y += 42.0;
+    ui.painter()
+        .fill(Rect::new(x0, y, inner_w, 1.0), 0.0, k.ink.line_soft);
+    y += 15.0;
+    text(
+        ui.painter(),
+        "Check for updates automatically",
+        13.5,
+        k.ink.text,
+        true,
+        x0,
+        y + (SWITCH_ROW_H - 13.5 * 1.3) / 2.0,
+        0.0,
+    );
+    let mut on = state.update_check;
+    let track = Rect::new(
+        x0 + inner_w - TOGGLE_W,
+        y + (SWITCH_ROW_H - TOGGLE_H) / 2.0,
+        TOGGLE_W,
+        TOGGLE_H,
+    );
+    if ui
+        .toggle(
+            "update-check-toggle",
+            track,
+            &mut on,
+            "Check for updates automatically",
+        )
+        .changed
+    {
+        player.dispatch(PlayerAction::SetUpdateCheck(on));
+    }
+    y += SWITCH_ROW_H + 10.0;
+    text(
+        ui.painter(),
         "Not affiliated with any music service.",
         12.5,
         k.ink.muted,
@@ -1096,6 +1260,82 @@ fn about_card(ui: &mut Ui<'_>, k: &Look, version: &str, at: Rect, out: &mut Sett
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn every_update_status_has_its_fixed_line() {
+        let v = || "0.3.0".to_owned();
+        assert_eq!(
+            update_line(&UpdateStatus::Unavailable),
+            "Updates work in installed copies"
+        );
+        assert_eq!(update_line(&UpdateStatus::Idle), "Not checked yet");
+        assert_eq!(update_line(&UpdateStatus::Checking), "Checking\u{2026}");
+        assert_eq!(
+            update_line(&UpdateStatus::UpToDate {
+                checked_at: SystemTime::UNIX_EPOCH
+            }),
+            "Up to date"
+        );
+        assert_eq!(
+            update_line(&UpdateStatus::Available { version: v() }),
+            "Version 0.3.0 is available"
+        );
+        let downloading = |done, total| UpdateStatus::Downloading {
+            version: v(),
+            done,
+            total,
+        };
+        assert_eq!(
+            update_line(&downloading(420, 1000)),
+            "Downloading 0.3.0 \u{2014} 42 %"
+        );
+        // A total not known yet, and a count past the total, never divide by zero or pass 100.
+        assert_eq!(update_line(&downloading(5, 0)), "Downloading 0.3.0\u{2026}");
+        assert_eq!(
+            update_line(&downloading(u64::MAX, 10)),
+            "Downloading 0.3.0 \u{2014} 100 %"
+        );
+        assert_eq!(
+            update_line(&UpdateStatus::Ready { version: v() }),
+            "Ready to restart"
+        );
+        assert_eq!(
+            update_line(&UpdateStatus::Failed {
+                text: whipspot_core::update::texts::NETWORK
+            }),
+            whipspot_core::update::texts::NETWORK
+        );
+    }
+
+    #[test]
+    fn the_update_buttons_follow_the_status() {
+        let v = || "0.3.0".to_owned();
+        let up = UpdateStatus::UpToDate {
+            checked_at: SystemTime::UNIX_EPOCH,
+        };
+        let failed = UpdateStatus::Failed { text: "x" };
+        let available = UpdateStatus::Available { version: v() };
+        let downloading = UpdateStatus::Downloading {
+            version: v(),
+            done: 0,
+            total: 0,
+        };
+        let ready = UpdateStatus::Ready { version: v() };
+        for (status, check, install) in [
+            (UpdateStatus::Unavailable, false, None),
+            (UpdateStatus::Idle, true, None),
+            (UpdateStatus::Checking, false, None),
+            (up, true, None),
+            (failed, true, None),
+            (available, false, Some("Download update")),
+            (downloading, false, None),
+            (ready, false, Some("Install and restart")),
+        ] {
+            assert_eq!(update_check_enabled(&status), check, "{status:?}");
+            assert_eq!(update_install_label(&status), install, "{status:?}");
+        }
+    }
 
     #[test]
     fn a_long_folder_path_is_cut_in_the_middle_and_keeps_both_ends() {

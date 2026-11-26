@@ -102,6 +102,11 @@
 //! (card 4 above the quality pill), `c-tour-queue@1x` (card 5 above the queue icon) and
 //! `c-tour-min@1x` (760x480, card 1). Every other shot runs with the tour off.
 //!
+//! Four more show the update UI (auto-update step 4): `c-settings-update-unavailable@1x`,
+//! `c-settings-update-available@1x` and `c-settings-update-downloading@1x` (1440x2200: the About
+//! card's Updates block with no updater, a version offered and a download held at 42 %, over a
+//! `FakeUpdater`) and `tray-menu-update@1x` (the tray menu with an update row).
+//!
 //! Three more show the tray icon (step 7 of the skin-playlist-tray task): `tray-menu@1x` (the main
 //! page of the menu with a track playing, as `Ui::menu_window` draws it, over a flat dark desktop),
 //! `tray-menu-skins@1x` (the skins page, the demo skin current, two skins listed) and
@@ -126,11 +131,12 @@ use whipspot_core::player::{
 };
 use whipspot_core::provider::{Library, ProviderRegistry, ReleaseGroup};
 use whipspot_core::skin::{PanelWindows, SkinEngine, SkinRegistry, SkinSource, WidgetKind};
+use whipspot_core::update::UpdateStatus;
 use whipspot_skin_winamp::WinampEngine;
 use whipspot_skin_winamp::demo::demo_skin;
 use whipspot_testkit::{
     ClockedOutput, DemoProvider, FakeArt, FakeLyrics, FakePower, FakeProvider, FakeSkinSource,
-    demo_images, demo_lyrics, run_panel_windows_contract,
+    FakeUpdater, demo_images, demo_lyrics, run_panel_windows_contract,
 };
 use whipspot_ui::diagnostics;
 use whipspot_ui::skin::{
@@ -297,6 +303,20 @@ fn parse(args: &[String]) -> anyhow::Result<Args> {
 /// The demo clock's rate: not the tone's 44.1 kHz, so the dump shows a resampled path.
 const DEMO_RATE: u32 = 48_000;
 
+/// The update state a demo player is put in (a `FakeUpdater`; never the real adapter, hard rule 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateDemo {
+    /// No updater: the About card reads "Updates work in installed copies".
+    None,
+    /// A newer version is offered.
+    Available,
+    /// The offered version is downloading and held at 42 %.
+    Downloading,
+}
+
+/// The version the demo's fake updater offers.
+const DEMO_UPDATE_VERSION: &str = "0.3.0";
+
 /// What a demo player is set up with.
 #[derive(Debug, Clone, Copy)]
 struct Setup {
@@ -322,6 +342,8 @@ struct Setup {
     helper_status: bool,
     /// Every second track of the playing list has two artists (the link shots' multi-artist line).
     collab: bool,
+    /// The updater's state (the About card's Updates block).
+    update: UpdateDemo,
 }
 
 impl Setup {
@@ -339,6 +361,7 @@ impl Setup {
             second_provider: false,
             helper_status: false,
             collab: false,
+            update: UpdateDemo::None,
         }
     }
 }
@@ -359,6 +382,7 @@ fn player(rt: &tokio::runtime::Runtime, setup: Setup) -> anyhow::Result<PlayerHa
         second_provider,
         helper_status,
         collab,
+        update,
     } = setup;
     let setup = EngineSetup::Output {
         output: Box::new(ClockedOutput::new(DEMO_RATE)),
@@ -443,8 +467,41 @@ fn player(rt: &tokio::runtime::Runtime, setup: Setup) -> anyhow::Result<PlayerHa
             FakeArt::new()
         }));
     }
+    // The scheduled check (60 s after start) is on, as in the app, but a dump is done long before
+    // it; the demo asks for the check itself below.
+    let mut held: Option<Arc<FakeUpdater>> = None;
+    if update != UpdateDemo::None {
+        let fake = Arc::new(FakeUpdater::new(whipspot_app::APP_VERSION));
+        fake.offer(DEMO_UPDATE_VERSION);
+        if update == UpdateDemo::Downloading {
+            fake.script_progress(&[(42_000_000, 100_000_000)]);
+        }
+        held = Some(fake.clone());
+        config = config.with_updater(fake, true);
+    }
     let handle = Player::start(registry, wiring, config, rt.handle());
     handle.dispatch(PlayerAction::RefreshAuth);
+    if update != UpdateDemo::None {
+        handle.dispatch(PlayerAction::CheckForUpdate);
+        anyhow::ensure!(
+            wait_for(|| matches!(handle.state().update, UpdateStatus::Available { .. })),
+            "the demo update was not offered"
+        );
+        if update == UpdateDemo::Downloading {
+            // Held after the check, so the download stays at its first progress step.
+            if let Some(fake) = &held {
+                fake.hold(true);
+            }
+            handle.dispatch(PlayerAction::InstallUpdate);
+            anyhow::ensure!(
+                wait_for(|| matches!(
+                    handle.state().update,
+                    UpdateStatus::Downloading { done, .. } if done > 0
+                )),
+                "the demo update did not start downloading"
+            );
+        }
+    }
     if logged_in {
         handle.dispatch(PlayerAction::PlayItem { context, index: 0 });
         if queue {
@@ -527,6 +584,8 @@ struct Shot {
     folders: Option<bool>,
     /// ReplayGain is set to this mode before the capture.
     replay: Option<ReplayGainMode>,
+    /// The About card's update state.
+    update: UpdateDemo,
     size: (u32, u32),
     scale: f32,
 }
@@ -563,6 +622,7 @@ impl Shot {
             saved: None,
             folders: None,
             replay: None,
+            update: UpdateDemo::None,
             size: DUMP_SIZE,
             scale: 1.0,
         }
@@ -780,6 +840,18 @@ fn shots() -> Vec<Shot> {
             ..Shot::new("c-settings-scrolled@1x", c, Route::Settings)
         },
     ]);
+    // The About card's Updates block: nothing to update, a version offered, a download running.
+    for (what, update) in [
+        ("unavailable", UpdateDemo::None),
+        ("available", UpdateDemo::Available),
+        ("downloading", UpdateDemo::Downloading),
+    ] {
+        shots.push(Shot {
+            size: SETTINGS_FULL_SIZE,
+            update,
+            ..Shot::new(format!("c-settings-update-{what}@1x"), c, Route::Settings)
+        });
+    }
     for (t, theme) in [("a", ThemeId::A), ("b", ThemeId::B)] {
         shots.push(Shot {
             logged_in: false,
@@ -1094,6 +1166,7 @@ fn capture(rt: &tokio::runtime::Runtime, shot: &Shot, path: &Path) -> anyhow::Re
             second_provider: shot.second_provider,
             helper_status: shot.helper_status,
             collab: shot.collab,
+            update: shot.update,
         },
     )?;
     if let Some(mode) = shot.replay {
@@ -2401,6 +2474,28 @@ fn dump_tray(rt: &tokio::runtime::Runtime, dir: &Path) -> anyhow::Result<()> {
     )?;
     write_image(&dir.join("tray-icon@1x.png"), &tray_icon_sheet())?;
     println!("dumped {}", dir.join("tray-icon@1x.png").display());
+    dump_tray_update(rt, dir)
+}
+
+/// The tray menu's main page with an update offered: its row above Show and Quit.
+fn dump_tray_update(rt: &tokio::runtime::Runtime, dir: &Path) -> anyhow::Result<()> {
+    let handle = player(rt, Setup::new(true))?;
+    anyhow::ensure!(
+        wait_for(|| is_playing(&handle)),
+        "the demo track did not play"
+    );
+    let library = tray_library(&[DEMO_SKIN, DEMO_SKIN_B])?;
+    let mut state = (*handle.state()).clone();
+    state.update = UpdateStatus::Available {
+        version: DEMO_UPDATE_VERSION.to_owned(),
+    };
+    capture_tray_menu(
+        &handle,
+        TrayMenu::new(library, true),
+        state,
+        TRAY_DARK,
+        &dir.join("tray-menu-update@1x.png"),
+    )?;
     Ok(())
 }
 
@@ -2913,6 +3008,9 @@ fn run() -> anyhow::Result<()> {
             if let Some(part) = only {
                 for shot in shots().iter().filter(|s| s.name.contains(&part)) {
                     capture(&rt, shot, &dir.join(format!("{}.png", shot.name)))?;
+                }
+                if "tray-menu-update@1x".contains(&part) {
+                    dump_tray_update(&rt, &dir)?;
                 }
                 return Ok(());
             }
