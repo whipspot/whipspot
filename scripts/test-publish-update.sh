@@ -43,7 +43,11 @@ FAKE="$T/repo" PUB="$T/bucket-public" PRIV="$T/bucket-private" KEYS="$T/keys"
 mkdir -p "$FAKE/scripts" "$FAKE/release" "$FAKE/crates/whipspot-app" "$PUB" "$PRIV" "$KEYS" "$T/fakebin" "$T/apps"
 chmod 700 "$KEYS"
 cp "$REPO/scripts/publish-update.sh" "$FAKE/scripts/"
-cp "$REPO/release/lunepack.toml" "$FAKE/release/"
+# The config as it was before the real bootstrap: the committed one holds the real root key, which
+# goes back to the placeholder so this run bootstraps its own throwaway root.
+pre_bootstrap_config() { sed 's|^    "[0-9a-f]\{64\}",$|    "ROOT-KEY-PLACEHOLDER-run-publish-update-bootstrap",|' "$REPO/release/lunepack.toml"; }
+pre_bootstrap_config >"$FAKE/release/lunepack.toml"
+grep -q PLACEHOLDER "$FAKE/release/lunepack.toml" || { echo "test-publish-update: no root key line to reset" >&2; exit 1; }
 mkdir -p "$FAKE/assets"
 cp -R "$REPO/assets/icon" "$FAKE/assets/icon"
 set_app_version() { printf '[package]\nname = "whipspot-app"\nversion = "%s"\nedition = "2024"\n' "$1" >"$FAKE/crates/whipspot-app/Cargo.toml"; }
@@ -143,7 +147,7 @@ mv "$KEYS/root.key" "$KEYS/root.key.moved" && mv "$KEYS/release.key" "$KEYS/rele
 cp "$FAKE/release/lunepack.toml" "$T/config.bootstrapped"
 # A second bootstrap must refuse because keys.json exists (the config is put back to a placeholder
 # and the key paths are free, so the remote check is what refuses).
-cp "$REPO/release/lunepack.toml" "$FAKE/release/lunepack.toml"
+pre_bootstrap_config >"$FAKE/release/lunepack.toml"
 refuse "bootstrap with keys.json already published" "keys.json already exists" bootstrap
 cp "$T/config.bootstrapped" "$FAKE/release/lunepack.toml"
 mv "$KEYS/root.key.moved" "$KEYS/root.key" && mv "$KEYS/release.key.moved" "$KEYS/release.key"

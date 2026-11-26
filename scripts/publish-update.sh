@@ -179,12 +179,16 @@ fetch_file() { # <@pub|@priv> <rel> <local file>
 # Fetches @pub:<rel> to <local file>: 0 when fetched, 1 when the server has no such file; anything
 # else (a refused connection, a 403, a 5xx) is not "absent" and ends the script.
 fetch_optional() { # <rel> <local file>
-  local status=0
-  rc copyto "@pub:$1" "$2" 2>/dev/null || status=$?
+  local status=0 err
+  err=$(rc copyto "@pub:$1" "$2" 2>&1 >/dev/null) || status=$?
   case "$status" in
     0) return 0 ;;
     3 | 4) return 1 ;;
-    *) die "cannot read the public bucket (rclone exit $status)" ;;
+    *)
+      # rclone's last error line names the path and the HTTP status; on a public URL it holds no key.
+      [ "$PUBLIC_HTTP" != 1 ] || echo "publish-update: rclone: $(tail -n 1 <<<"$err" | cut -c1-300)" >&2
+      die "cannot read the public bucket (rclone exit $status)"
+      ;;
   esac
 }
 
