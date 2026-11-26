@@ -60,6 +60,9 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   # lunepack's CLI, runtime and UI, built from the commit Cargo.lock pins (no secrets here).
+  # No build cache here: these binaries later run with the release key (pack, publish) and ship in
+  # every pack, and ci.yml's caches are written by jobs that compile the whole dependency tree, so a
+  # restored cache is not trusted. Always a clean target dir.
   # `lunepack prebuilt fetch` refuses a CLI built from source, so the runtime and UI are built too.
   tools-macos:
     runs-on: macos-latest
@@ -82,9 +85,6 @@ jobs:
           ref: ${{ steps.pin.outputs.rev }}
           path: lunepack-src
           persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: lunepack-src
       - name: Build the CLI, runtime and UI (universal)
         shell: bash
         env:
@@ -128,9 +128,6 @@ jobs:
           ref: ${{ steps.pin.outputs.rev }}
           path: lunepack-src
           persist-credentials: false
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: lunepack-src
       - name: Build the CLI
         shell: bash
         env:

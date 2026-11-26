@@ -235,8 +235,10 @@ import functools, http.server, sys
 class H(http.server.SimpleHTTPRequestHandler):
     def list_directory(self, path):
         self.send_error(404, "no listing")
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *a):
+        if len(sys.argv) > 2:
+            with open(sys.argv[2], "a") as f:
+                f.write(self.requestline + "\n")
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(H, directory=sys.argv[1]))
 print(srv.server_address[1], flush=True)
 srv.serve_forever()
@@ -294,6 +296,30 @@ for u in "http://example.com/" "https://example.com/x y" "https://ex'ample.com/"
   tail -n +"$((mark + 1))" "$LOG" | grep -qF "not a plain https host" || fail "a bad public URL was refused for another reason"
 done
 ok "bad public URLs refused"
+# The root walk: the config's root is version 1 and is never published; rotations are root-2.json,
+# root-3.json, ... A copy of the public folder with those two documents (their content is not valid:
+# only the names asked for matter here, lunepack's own checks of them are not under test) is served
+# with a request log; the walk must ask for root-2, root-3 (root-2 existed) and root-4 (it ended
+# there), and never for root-1.
+cp -R "$PUB" "$T/pub-roots"
+echo '{}' >"$T/pub-roots/whipspot/root-2.json"
+echo '{}' >"$T/pub-roots/whipspot/root-3.json"
+python3 "$T/nolist.py" "$T/pub-roots" "$T/roots-requests.log" >"$T/http-port2" 2>>"$T/http-err" &
+HTTP_PID2=$!
+for _ in $(seq 1 50); do [ -s "$T/http-port2" ] && break; sleep 0.1; done
+HTTP_PORT2=$(head -n 1 "$T/http-port2")
+[[ "$HTTP_PORT2" =~ ^[0-9]+$ ]] || fail "the second test http server did not start"
+set_app_version 0.2.13
+env -u R2_ACCOUNT_ID -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u WHIPSPOT_R2_PRIVATE WHIPSPOT_R2_PUBLIC="http://127.0.0.1:$HTTP_PORT2/" \
+  WHIPSPOT_PACKED="$T/packed-roots" bash "$FAKE/scripts/publish-update.sh" pack "$TARGET" "$(make_app 0.2.13)" 0.2.13 >>"$LOG" 2>&1 || true
+kill "$HTTP_PID2" 2>/dev/null || true
+wait "$HTTP_PID2" 2>/dev/null || true
+for r in 2 3 4; do
+  grep -q "/whipspot/root-$r.json " "$T/roots-requests.log" || fail "the keyless fetch never asked for root-$r.json"
+done
+if grep -q "/whipspot/root-1.json " "$T/roots-requests.log"; then fail "the keyless fetch asked for root-1.json (the config's root is never published)"; fi
+if grep -q "/whipspot/root-5.json " "$T/roots-requests.log"; then fail "the keyless fetch walked past the first missing root document"; fi
+ok "the keyless fetch walks root-2, root-3, ... from the config's root version + 1"
 # With the R2 remote as the public bucket, pack still needs the R2 keys (the control for the above).
 (unset R2_SECRET_ACCESS_KEY; WHIPSPOT_R2_PUBLIC=whipspotr2:izzat-updates bash "$FAKE/scripts/publish-update.sh" pack "$TARGET" "$(make_app 0.2.12)" 0.2.12 >>"$LOG" 2>&1) &&
   fail "pack against R2 ran without R2 keys"

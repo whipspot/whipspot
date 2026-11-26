@@ -188,17 +188,28 @@ fetch_optional() { # <rel> <local file>
   esac
 }
 
+# The version of the config's [root] (the root every installed copy carries), as a number.
+root_version() {
+  local v
+  v=$(awk '/^\[root\]/ { s = 1; next } /^\[/ { s = 0 } s && /^version[[:space:]]*=/ { gsub(/[^0-9]/, ""); print; exit }' "$CONFIG")
+  [[ "$v" =~ ^[1-9][0-9]{0,5}$ ]] || die "no [root] version in release/lunepack.toml"
+  printf '%s' "$v"
+}
+
 # keys.json, root-*.json and the channel's feed into $WORK/rel (the feed may be absent).
 fetch_trust_docs() {
   mkdir -p "$WORK/rel"
   if [ "$PUBLIC_HTTP" = 1 ]; then
-    # A URL has no listing: the documents are fetched by name. The root documents are root-1.json,
-    # root-2.json, ... (a root rotation adds one); the first missing one ends the run.
-    local n=1
+    # A URL has no listing: the documents are fetched by name. The config's [root] is version V and
+    # is never published; each rotation publishes root-<k>.json for k = V+1, V+2, ... in order, so the
+    # first missing one ends the walk (as lunepack's own release-directory walk does).
+    local rv n
+    rv=$(root_version)
+    n=$((rv + 1))
     fetch_optional "$PREFIX/keys.json" "$WORK/rel/keys.json" ||
       die "no $PREFIX/keys.json at the public feed; run bootstrap first"
     fetch_optional "$PREFIX/feed-$CHANNEL.json" "$WORK/rel/feed-$CHANNEL.json" || true
-    while [ "$n" -le 64 ] && fetch_optional "$PREFIX/root-$n.json" "$WORK/rel/root-$n.json"; do n=$((n + 1)); done
+    while [ "$n" -le $((rv + 1024)) ] && fetch_optional "$PREFIX/root-$n.json" "$WORK/rel/root-$n.json"; do n=$((n + 1)); done
     return 0
   fi
   rc copy "@pub:$PREFIX/keys.json" "$WORK/rel" 2>/dev/null ||
