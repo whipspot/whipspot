@@ -41,7 +41,7 @@ specific to Whipspot.
 - `feed_check` (by hand): reads `keys.json` from an Ubuntu, a macOS and a Windows runner and runs
   `publish fetch` on Ubuntu; no secret. Run it before the first tag.
 
-No job that holds a secret compiles anything, and each runs `lunepack` only after its hash check.
+No job that holds a secret compiles anything, and each runs `lunepack` only after checking that its tools directory holds exactly the expected files and that their hashes match.
 
 ## GitHub environments and secrets
 
