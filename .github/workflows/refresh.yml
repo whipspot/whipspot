@@ -4,7 +4,7 @@
 #
 # No job that holds a secret compiles anything. tools-linux builds the lunepack CLI with no secret
 # and outputs its SHA-256; every job that holds a key downloads it, refuses to run it unless the
-# hash matches, and only then runs it.
+# directory holds exactly the expected file and the hash matches, and only then runs it.
 #   refresh   environment `release-refresh` (main only): the release key and two R2 tokens, public
 #             read and write, private read only (a refresh token must not be able to write the
 #             private bucket: that would let it lower the state file's record).
@@ -129,13 +129,23 @@ jobs:
           WANT_CLI: ${{ needs.tools-linux.outputs.cli_sha256 }}
         run: |
           set -euo pipefail
+          # Exactly the expected files and nothing else (no extra file, directory or symlink): an
+          # artifact a build job re-uploaded under this name could carry a DLL beside the CLI.
+          dir=dist/lunepack-tools
+          want_files=$(printf '%s\n' lunepack | LC_ALL=C sort)
+          not_files=$(find "$dir" -mindepth 1 ! -type f -print)
+          have_files=$(find "$dir" -mindepth 1 -type f -exec basename {} \; | LC_ALL=C sort)
+          if [ -n "$not_files" ] || [ "$have_files" != "$want_files" ]; then
+            echo "the tools directory does not hold exactly the expected files" >&2
+            exit 1
+          fi
           h() { sha256sum "$1" | cut -d' ' -f1; }
-          cli=$(h dist/lunepack-tools/lunepack)
+          cli=$(h "$dir/lunepack")
           if [ -z "$WANT_CLI" ] || [ "$cli" != "$WANT_CLI" ]; then
             echo "the CLI is not the one tools-linux built" >&2
             exit 1
           fi
-          chmod +x dist/lunepack-tools/lunepack
+          chmod +x "$dir/lunepack"
       - name: Fetch from the feed (writes only a scratch directory)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -168,13 +178,23 @@ jobs:
           WANT_CLI: ${{ needs.tools-linux.outputs.cli_sha256 }}
         run: |
           set -euo pipefail
+          # Exactly the expected files and nothing else (no extra file, directory or symlink): an
+          # artifact a build job re-uploaded under this name could carry a DLL beside the CLI.
+          dir=dist/lunepack-tools
+          want_files=$(printf '%s\n' lunepack | LC_ALL=C sort)
+          not_files=$(find "$dir" -mindepth 1 ! -type f -print)
+          have_files=$(find "$dir" -mindepth 1 -type f -exec basename {} \; | LC_ALL=C sort)
+          if [ -n "$not_files" ] || [ "$have_files" != "$want_files" ]; then
+            echo "the tools directory does not hold exactly the expected files" >&2
+            exit 1
+          fi
           h() { sha256sum "$1" | cut -d' ' -f1; }
-          cli=$(h dist/lunepack-tools/lunepack)
+          cli=$(h "$dir/lunepack")
           if [ -z "$WANT_CLI" ] || [ "$cli" != "$WANT_CLI" ]; then
             echo "the CLI is not the one tools-linux built" >&2
             exit 1
           fi
-          chmod +x dist/lunepack-tools/lunepack
+          chmod +x "$dir/lunepack"
       - name: Refresh the feed
         shell: bash
         env:
@@ -212,13 +232,23 @@ jobs:
           WANT_CLI: ${{ needs.tools-linux.outputs.cli_sha256 }}
         run: |
           set -euo pipefail
+          # Exactly the expected files and nothing else (no extra file, directory or symlink): an
+          # artifact a build job re-uploaded under this name could carry a DLL beside the CLI.
+          dir=dist/lunepack-tools
+          want_files=$(printf '%s\n' lunepack | LC_ALL=C sort)
+          not_files=$(find "$dir" -mindepth 1 ! -type f -print)
+          have_files=$(find "$dir" -mindepth 1 -type f -exec basename {} \; | LC_ALL=C sort)
+          if [ -n "$not_files" ] || [ "$have_files" != "$want_files" ]; then
+            echo "the tools directory does not hold exactly the expected files" >&2
+            exit 1
+          fi
           h() { sha256sum "$1" | cut -d' ' -f1; }
-          cli=$(h dist/lunepack-tools/lunepack)
+          cli=$(h "$dir/lunepack")
           if [ -z "$WANT_CLI" ] || [ "$cli" != "$WANT_CLI" ]; then
             echo "the CLI is not the one tools-linux built" >&2
             exit 1
           fi
-          chmod +x dist/lunepack-tools/lunepack
+          chmod +x "$dir/lunepack"
       - name: Drop the release
         shell: bash
         env:
