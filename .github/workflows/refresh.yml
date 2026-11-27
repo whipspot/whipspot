@@ -11,6 +11,9 @@
 #   drop      environment `release-push` (run from a v* tag, the owner approves): the release key
 #             and the push token, as in release.yml.
 #   feed-check no secret, no environment: only reads https://updates.izzat.dev/whipspot/.
+#   ref-check  no secret, no environment: fails a by-hand run started from the wrong ref (a drop
+#             not from a v* tag, a refresh not from main), which would otherwise end green with
+#             every key job skipped.
 # None of these sets SOURCE_DATE_EPOCH: they sign at the real time.
 name: refresh
 
@@ -93,6 +96,29 @@ jobs:
           name: tools-linux
           path: dist/lunepack-tools
           if-no-files-found: error
+
+  # A by-hand run from the wrong ref would otherwise end green with refresh and drop both skipped:
+  # a drop must start from a v* tag and a refresh from main. No secret, no environment.
+  ref-check:
+    if: github.event_name == 'workflow_dispatch' && !inputs.feed_check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the ref against the run's purpose
+        shell: bash
+        env:
+          DROP_VERSION: ${{ inputs.drop_version }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DROP_VERSION" ]; then
+            case "$REF" in
+              refs/tags/v*) ;;
+              *) echo "a drop runs from a v* tag, not from $REF" >&2; exit 1 ;;
+            esac
+          elif [ "$REF" != refs/heads/main ]; then
+            echo "a refresh runs from main, not from $REF" >&2
+            exit 1
+          fi
 
   # Can GitHub's runners read the feed? v0.2.5 failed at `publish fetch` with a 403 from this URL.
   # Run it by hand (feed_check on) before tagging. It reads one public URL and holds no secret; on
