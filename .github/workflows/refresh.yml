@@ -1,0 +1,236 @@
+# The update feed's upkeep, apart from a release (release.yml): a weekly refresh that re-signs the
+# stable feed before it expires, a by-hand drop of one release, and a check that GitHub's runners
+# can read the feed. Operator steps: release/README.md.
+#
+# No job that holds a secret compiles anything. tools-linux builds the lunepack CLI with no secret
+# and outputs its SHA-256; every job that holds a key downloads it, refuses to run it unless the
+# hash matches, and only then runs it.
+#   refresh   environment `release-refresh` (main only): the release key and two R2 tokens, public
+#             read and write, private read only (a refresh token must not be able to write the
+#             private bucket: that would let it lower the state file's record).
+#   drop      environment `release-push` (run from a v* tag, the owner approves): the release key
+#             and the push token, as in release.yml.
+#   feed-check no secret, no environment: only reads https://updates.izzat.dev/whipspot/.
+# None of these sets SOURCE_DATE_EPOCH: they sign at the real time.
+name: refresh
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      drop_version:
+        description: "a release to take out of the feeds (run from a v* tag); empty: refresh"
+        required: false
+        default: ""
+      feed_check:
+        description: "only check that GitHub runners can read the feed (no secret is used)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# The same group as release.yml: a refresh never starts while a push runs.
+concurrency:
+  group: whipspot-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The lunepack CLI for Linux, built from the commit Cargo.lock pins. No secret, no cache (the
+  # binary later runs beside the release key and the R2 tokens).
+  tools-linux:
+    runs-on: ubuntu-latest
+    outputs:
+      cli_sha256: ${{ steps.hash.outputs.cli_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the lunepack commit from Cargo.lock
+        id: pin
+        shell: bash
+        run: |
+          revs=$(grep -E '^source = "git\+https://github\.com/lune-rs/lunepack\?rev=[0-9a-f]{40}#[0-9a-f]{40}"$' Cargo.lock | sort -u)
+          [ "$(grep -c . <<<"$revs")" = 1 ] || { echo "Cargo.lock does not pin one lunepack commit" >&2; exit 1; }
+          rev=$(sed -E 's/^.*\?rev=([0-9a-f]{40})#([0-9a-f]{40})"$/\1 \2/' <<<"$revs")
+          [ "${rev% *}" = "${rev#* }" ] || { echo "the lunepack rev and its locked commit differ" >&2; exit 1; }
+          echo "rev=${rev% *}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lune-rs/lunepack
+          ref: ${{ steps.pin.outputs.rev }}
+          path: lunepack-src
+          persist-credentials: false
+      - name: Build the CLI
+        shell: bash
+        env:
+          PIN: ${{ steps.pin.outputs.rev }}
+        run: |
+          set -euo pipefail
+          [ "$(git -C lunepack-src rev-parse HEAD)" = "$PIN" ] || { echo "the lunepack checkout is not the pinned commit" >&2; exit 1; }
+          out="$GITHUB_WORKSPACE/dist/lunepack-tools"
+          mkdir -p "$out"
+          cd lunepack-src
+          cargo fetch --locked
+          cargo build --locked --release -p lunepack-cli --config profile.release.strip=true
+          cp target/release/lunepack "$out/lunepack"
+      - name: Hash the CLI
+        id: hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          h() { sha256sum "$1" | cut -d' ' -f1; }
+          cli=$(h dist/lunepack-tools/lunepack)
+          [[ "$cli" =~ ^[0-9a-f]{64}$ ]] || { echo "no usable tool hash" >&2; exit 1; }
+          echo "cli_sha256=$cli" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tools-linux
+          path: dist/lunepack-tools
+          if-no-files-found: error
+
+  # Can GitHub's runners read the feed? v0.2.5 failed at `publish fetch` with a 403 from this URL.
+  # Run it by hand (feed_check on) before tagging. It reads one public URL and holds no secret; on
+  # Linux it also runs `publish fetch` (which reads no credential) into a scratch directory.
+  feed-check:
+    if: github.event_name == 'workflow_dispatch' && inputs.feed_check
+    needs: [tools-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Read keys.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /dev/null -w '%{http_code}' https://updates.izzat.dev/whipspot/keys.json)
+          echo "keys.json: HTTP $code"
+          [ "$code" = 200 ] || { echo "the feed is not readable from this runner" >&2; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: tools-linux
+          path: dist/lunepack-tools
+      - name: Check the CLI against tools-linux
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          WANT_CLI: ${{ needs.tools-linux.outputs.cli_sha256 }}
+        run: |
+          set -euo pipefail
+          h() { sha256sum "$1" | cut -d' ' -f1; }
+          cli=$(h dist/lunepack-tools/lunepack)
+          if [ -z "$WANT_CLI" ] || [ "$cli" != "$WANT_CLI" ]; then
+            echo "the CLI is not the one tools-linux built" >&2
+            exit 1
+          fi
+          chmod +x dist/lunepack-tools/lunepack
+      - name: Fetch from the feed (writes only a scratch directory)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist/lunepack-tools/lunepack publish fetch --config release/lunepack.toml \
+            --release-dir "$RUNNER_TEMP/feed-check" --version 999999.0.0
+
+  # Re-signs the stable feed when it expires within 30 days; exit 0 with a notice while nothing is
+  # published. Main only (the environment is restricted to main too).
+  refresh:
+    if: >-
+      (github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.drop_version == '' && !inputs.feed_check))
+      && github.ref == 'refs/heads/main'
+    needs: [tools-linux]
+    runs-on: ubuntu-latest
+    environment: release-refresh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tools-linux
+          path: dist/lunepack-tools
+      - name: Check the CLI against tools-linux
+        shell: bash
+        env:
+          WANT_CLI: ${{ needs.tools-linux.outputs.cli_sha256 }}
+        run: |
+          set -euo pipefail
+          h() { sha256sum "$1" | cut -d' ' -f1; }
+          cli=$(h dist/lunepack-tools/lunepack)
+          if [ -z "$WANT_CLI" ] || [ "$cli" != "$WANT_CLI" ]; then
+            echo "the CLI is not the one tools-linux built" >&2
+            exit 1
+          fi
+          chmod +x dist/lunepack-tools/lunepack
+      - name: Refresh the feed
+        shell: bash
+        env:
+          LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_REFRESH_PUBLIC_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_REFRESH_PUBLIC_SECRET_ACCESS_KEY }}
+          R2_PRIVATE_ACCESS_KEY_ID: ${{ secrets.R2_REFRESH_PRIVATE_ACCESS_KEY_ID }}
+          R2_PRIVATE_SECRET_ACCESS_KEY: ${{ secrets.R2_REFRESH_PRIVATE_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          dist/lunepack-tools/lunepack publish refresh --config release/lunepack.toml --sign release \
+            --if-expiring-within-days 30 --skip-if-unpublished
+
+  # Takes one release out of the feeds (a broken update). By hand, from a v* tag, with the version;
+  # the owner approves as for a push.
+  drop:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.drop_version != '' &&
+      startsWith(github.ref, 'refs/tags/v')
+    needs: [tools-linux]
+    runs-on: ubuntu-latest
+    environment: release-push
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tools-linux
+          path: dist/lunepack-tools
+      - name: Check the CLI against tools-linux
+        shell: bash
+        env:
+          WANT_CLI: ${{ needs.tools-linux.outputs.cli_sha256 }}
+        run: |
+          set -euo pipefail
+          h() { sha256sum "$1" | cut -d' ' -f1; }
+          cli=$(h dist/lunepack-tools/lunepack)
+          if [ -z "$WANT_CLI" ] || [ "$cli" != "$WANT_CLI" ]; then
+            echo "the CLI is not the one tools-linux built" >&2
+            exit 1
+          fi
+          chmod +x dist/lunepack-tools/lunepack
+      - name: Drop the release
+        shell: bash
+        env:
+          DROP_VERSION: ${{ inputs.drop_version }}
+          LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PRIVATE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_PRIVATE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          lp=dist/lunepack-tools/lunepack
+          "$lp" publish drop --config release/lunepack.toml --version "$DROP_VERSION" --sign release --dry-run
+          "$lp" publish drop --config release/lunepack.toml --version "$DROP_VERSION" --sign release
