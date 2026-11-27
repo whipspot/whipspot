@@ -1,7 +1,9 @@
-# Release pipeline. A version tag (v*) builds the app for macOS and Windows, packs each build with
+# Release pipeline. A version tag builds the app for macOS and Windows, packs each build with
 # lunepack, makes the installers (a .dmg and a setup .exe), publishes the update with
-# `lunepack publish push` (the stable feed keeps the 10 newest versions; release/README.md) and
-# attaches the installers to a draft GitHub Release. Unsigned: no Apple Developer ID or
+# `lunepack publish push` (each feed keeps its 10 newest versions; release/README.md) and
+# attaches the installers to a draft GitHub Release. v<x.y.z> (on main) is a stable release,
+# listed in the stable and beta feeds; v<x.y.z>-rc.<N> (on main or develop) a beta release,
+# listed in the beta feed only and packed for the beta channel (D75). Unsigned: no Apple Developer ID or
 # notarisation, no Windows code signing (see README, Install). The weekly feed refresh and the
 # manual drop of a release are in refresh.yml.
 #
@@ -44,26 +46,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The version of crates/whipspot-app, checked against the tag before anything is built or uploaded.
+  # The release's version and channel, checked against the tag before anything is built or
+  # uploaded (the channel standard, D75): v<x.y.z> is a stable release on main, listed in both
+  # feeds; v<x.y.z>-rc.<N> a beta release on main or develop, listed in the beta feed only. The
+  # version of crates/whipspot-app is the base <x.y.z> in both cases. A manual run builds the
+  # Cargo version as stable.
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      channel: ${{ steps.v.outputs.channel }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Read the version and match it to the tag
+          fetch-depth: 0
+      - name: Read the version and match it to the tag and its branch
         id: v
         shell: bash
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/whipspot-app/Cargo.toml | head -1)
-          [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || { echo "no usable version in crates/whipspot-app/Cargo.toml" >&2; exit 1; }
-          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "the tag is not v$version (crates/whipspot-app/Cargo.toml)" >&2
-            exit 1
+          set -euo pipefail
+          base=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/whipspot-app/Cargo.toml | head -1)
+          [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "crates/whipspot-app/Cargo.toml has no <x.y.z> version" >&2; exit 1; }
+          version=$base channel=stable
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-rc\.[0-9]+)?$ ]] || { echo "the tag is not v<x.y.z> or v<x.y.z>-rc.<N>" >&2; exit 1; }
+            [ "${BASH_REMATCH[1]}" = "$base" ] || { echo "the tag is not v$base or v$base-rc.<N> (crates/whipspot-app/Cargo.toml)" >&2; exit 1; }
+            version=${GITHUB_REF_NAME#v}
+            on() { git rev-parse -q --verify "refs/remotes/origin/$1" >/dev/null && git merge-base --is-ancestor HEAD "origin/$1"; }
+            if [ -n "${BASH_REMATCH[2]}" ]; then
+              channel=beta
+              on main || on develop || { echo "a beta tag must be on main or develop" >&2; exit 1; }
+            else
+              on main || { echo "a stable tag must be on main" >&2; exit 1; }
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
   # lunepack's CLI, runtime and UI, built from the commit Cargo.lock pins (no secrets here).
   # No build cache here: these binaries later run with the release key (pack, push) and ship in
@@ -324,6 +343,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          CHANNEL: ${{ needs.version.outputs.channel }}
           LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
         run: |
           set -euo pipefail
@@ -332,7 +352,7 @@ jobs:
           tools=dist/lunepack-tools
           "$tools/lunepack" publish fetch --config release/lunepack.toml --release-dir release-dir --version "$VERSION"
           "$tools/lunepack" pack --config release/lunepack.toml --input dist/Whipspot.app --version "$VERSION" \
-            --target macos-universal --release-dir release-dir --sign release --deltas 1 \
+            --target macos-universal --release-dir release-dir --sign release --deltas 1 --channel "$CHANNEL" \
             --runtime "$tools/lunepack-runtime" --ui "$tools/lunepack-ui"
           "$tools/lunepack" setup release-dir --config release/lunepack.toml --version "$VERSION" \
             --target macos-universal --out "dist/whipspot-$VERSION-macos-universal.dmg"
@@ -402,6 +422,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          CHANNEL: ${{ needs.version.outputs.channel }}
           LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
         run: |
           set -euo pipefail
@@ -410,7 +431,7 @@ jobs:
           tools=dist/lunepack-tools
           "$tools/lunepack.exe" publish fetch --config release/lunepack.toml --release-dir release-dir --version "$VERSION"
           "$tools/lunepack.exe" pack --config release/lunepack.toml --input dist/input --version "$VERSION" \
-            --target windows-x86_64 --release-dir release-dir --sign release --deltas 1 \
+            --target windows-x86_64 --release-dir release-dir --sign release --deltas 1 --channel "$CHANNEL" \
             --runtime "$tools/lunepack-runtime.exe" --ui "$tools/lunepack-ui.exe" --stub "$tools/lunepack-stub.exe"
           "$tools/lunepack.exe" setup release-dir --config release/lunepack.toml --version "$VERSION" \
             --target windows-x86_64 --out "dist/whipspot-$VERSION-windows-x86_64-setup.exe"
@@ -427,8 +448,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Adds the version to the stable feed, drops all but the 10 newest, uploads, deletes the dropped
-  # folders and saves the publisher state (all inside `lunepack publish push`, after a dry run).
+  # Adds the version to its feeds (stable and beta, or beta only for an -rc.<N>), drops all but the
+  # 10 newest of each, uploads, deletes the dropped folders and saves the publisher state (all
+  # inside `lunepack publish push`, after a dry run).
   # The only job with the R2 write token, and it waits for the owner's approval (environment
   # release-push). It compiles nothing: the CLI is the macOS one from tools-macos (this job runs on
   # a Mac runner, so no Linux CLI is built), run only after its hash is checked. No
@@ -504,7 +526,7 @@ jobs:
   # refuses a version that is already in the feed.
   release:
     if: github.event_name == 'push'
-    needs: [push, pack-macos, pack-windows]
+    needs: [version, push, pack-macos, pack-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -514,10 +536,15 @@ jobs:
           pattern: installer-*
           merge-multiple: true
           path: dist
+      # A beta release (an -rc.<N> tag) is a GitHub prerelease; a stable one is not.
       - name: Create a draft release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "$GITHUB_REF_NAME" dist/*.dmg dist/*-setup.exe
-          --repo "$GITHUB_REPOSITORY" --draft --prerelease --generate-notes
-          --title "Whipspot $GITHUB_REF_NAME"
+          CHANNEL: ${{ needs.version.outputs.channel }}
+        run: |
+          set -euo pipefail
+          pre=()
+          [ "$CHANNEL" = beta ] && pre=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/*.dmg dist/*-setup.exe \
+            --repo "$GITHUB_REPOSITORY" --draft "${pre[@]}" --generate-notes \
+            --title "Whipspot $GITHUB_REF_NAME"

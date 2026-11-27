@@ -1,6 +1,6 @@
-# The update feed's upkeep, apart from a release (release.yml): a weekly refresh that re-signs the
-# stable feed before it expires, a by-hand drop of one release, and a check that GitHub's runners
-# can read the feed. Operator steps: release/README.md.
+# The update feeds' upkeep, apart from a release (release.yml): a weekly refresh that re-signs each
+# channel's feed (stable, beta) before it expires, a by-hand drop of one release, and a check that
+# GitHub's runners can read the feed. Operator steps: release/README.md.
 #
 # No job that holds a secret compiles anything. tools-linux builds the lunepack CLI with no secret
 # and outputs its SHA-256; every job that holds a key downloads it, refuses to run it unless the

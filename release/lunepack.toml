@@ -20,6 +20,8 @@ keys = [
 [signers.release]
 env = "LUNEPACK_RELEASE_KEY"
 
+# The default channel; a beta release (tag v<x.y.z>-rc.<N>) is packed with `pack --channel beta`.
+# An installed copy follows the channel its setup came from (the app records it, D75).
 [update]
 feed = "https://updates.izzat.dev/whipspot/"
 channel = "stable"
@@ -62,5 +64,6 @@ private_bucket = "izzat-updates-publisher"
 keep = 10
 deltas = 1
 feed_days = 90
-channels = ["stable"]
+channels = ["stable", "beta"]
+prerelease_channels = ["beta"]             # a version with a pre-release part (-rc.N) goes only here
 require_targets = ["macos-universal", "windows-x86_64"]
