@@ -70,6 +70,10 @@ pub struct Settings {
     /// Look for a newer version on a schedule (60 s after start, then every 6 h); on by default.
     /// A check the user asks for does not depend on it.
     pub update_check: bool,
+    /// The update channel this copy follows (D75): recorded from the installed copy's own
+    /// channel at its first start and at the first start after a setup, so an update to a pack of
+    /// another channel never moves it. Empty until recorded; whipspot-update checks the name.
+    pub update_channel: String,
     /// The theme's key, `"a"`, `"b"` or `"c"`; any other value loads as `"c"` (MD89).
     pub theme: String,
     /// `"high"`, `"normal"` or `"low"` (MD88); any other value loads as `"high"`.
@@ -153,6 +157,7 @@ impl Default for Settings {
             lyrics: true,
             efficiency_mode: true,
             update_check: true,
+            update_channel: String::new(),
             theme: ThemeId::default().key().to_owned(),
             stream_quality: StreamQuality::default().key().to_owned(),
             auto_hide: true,
@@ -469,6 +474,7 @@ mod tests {
             lyrics: false,
             efficiency_mode: false,
             update_check: false,
+            update_channel: "beta".to_owned(),
             theme: "b".to_owned(),
             stream_quality: "low".to_owned(),
             auto_hide: false,
@@ -555,6 +561,17 @@ mod tests {
             br#"{"version":1,"efficiency_mode":false}"#,
         );
         assert!(!off.efficiency_mode);
+    }
+
+    #[test]
+    fn update_channel_is_unrecorded_by_default_and_a_saved_one_loads() {
+        assert_eq!(Settings::default().update_channel, "");
+        assert_eq!(
+            load_text("channel-none", br#"{"version":1}"#).update_channel,
+            ""
+        );
+        let beta = load_text("channel-beta", br#"{"version":1,"update_channel":"beta"}"#);
+        assert_eq!(beta.update_channel, "beta");
     }
 
     #[test]
@@ -1148,6 +1165,7 @@ mod tests {
             lyrics: maybe(rng),
             efficiency_mode: maybe(rng),
             update_check: maybe(rng),
+            update_channel: ["", "stable", "beta", "bogus/x"][rng.below(4)].to_owned(),
             theme: ["a", "b", "c", "z", ""][rng.below(5)].to_owned(),
             stream_quality: ["high", "normal", "low", "ultra"][rng.below(4)].to_owned(),
             auto_hide: maybe(rng),
