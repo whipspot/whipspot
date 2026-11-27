@@ -3,9 +3,10 @@
 # `lunepack publish push` (each feed keeps its 10 newest versions; release/README.md) and
 # attaches the installers to a draft GitHub Release. v<x.y.z> (on main) is a stable release,
 # listed in the stable and beta feeds; v<x.y.z>-rc.<N> (on main or develop) a beta release,
-# listed in the beta feed only and packed for the beta channel (D75). Unsigned: no Apple Developer ID or
-# notarisation, no Windows code signing (see README, Install). The weekly feed refresh and the
-# manual drop of a release are in refresh.yml.
+# listed in the beta feed only and packed for the beta channel (D75). macOS is signed ad-hoc
+# only (release/lunepack.toml [codesign.macos]): no Apple Developer ID or notarisation, no
+# Windows code signing (see README, Install). The weekly feed refresh and the manual drop of a
+# release are in refresh.yml.
 #
 # No job that holds a secret compiles anything. Four kinds of job:
 #   build  (tools-*, build-*): cargo runs here, with every build script and proc macro of the

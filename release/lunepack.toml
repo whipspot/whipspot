@@ -41,6 +41,15 @@ categories = ["AudioVideo", "Audio", "Player"]
 entry = "Contents/MacOS/Whipspot"
 icon = "Contents/Resources/whipspot-256.png"
 
+# macOS code signing: an ad-hoc signature (no Apple developer identity, no notarization) on the
+# packed app and on the installer app and .dmg that `setup` makes. Without it the installer app is
+# only linker-signed, and a downloaded .dmg reports it as "damaged"; with it Gatekeeper shows its
+# ordinary unidentified-developer prompt instead. Signing happens before hashing, so the update
+# feed signs the signed files. Developer ID signing and notarization would replace these templates.
+[codesign.macos]
+sign = ["/usr/bin/codesign", "--force", "--sign", "-", "{path}"]
+verify = ["/usr/bin/codesign", "--verify", "--deep", "--strict", "{path}"]
+
 # Inputs of the installers' stamping (not part of any signed document), relative to this file.
 [windows]
 icon = "../assets/icon/whipspot.ico"

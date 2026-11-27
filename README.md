@@ -42,7 +42,7 @@ flowchart LR
 Get the latest installer from [**Releases**](../../releases).
 
 - **Windows:** run `whipspot-<version>-windows-x86_64-setup.exe`. It installs for your user only. The installer isn't code-signed yet, so if SmartScreen warns you, click *More info* → *Run anyway*.
-- **macOS:** open `whipspot-<version>-macos-universal.dmg` and drag Whipspot to Applications. The app isn't notarised yet, so right-click it and choose *Open* the first time.
+- **macOS:** open `whipspot-<version>-macos-universal.dmg` and run *Install Whipspot*. The installer isn't signed with an Apple Developer ID or notarised yet, so macOS blocks it the first time: open System Settings > Privacy & Security and choose *Open Anyway*.
 
 > The installers are built by CI, and no installer has been run on a real Windows 11 or macOS machine yet. Treat the first install as a test.
 
