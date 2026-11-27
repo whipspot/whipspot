@@ -2976,7 +2976,7 @@ dependencies = [
 [[package]]
 name = "lunepack"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "lunepack-codec-lzma",
  "lunepack-core",
@@ -2996,7 +2996,7 @@ dependencies = [
 [[package]]
 name = "lunepack-codec-lzma"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "lunepack-core",
  "lzma-rust2",
@@ -3005,7 +3005,7 @@ dependencies = [
 [[package]]
 name = "lunepack-core"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "base64 0.22.1",
  "semver",
@@ -3018,7 +3018,7 @@ dependencies = [
 [[package]]
 name = "lunepack-crypto"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
@@ -3030,7 +3030,7 @@ dependencies = [
 [[package]]
 name = "lunepack-fs"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "fs4",
  "libc",
@@ -3040,20 +3040,23 @@ dependencies = [
 [[package]]
 name = "lunepack-http"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "http",
  "hyper-util",
  "lunepack-core",
  "rustls",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
  "ureq",
  "url",
+ "zeroize",
 ]
 
 [[package]]
 name = "lunepack-os-linux"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "libc",
  "lunepack-core",
@@ -3062,7 +3065,7 @@ dependencies = [
 [[package]]
 name = "lunepack-os-macos"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "core-foundation 0.10.1",
  "libc",
@@ -3073,7 +3076,7 @@ dependencies = [
 [[package]]
 name = "lunepack-os-windows"
 version = "0.1.0"
-source = "git+https://github.com/lune-rs/lunepack?rev=a3d23376a89b3825f9cc92e674af8ce04bfc09e4#a3d23376a89b3825f9cc92e674af8ce04bfc09e4"
+source = "git+https://github.com/lune-rs/lunepack?rev=be29be066341c52a1af95f9f6d7d30cabe2cba35#be29be066341c52a1af95f9f6d7d30cabe2cba35"
 dependencies = [
  "lunepack-core",
  "tracing",
@@ -6950,7 +6953,7 @@ dependencies = [
 
 [[package]]
 name = "whipspot-app"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "dirs",
