@@ -66,7 +66,7 @@ A tag ruleset limiting who may create `v*` tags, and a protected `main`, are rec
 2. `git tag -a vX.Y.Z -m "Whipspot X.Y.Z"` and push the tag. Approve `release-push` when the pack jobs
    are done.
 3. Check the result without any credential:
-   `lunepack publish fetch --release-dir <empty dir> --version 999999.0.0` checks the signatures and the
+   `lunepack publish fetch --config release/lunepack.toml --release-dir <empty dir> --version 999999.0.0` checks the signatures and the
    chain of what is published (it does not check expiry). The owner sees each feed's expiry with
    `lunepack publish plan --config release/lunepack.toml` and the store credentials in the environment.
 

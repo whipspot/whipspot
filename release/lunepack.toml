@@ -15,8 +15,8 @@ keys = [
     "6044f290a681ad4f22f3a9b18b2efde7881f4444d42c805de8330a985165e87e",
 ]
 
-# Signs manifests and feeds. The root key signs only at bootstrap, through
-# `--sign file:$WHIPSPOT_ROOT_KEY` (a config cannot name a key file by an environment variable).
+# Signs manifests and feeds. The root key stays offline with the owner and signs only key changes
+# (`lunepack publish keys`).
 [signers.release]
 env = "LUNEPACK_RELEASE_KEY"
 

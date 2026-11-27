@@ -33,8 +33,9 @@ permissions:
 
 # Two tags never publish at once, and refresh.yml shares the group so a refresh never starts while
 # a push runs; a manual run gets a group of its own and never blocks a release. A run waiting
-# behind another is replaced by a newer waiting one (GitHub keeps one): watch for a cancelled
-# release run and push its tag again.
+# behind another is replaced by a newer waiting one (GitHub keeps one, and it can be a refresh):
+# watch for a cancelled release run and re-run it (Re-run all jobs); pushing the tag again sends
+# no event.
 concurrency:
   group: ${{ github.event_name == 'push' && 'whipspot-publish' || format('dispatch-{0}', github.run_id) }}
   cancel-in-progress: false
