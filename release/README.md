@@ -8,7 +8,7 @@ strands existing installs. It never holds a key.
 Storage (Cloudflare R2, shared with Luneterm, which owns `luneterm/` in both buckets):
 
 - `izzat-updates`, public at `https://updates.izzat.dev/`: Whipspot's release directory under
-  `whipspot/` (`keys.json`, `feed-stable.json`, one folder per version).
+  `whipspot/` (`keys.json`, `feed-stable.json`, `feed-beta.json`, one folder per version).
 - `izzat-updates-publisher`, private: `whipspot/lunepack-state.json`, the publisher state lunepack
   uses to refuse a replayed older document, and the pending-deletes record. Never rebuild it from the
   public bucket.
@@ -29,12 +29,12 @@ specific to Whipspot.
   then `publish fetch` (the previous release for the delta, read from the public feed over https),
   `pack`, `setup`. They hold the release key and no R2 key.
 - `push` (environment `release-push`, the owner approves): checks the CLI hash, then
-  `publish push --dry-run` and `publish push`. Keeps the 10 newest versions in the `stable` feed.
-- `release`: a draft GitHub release with the two installers.
+  `publish push --dry-run` and `publish push`. Keeps the 10 newest versions in each feed.
+- `release`: a draft GitHub release with the two installers (a prerelease for a beta release).
 
 `.github/workflows/refresh.yml`:
 
-- weekly `refresh` (environment `release-refresh`, main only): re-signs the feed when it expires
+- weekly `refresh` (environment `release-refresh`, main only): re-signs each feed that expires
   within 30 days; does nothing while nothing is published.
 - `drop` (by hand from a `v*` tag, with `drop_version`; environment `release-push`): takes one release
   out of the feed.
@@ -57,14 +57,33 @@ The refresh tokens must not be one token with write access to both buckets: a re
 the private bucket could lower the state file's record. The workflows map these names onto the
 variables `[publish]` in `lunepack.toml` reads.
 
-A tag ruleset limiting who may create `v*` tags, and a protected `main`, are recommended.
+A tag ruleset (`v*`: creation, update and deletion, repository admins bypass) and a `main` ruleset
+(no deletion, no force push) are in place.
+
+## Channels
+
+Two channels, `stable` and `beta`, the standard every lunepack app of ours follows:
+
+| Tag | Branch | Listed in | Packed for |
+| --- | --- | --- | --- |
+| `vX.Y.Z` | `main` | `stable` and `beta` | `stable` |
+| `vX.Y.Z-rc.N` | `main` or `develop` | `beta` only | `beta` |
+
+The workflow refuses any other tag, and a tag on any other branch. In both cases the version in
+`crates/whipspot-app/Cargo.toml` is `X.Y.Z` (an rc leads to that version). Stable copies never see an rc:
+the stable feed never lists one. A later stable `vX.Y.Z` is listed in beta too, so beta copies move to it.
+
+An installed copy follows the channel its setup came from: the app records it in `settings.json`
+(`update_channel`) at its first start and at the first start after a setup, and keeps it through updates
+(a beta copy updated to a stable release stays on beta). To switch, uninstall and run the other channel's
+setup.
 
 ## Every release
 
-1. Set the version in `crates/whipspot-app/Cargo.toml` (the workflow refuses a tag that differs), commit,
-   push.
-2. `git tag -a vX.Y.Z -m "Whipspot X.Y.Z"` and push the tag. Approve `release-push` when the pack jobs
-   are done.
+1. Set the version in `crates/whipspot-app/Cargo.toml` to `X.Y.Z` (the workflow refuses a tag whose
+   `X.Y.Z` differs), commit, push. For a beta, do it on `develop` (or `main`) and wait for CI.
+2. `git tag -a vX.Y.Z -m "Whipspot X.Y.Z"` (or `vX.Y.Z-rc.N` for a beta) and push the tag. Approve
+   `release-push` when the pack jobs are done. Then publish the draft release.
 3. Check the result without any credential:
    `lunepack publish fetch --config release/lunepack.toml --release-dir <empty dir> --version 999999.0.0` checks the signatures and the
    chain of what is published (it does not check expiry). The owner sees each feed's expiry with
