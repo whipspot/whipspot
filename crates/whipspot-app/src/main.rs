@@ -41,7 +41,7 @@ use whipspot_ui::skin::{SavedLayout, SavedPanel, SkinLibrary, SkinPrefs, SkinRep
 use whipspot_ui::theme::ThemeId;
 use whipspot_ui::tray::TrayMenu;
 use whipspot_ui::{DiagnosticsUi, NativeUi, ProviderChoice, StreamQuality, Tab, UiPrefs};
-use whipspot_update::{LunepackUpdater, Start};
+use whipspot_update::{LunepackUpdater, Start, StartNote};
 use whipspot_ytmusic::http::ReqwestHttp;
 use whipspot_ytmusic::run::ProcessRunner;
 use whipspot_ytmusic::tools::ToolEnv;
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
     if !dll_search_restricted {
         log::warn!("could not restrict the DLL search path");
     }
-    match run(paths.as_ref()) {
+    match run(paths.as_ref(), start_note == StartNote::SetupInstalled) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => {
             // Fixed texts only (M2-F2): never a library or OS error text.
@@ -211,11 +211,30 @@ fn save_skin(settings: &mut Settings, report: SkinReport) {
     settings.skin = Some(name);
 }
 
-fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
+/// `setup_installed`: this is the first start after a setup file installed the copy (D75).
+fn run(paths: Option<&AppPaths>, setup_installed: bool) -> anyhow::Result<()> {
     let (mut settings, notice) = match paths {
         Some(paths) => Settings::load(paths),
         None => (Settings::default(), None),
     };
+    // The update channel (D75): the copy follows the channel its setup came from. A new record is
+    // saved at once, so a start that never reaches the exit still keeps it (the setup's event
+    // is delivered once).
+    let channel = whipspot_update::settle_channel(
+        &settings.update_channel,
+        whipspot_update::installed_channel().as_deref(),
+        setup_installed,
+    );
+    if channel.record
+        && let Some(recorded) = &channel.channel
+    {
+        settings.update_channel = recorded.clone();
+        if let Some(paths) = paths
+            && settings.save(paths).is_err()
+        {
+            log::warn!("could not save settings");
+        }
+    }
 
     // Each worker applies the efficiency mode's thread mark to itself when it unparks (I5); no
     // audio work runs on these workers.
@@ -330,7 +349,8 @@ fn run(paths: Option<&AppPaths>) -> anyhow::Result<()> {
     }
     // The updater (D4): only for a copy the installer put on the machine; any other copy leaves
     // the status at Unavailable and nothing runs. The app crate's own version is the running one.
-    let updater = LunepackUpdater::new(whipspot_app::APP_VERSION);
+    let updater =
+        LunepackUpdater::new(whipspot_app::APP_VERSION).with_channel(channel.channel.as_deref());
     if updater.available() {
         config = config.with_updater(Arc::new(updater), settings.update_check);
     }

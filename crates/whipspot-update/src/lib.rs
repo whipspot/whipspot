@@ -20,8 +20,8 @@ use std::thread;
 use std::time::Duration;
 
 use lunepack::{
-    ApplyOptions, CancelToken, CheckOptions, ConfirmOutcome, DownloadOptions, Error, Installation,
-    Phase, StagedVersion, StartupAction, UpdateInfo, blocking,
+    ApplyOptions, CancelToken, Channel, CheckOptions, ConfirmOutcome, DownloadOptions, Error,
+    Installation, LifecycleEvent, Phase, StagedVersion, StartupAction, UpdateInfo, blocking,
 };
 use whipspot_core::update::{CancelFlag, UpdateError, UpdateOffer, Updater};
 
@@ -98,6 +98,8 @@ fn drive<T>(
 /// it runs from at each call, so a copy that is moved or adopted is always looked at as it is.
 pub struct LunepackUpdater {
     version: String,
+    /// The channel to follow (D75), when the app recorded one; else the installed tree's.
+    channel: Option<Channel>,
     /// What the last check found: `download` takes the offer's version and needs the verified
     /// documents behind it.
     found: Mutex<Option<UpdateInfo>>,
@@ -110,9 +112,18 @@ impl LunepackUpdater {
     pub fn new(version: &str) -> Self {
         Self {
             version: version.to_owned(),
+            channel: None,
             found: Mutex::new(None),
             staged: Mutex::new(None),
         }
+    }
+
+    /// The same updater following `channel` (D75: the one the app recorded, [`settle_channel`])
+    /// instead of the channel the installed tree's update config names. A name lunepack does not
+    /// accept is ignored, so the tree's channel stands.
+    pub fn with_channel(mut self, channel: Option<&str>) -> Self {
+        self.channel = channel.and_then(|c| Channel::parse(c).ok());
+        self
     }
 
     /// Whether this copy sits in a place lunepack updates (has an update config beside it). A
@@ -127,7 +138,10 @@ impl LunepackUpdater {
         let install = Installation::from_current_exe().map_err(|e| map_error(&e))?;
         install
             .updater_builder()
-            .and_then(|builder| builder.build())
+            .and_then(|builder| match &self.channel {
+                Some(channel) => builder.channel(channel.clone()).build(),
+                None => builder.build(),
+            })
             .map_err(|e| map_error(&e))
     }
 }
@@ -225,6 +239,9 @@ pub enum Start {
 pub enum StartNote {
     /// An installed copy started normally.
     Installed,
+    /// The first start after a setup file installed this copy (lunepack's `Installed` event,
+    /// delivered once; never after an update). The app records the channel then (D75).
+    SetupInstalled,
     /// Not an installed copy (a development run, or a copy run from a disk image).
     DevRun,
     /// This version was rolled back after it never confirmed.
@@ -238,6 +255,7 @@ impl StartNote {
     pub fn text(self) -> &'static str {
         match self {
             StartNote::Installed => "update lifecycle: installed copy started",
+            StartNote::SetupInstalled => "update lifecycle: first start after a setup",
             StartNote::DevRun => "update lifecycle: not an installed copy",
             StartNote::RolledBack => "update lifecycle: this version was rolled back",
             StartNote::Failed => "update lifecycle: the start call failed",
@@ -258,9 +276,65 @@ pub fn lifecycle_startup() -> (Start, StartNote) {
         Ok(started) if started.action == StartupAction::Exit => {
             (Start::Exit, StartNote::RolledBack)
         }
+        Ok(started) if installed_by_setup(&started.events) => {
+            (Start::Continue, StartNote::SetupInstalled)
+        }
         Ok(_) => (Start::Continue, StartNote::Installed),
         Err(e) if is_dev_run(&e) => (Start::Continue, StartNote::DevRun),
         Err(_) => (Start::Continue, StartNote::Failed),
+    }
+}
+
+/// Whether this start's lifecycle events say a setup file just installed the copy. A per-machine
+/// install queues no events, so it never counts.
+fn installed_by_setup(events: &[LifecycleEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, LifecycleEvent::Installed { .. }))
+}
+
+/// The channel the running copy's update config names; `None` when this copy is not installed or
+/// the config cannot be read. Local files only.
+pub fn installed_channel() -> Option<String> {
+    let install = Installation::from_current_exe().ok()?;
+    Some(install.config().channel.as_str().to_owned())
+}
+
+/// What the app does with the update channel at a start (D75, the channel standard).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelChoice {
+    /// The channel the updater follows; `None` when this copy cannot update itself.
+    pub channel: Option<String>,
+    /// The settings must record `channel` (it differs from the recorded one).
+    pub record: bool,
+}
+
+/// The channel to follow. A copy follows the channel its setup came from: on the first start
+/// after a setup (`setup_installed`) that is the installed tree's channel, whatever was recorded
+/// (the settings outlive an uninstall); on any other start the recorded one when lunepack accepts
+/// the name, else the tree's. An update replaces the tree's config with the new pack's, and every
+/// stable release is also listed in beta, so after an update the tree may name stable on a beta
+/// copy: the record keeps it on beta. Not installed (`installed` is `None`): nothing is followed
+/// and nothing is recorded.
+pub fn settle_channel(
+    recorded: &str,
+    installed: Option<&str>,
+    setup_installed: bool,
+) -> ChannelChoice {
+    let Some(installed) = installed else {
+        return ChannelChoice {
+            channel: None,
+            record: false,
+        };
+    };
+    let channel = if !setup_installed && Channel::parse(recorded).is_ok() {
+        recorded
+    } else {
+        installed
+    };
+    ChannelChoice {
+        channel: Some(channel.to_owned()),
+        record: channel != recorded,
     }
 }
 
@@ -329,6 +403,76 @@ mod tests {
     fn the_lifecycle_calls_of_a_build_folder_copy_continue_quietly() {
         assert_eq!(lifecycle_startup(), (Start::Continue, StartNote::DevRun));
         assert_eq!(confirm_healthy(), Health::DevRun);
+    }
+
+    #[test]
+    fn a_build_folder_copy_has_no_installed_channel() {
+        assert_eq!(installed_channel(), None);
+    }
+
+    #[test]
+    fn only_an_installed_event_counts_as_a_setup() {
+        let v = |t: &str| lunepack::Version::parse(t).unwrap();
+        assert!(!installed_by_setup(&[]));
+        assert!(installed_by_setup(&[LifecycleEvent::Installed {
+            version: v("1.0.0")
+        }]));
+        assert!(!installed_by_setup(&[LifecycleEvent::Updated {
+            from: v("1.0.0"),
+            to: v("1.1.0"),
+        }]));
+    }
+
+    #[test]
+    fn the_channel_follows_the_setup_then_the_record() {
+        let pick = |recorded, installed, setup| settle_channel(recorded, installed, setup);
+        let choice = |c: &str, record| ChannelChoice {
+            channel: Some(c.to_owned()),
+            record,
+        };
+        // Not installed: nothing is followed or recorded, whatever the settings hold.
+        let none = ChannelChoice {
+            channel: None,
+            record: false,
+        };
+        assert_eq!(pick("beta", None, false), none);
+        assert_eq!(pick("", None, true), none);
+        // The first start of an install from before the record: the tree's channel, recorded.
+        assert_eq!(pick("", Some("beta"), false), choice("beta", true));
+        assert_eq!(pick("", Some("stable"), false), choice("stable", true));
+        // A beta copy updated to a stable pack (its tree now names stable) stays on beta.
+        assert_eq!(pick("beta", Some("stable"), false), choice("beta", false));
+        // A setup of the other channel wins over the record, which outlived the uninstall.
+        assert_eq!(pick("beta", Some("stable"), true), choice("stable", true));
+        assert_eq!(pick("stable", Some("beta"), true), choice("beta", true));
+        assert_eq!(pick("beta", Some("beta"), true), choice("beta", false));
+        // A record lunepack would refuse is replaced by the tree's channel.
+        assert_eq!(
+            pick("Not A/Channel", Some("stable"), false),
+            choice("stable", true)
+        );
+    }
+
+    #[test]
+    fn a_channel_name_lunepack_refuses_leaves_the_tree_channel() {
+        assert!(
+            LunepackUpdater::new("1.2.3")
+                .with_channel(Some("beta"))
+                .channel
+                .is_some()
+        );
+        assert!(
+            LunepackUpdater::new("1.2.3")
+                .with_channel(Some("no/such"))
+                .channel
+                .is_none()
+        );
+        assert!(
+            LunepackUpdater::new("1.2.3")
+                .with_channel(None)
+                .channel
+                .is_none()
+        );
     }
 
     #[test]
