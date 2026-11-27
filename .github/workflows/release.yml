@@ -1,18 +1,26 @@
 # Release pipeline. A version tag (v*) builds the app for macOS and Windows, packs each build with
-# lunepack, makes the installers (a .dmg and a setup .exe), publishes the update to the R2 bucket
-# (`scripts/publish-update.sh`, which keeps the 10 newest versions; release/README.md) and attaches
-# the installers to a draft GitHub Release. Unsigned: no Apple Developer ID or notarisation, no
-# Windows code signing (see README, Install).
+# lunepack, makes the installers (a .dmg and a setup .exe), publishes the update with
+# `lunepack publish push` (the stable feed keeps the 10 newest versions; release/README.md) and
+# attaches the installers to a draft GitHub Release. Unsigned: no Apple Developer ID or
+# notarisation, no Windows code signing (see README, Install). The weekly feed refresh and the
+# manual drop of a release are in refresh.yml.
 #
-# Secrets never meet a job that compiles anything. Three kinds of job:
+# No job that holds a secret compiles anything. Four kinds of job:
 #   build  (tools-*, build-*): cargo runs here, with every build script and proc macro of the
 #          dependency tree; no secret, no environment; they hand over unsigned artifacts only.
-#   pack   (pack-*): environment `release`; runs only prebuilt binaries (the lunepack CLI from the
-#          tools-* job) on the unsigned artifacts; holds LUNEPACK_RELEASE_KEY and nothing else. The
-#          previous release (for the delta) is read from the public feed over https, so no R2 key.
-#   publish: environment `release`; the release key and the R2 keys; runs only the lunepack CLI.
+#          Each tools-* job also outputs the SHA-256 of the lunepack CLI (cli_sha256) and of the
+#          runtime, UI and stub that ship in every pack (bins_sha256).
+#   pack   (pack-*): environment `release-pack` (tags v* only); holds LUNEPACK_RELEASE_KEY and no
+#          R2 key. It checks its OS's tools against the hashes first, then runs only those
+#          prebuilt binaries: `publish fetch` (the previous release for the delta, read from the
+#          public feed with no credential), `pack`, `setup`. SOURCE_DATE_EPOCH is set in that one
+#          step and nowhere else.
+#   push   (push): environment `release-push` (tags v*, the owner approves); the release key and
+#          the R2 push token. It checks the CLI hash, then runs `publish push --dry-run` and
+#          `publish push` on the release directories the pack jobs made.
+#   release: no secret; the draft GitHub Release with the installers.
 # A manual run (workflow_dispatch) runs the build jobs and nothing else: packing needs the release
-# key and the bucket, which only a tag push may use.
+# key, which only a tag push may use.
 name: release
 
 on:
@@ -23,19 +31,17 @@ on:
 permissions:
   contents: read
 
-# Two tags never publish at once; a manual run gets a group of its own and never blocks a release.
-# A run waiting behind another is replaced by a newer waiting one (GitHub keeps one): watch for a
-# cancelled release run and push its tag again.
+# Two tags never publish at once, and refresh.yml shares the group so a refresh never starts while
+# a push runs; a manual run gets a group of its own and never blocks a release. A run waiting
+# behind another is replaced by a newer waiting one (GitHub keeps one, and it can be a refresh):
+# watch for a cancelled release run and re-run it (Re-run all jobs); pushing the tag again sends
+# no event.
 concurrency:
-  group: ${{ github.event_name == 'push' && 'release' || format('dispatch-{0}', github.run_id) }}
+  group: ${{ github.event_name == 'push' && 'whipspot-publish' || format('dispatch-{0}', github.run_id) }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  # rclone, fetched by version and checked against its published SHA-256 (downloads.rclone.org/v<version>/SHA256SUMS).
-  RCLONE_VERSION: "1.76.0"
-  RCLONE_SHA256_OSX_ARM64: e72dc90b70f4947a7b72b61bde4a4fbba5777b2874fb448951ffdde67ebd0ab7
-  RCLONE_SHA256_WINDOWS_AMD64: 8b4fd2737ade4e70c057ef4a49deb7cffe94b0fb9d7587c189d149823f21a1dc
 
 jobs:
   # The version of crates/whipspot-app, checked against the tag before anything is built or uploaded.
@@ -60,12 +66,23 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   # lunepack's CLI, runtime and UI, built from the commit Cargo.lock pins (no secrets here).
-  # No build cache here: these binaries later run with the release key (pack, publish) and ship in
+  # No build cache here: these binaries later run with the release key (pack, push) and ship in
   # every pack, and ci.yml's caches are written by jobs that compile the whole dependency tree, so a
   # restored cache is not trusted. Always a clean target dir.
-  # `lunepack prebuilt fetch` refuses a CLI built from source, so the runtime and UI are built too.
+  # `lunepack prebuilt fetch` refuses a CLI built from source, so the runtime and UI are built here
+  # too and held to the bins_sha256 below instead of lunepack's pins.
+  # The hashes: `h FILE` is the first field of shasum -a 256 (sha256sum on Linux and Windows);
+  # cli_sha256 is h of the CLI; bins_sha256 is h of one line "<h of the file>  <file name>" per
+  # runtime, UI (and stub) file, names sorted with LC_ALL=C sort. Every key job recomputes both
+  # with the same code and refuses to run a tool on a mismatch or an empty output, or when the
+  # downloaded tools directory holds anything but the expected files (an artifact re-uploaded under
+  # the same name could add a DLL beside the CLI). The printf line keeps Git bash's `*name` binary
+  # marker out of the listing.
   tools-macos:
     runs-on: macos-latest
+    outputs:
+      cli_sha256: ${{ steps.hash.outputs.cli_sha256 }}
+      bins_sha256: ${{ steps.hash.outputs.bins_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,6 +118,18 @@ jobs:
           bash scripts/build-runtime.sh macos-universal --package lunepack-runtime --out "$out/lunepack-runtime"
           bash scripts/build-runtime.sh macos-universal --package lunepack-ui --out "$out/lunepack-ui"
           ls -l "$out"
+      - name: Hash the tools
+        id: hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          h() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          dir=dist/lunepack-tools
+          cli=$(h "$dir/lunepack")
+          bins=$(for f in $(printf '%s\n' lunepack-runtime lunepack-ui | LC_ALL=C sort); do printf '%s  %s\n' "$(h "$dir/$f")" "$f"; done | h -)
+          [[ "$cli" =~ ^[0-9a-f]{64}$ && "$bins" =~ ^[0-9a-f]{64}$ ]] || { echo "no usable tool hash" >&2; exit 1; }
+          echo "cli_sha256=$cli" >> "$GITHUB_OUTPUT"
+          echo "bins_sha256=$bins" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tools-macos
@@ -109,6 +138,9 @@ jobs:
 
   tools-windows:
     runs-on: windows-latest
+    outputs:
+      cli_sha256: ${{ steps.hash.outputs.cli_sha256 }}
+      bins_sha256: ${{ steps.hash.outputs.bins_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,6 +187,18 @@ jobs:
             cp "${files[0]}" "$out/lunepack-$kind.exe"
           done
           ls -l "$out"
+      - name: Hash the tools
+        id: hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          h() { sha256sum "$1" | cut -d' ' -f1; }
+          dir=dist/lunepack-tools
+          cli=$(h "$dir/lunepack.exe")
+          bins=$(for f in $(printf '%s\n' lunepack-runtime.exe lunepack-ui.exe lunepack-stub.exe | LC_ALL=C sort); do printf '%s  %s\n' "$(h "$dir/$f")" "$f"; done | h -)
+          [[ "$cli" =~ ^[0-9a-f]{64}$ && "$bins" =~ ^[0-9a-f]{64}$ ]] || { echo "no usable tool hash" >&2; exit 1; }
+          echo "cli_sha256=$cli" >> "$GITHUB_OUTPUT"
+          echo "bins_sha256=$bins" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tools-windows
@@ -204,23 +248,22 @@ jobs:
           mkdir -p dist/input
           cp target/release/whipspot-app.exe dist/input/whipspot.exe
           cp LICENSE dist/input/LICENSE.txt
+          cp assets/icon/whipspot-256.png dist/input/whipspot-256.png
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: app-windows
           path: dist/input
           if-no-files-found: error
 
-  # Packs the macOS build and makes the .dmg. Compiles nothing: only the lunepack CLI built by
-  # tools-macos and rclone (checked against its SHA-256) run here. The release key is in the pack
-  # step's env alone; the setup step needs no secret. The previous release is read from the public
-  # feed (WHIPSPOT_R2_PUBLIC as a URL: no R2 key, and the delta is kept).
+  # Packs the macOS build and makes the .dmg. Compiles nothing: the lunepack CLI, runtime and UI
+  # built by tools-macos run here, after their hashes are checked. The release key is in the one
+  # step that fetches, packs and sets up (with SOURCE_DATE_EPOCH, which no other step sets); there
+  # is no R2 key: the previous release is read from the public feed over https.
   pack-macos:
     if: github.event_name == 'push'
     needs: [version, tools-macos, build-macos]
     runs-on: macos-latest
-    environment: release
-    env:
-      WHIPSPOT_R2_PUBLIC: https://updates.izzat.dev/
+    environment: release-pack
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -229,6 +272,31 @@ jobs:
         with:
           name: tools-macos
           path: dist/lunepack-tools
+      - name: Check the tools against tools-macos
+        shell: bash
+        env:
+          WANT_CLI: ${{ needs.tools-macos.outputs.cli_sha256 }}
+          WANT_BINS: ${{ needs.tools-macos.outputs.bins_sha256 }}
+        run: |
+          set -euo pipefail
+          # Exactly the expected files and nothing else (no extra file, directory or symlink): an
+          # artifact a build job re-uploaded under this name could carry a DLL beside the CLI.
+          dir=dist/lunepack-tools
+          want_files=$(printf '%s\n' lunepack lunepack-runtime lunepack-ui | LC_ALL=C sort)
+          not_files=$(find "$dir" -mindepth 1 ! -type f -print)
+          have_files=$(find "$dir" -mindepth 1 -type f -exec basename {} \; | LC_ALL=C sort)
+          if [ -n "$not_files" ] || [ "$have_files" != "$want_files" ]; then
+            echo "the tools directory does not hold exactly the expected files" >&2
+            exit 1
+          fi
+          h() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          cli=$(h "$dir/lunepack")
+          bins=$(for f in $(printf '%s\n' lunepack-runtime lunepack-ui | LC_ALL=C sort); do printf '%s  %s\n' "$(h "$dir/$f")" "$f"; done | h -)
+          if [ -z "$WANT_CLI" ] || [ -z "$WANT_BINS" ] || [ "$cli" != "$WANT_CLI" ] || [ "$bins" != "$WANT_BINS" ]; then
+            echo "the tools are not the ones tools-macos built" >&2
+            exit 1
+          fi
+          chmod +x "$dir/lunepack" "$dir/lunepack-runtime" "$dir/lunepack-ui"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: app-macos
@@ -237,7 +305,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x dist/lunepack-tools/lunepack dist/lunepack-tools/lunepack-runtime dist/lunepack-tools/lunepack-ui
           tar=dist/app-tar/Whipspot-app.tar
           [ -f "$tar" ] || { echo "no app tar" >&2; exit 1; }
           names=$(tar -tf "$tar")
@@ -248,35 +315,27 @@ jobs:
           mkdir -p dist
           tar -xf "$tar" -C dist
           [ -x dist/Whipspot.app/Contents/MacOS/Whipspot ] || { echo "the bundle has no executable" >&2; exit 1; }
-      - name: Install rclone
+          [ -f dist/Whipspot.app/Contents/Resources/whipspot-256.png ] || { echo "the bundle has no install icon" >&2; exit 1; }
+      - name: Fetch, pack and make the installer (.dmg)
         shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
         run: |
           set -euo pipefail
-          [ "$(uname -m)" = arm64 ] || { echo "this runner is not arm64" >&2; exit 1; }
-          d="$RUNNER_TEMP/rclone"
-          mkdir -p "$d"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$d/rclone.zip" "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-osx-arm64.zip"
-          echo "$RCLONE_SHA256_OSX_ARM64  $d/rclone.zip" | shasum -a 256 -c -
-          unzip -q "$d/rclone.zip" -d "$d"
-          echo "$d/rclone-v${RCLONE_VERSION}-osx-arm64" >> "$GITHUB_PATH"
-      - name: Pack the update (the previous release gives a delta)
-        shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          LUNEPACK: dist/lunepack-tools/lunepack
-          LUNEPACK_BIN_DIR: dist/lunepack-tools
-          LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
-        run: bash scripts/publish-update.sh pack macos-universal dist/Whipspot.app "$VERSION"
-      - name: Make the installer (.dmg)
-        shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          LUNEPACK: dist/lunepack-tools/lunepack
-        run: bash scripts/publish-update.sh setup macos-universal "$VERSION"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          tools=dist/lunepack-tools
+          "$tools/lunepack" publish fetch --config release/lunepack.toml --release-dir release-dir --version "$VERSION"
+          "$tools/lunepack" pack --config release/lunepack.toml --input dist/Whipspot.app --version "$VERSION" \
+            --target macos-universal --release-dir release-dir --sign release --deltas 1 \
+            --runtime "$tools/lunepack-runtime" --ui "$tools/lunepack-ui"
+          "$tools/lunepack" setup release-dir --config release/lunepack.toml --version "$VERSION" \
+            --target macos-universal --out "dist/whipspot-$VERSION-macos-universal.dmg"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: update-macos
-          path: dist/update
+          name: release-macos-universal
+          path: release-dir
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -288,9 +347,7 @@ jobs:
     if: github.event_name == 'push'
     needs: [version, tools-windows, build-windows]
     runs-on: windows-latest
-    environment: release
-    env:
-      WHIPSPOT_R2_PUBLIC: https://updates.izzat.dev/
+    environment: release-pack
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -299,6 +356,30 @@ jobs:
         with:
           name: tools-windows
           path: dist/lunepack-tools
+      - name: Check the tools against tools-windows
+        shell: bash
+        env:
+          WANT_CLI: ${{ needs.tools-windows.outputs.cli_sha256 }}
+          WANT_BINS: ${{ needs.tools-windows.outputs.bins_sha256 }}
+        run: |
+          set -euo pipefail
+          # Exactly the expected files and nothing else (no extra file, directory or symlink): an
+          # artifact a build job re-uploaded under this name could carry a DLL beside the CLI.
+          dir=dist/lunepack-tools
+          want_files=$(printf '%s\n' lunepack.exe lunepack-runtime.exe lunepack-stub.exe lunepack-ui.exe | LC_ALL=C sort)
+          not_files=$(find "$dir" -mindepth 1 ! -type f -print)
+          have_files=$(find "$dir" -mindepth 1 -type f -exec basename {} \; | LC_ALL=C sort)
+          if [ -n "$not_files" ] || [ "$have_files" != "$want_files" ]; then
+            echo "the tools directory does not hold exactly the expected files" >&2
+            exit 1
+          fi
+          h() { sha256sum "$1" | cut -d' ' -f1; }
+          cli=$(h "$dir/lunepack.exe")
+          bins=$(for f in $(printf '%s\n' lunepack-runtime.exe lunepack-ui.exe lunepack-stub.exe | LC_ALL=C sort); do printf '%s  %s\n' "$(h "$dir/$f")" "$f"; done | h -)
+          if [ -z "$WANT_CLI" ] || [ -z "$WANT_BINS" ] || [ "$cli" != "$WANT_CLI" ] || [ "$bins" != "$WANT_BINS" ]; then
+            echo "the tools are not the ones tools-windows built" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: app-windows
@@ -307,37 +388,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ -f dist/input/whipspot.exe ] && [ -f dist/input/LICENSE.txt ] || { echo "the install tree lacks whipspot.exe or LICENSE.txt" >&2; exit 1; }
-          [ "$(ls -A dist/input | wc -l | tr -d ' ')" = 2 ] || { echo "the install tree holds more than whipspot.exe and LICENSE.txt" >&2; exit 1; }
-      - name: Install rclone
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $d = Join-Path $env:RUNNER_TEMP 'rclone'
-          New-Item -ItemType Directory -Force -Path $d | Out-Null
-          $zip = Join-Path $d 'rclone.zip'
-          Invoke-WebRequest -Uri "https://downloads.rclone.org/v$env:RCLONE_VERSION/rclone-v$env:RCLONE_VERSION-windows-amd64.zip" -OutFile $zip
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLower() -ne $env:RCLONE_SHA256_WINDOWS_AMD64) { throw 'rclone does not match its SHA-256' }
-          Expand-Archive -LiteralPath $zip -DestinationPath $d
-          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $d "rclone-v$env:RCLONE_VERSION-windows-amd64")
-      - name: Pack the update (the previous release gives a delta)
+          for f in whipspot.exe LICENSE.txt whipspot-256.png; do
+            [ -f "dist/input/$f" ] || { echo "the install tree lacks $f" >&2; exit 1; }
+          done
+          [ "$(find dist/input -mindepth 1 | wc -l | tr -d ' ')" = 3 ] || { echo "the install tree holds more than whipspot.exe, LICENSE.txt and whipspot-256.png" >&2; exit 1; }
+      - name: Fetch, pack and make the installer (setup .exe)
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
-          LUNEPACK: dist/lunepack-tools/lunepack.exe
-          LUNEPACK_BIN_DIR: dist/lunepack-tools
           LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
-        run: bash scripts/publish-update.sh pack windows-x86_64 dist/input "$VERSION"
-      - name: Make the installer (setup .exe)
-        shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          LUNEPACK: dist/lunepack-tools/lunepack.exe
-        run: bash scripts/publish-update.sh setup windows-x86_64 "$VERSION"
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          tools=dist/lunepack-tools
+          "$tools/lunepack.exe" publish fetch --config release/lunepack.toml --release-dir release-dir --version "$VERSION"
+          "$tools/lunepack.exe" pack --config release/lunepack.toml --input dist/input --version "$VERSION" \
+            --target windows-x86_64 --release-dir release-dir --sign release --deltas 1 \
+            --runtime "$tools/lunepack-runtime.exe" --ui "$tools/lunepack-ui.exe" --stub "$tools/lunepack-stub.exe"
+          "$tools/lunepack.exe" setup release-dir --config release/lunepack.toml --version "$VERSION" \
+            --target windows-x86_64 --out "dist/whipspot-$VERSION-windows-x86_64-setup.exe"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: update-windows
-          path: dist/update
+          name: release-windows-x86_64
+          path: release-dir
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -346,14 +420,17 @@ jobs:
           if-no-files-found: error
 
   # Adds the version to the stable feed, drops all but the 10 newest, uploads, deletes the dropped
-  # folders, saves the publisher state (all inside publish-update.sh). The only job with the R2
-  # write keys. It compiles nothing: the CLI is the macOS one from tools-macos (this job runs on a
-  # Mac runner, so no Linux CLI is built) and rclone, checked against its SHA-256.
-  publish:
+  # folders and saves the publisher state (all inside `lunepack publish push`, after a dry run).
+  # The only job with the R2 write token, and it waits for the owner's approval (environment
+  # release-push). It compiles nothing: the CLI is the macOS one from tools-macos (this job runs on
+  # a Mac runner, so no Linux CLI is built), run only after its hash is checked. No
+  # SOURCE_DATE_EPOCH: push signs the feeds at the real time. The one R2 token serves both
+  # buckets, so it is mapped to both of [publish]'s pairs.
+  push:
     if: github.event_name == 'push'
     needs: [version, tools-macos, pack-macos, pack-windows]
     runs-on: macos-latest
-    environment: release
+    environment: release-push
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -362,48 +439,64 @@ jobs:
         with:
           name: tools-macos
           path: dist/lunepack-tools
+      - name: Check the tools against tools-macos (the CLI runs here with the release key)
+        shell: bash
+        env:
+          WANT_CLI: ${{ needs.tools-macos.outputs.cli_sha256 }}
+          WANT_BINS: ${{ needs.tools-macos.outputs.bins_sha256 }}
+        run: |
+          set -euo pipefail
+          # Exactly the expected files and nothing else (no extra file, directory or symlink): an
+          # artifact a build job re-uploaded under this name could carry a DLL beside the CLI.
+          dir=dist/lunepack-tools
+          want_files=$(printf '%s\n' lunepack lunepack-runtime lunepack-ui | LC_ALL=C sort)
+          not_files=$(find "$dir" -mindepth 1 ! -type f -print)
+          have_files=$(find "$dir" -mindepth 1 -type f -exec basename {} \; | LC_ALL=C sort)
+          if [ -n "$not_files" ] || [ "$have_files" != "$want_files" ]; then
+            echo "the tools directory does not hold exactly the expected files" >&2
+            exit 1
+          fi
+          h() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          cli=$(h "$dir/lunepack")
+          bins=$(for f in $(printf '%s\n' lunepack-runtime lunepack-ui | LC_ALL=C sort); do printf '%s  %s\n' "$(h "$dir/$f")" "$f"; done | h -)
+          if [ -z "$WANT_CLI" ] || [ -z "$WANT_BINS" ] || [ "$cli" != "$WANT_CLI" ] || [ "$bins" != "$WANT_BINS" ]; then
+            echo "the tools are not the ones tools-macos built" >&2
+            exit 1
+          fi
+          chmod +x "$dir/lunepack" "$dir/lunepack-runtime" "$dir/lunepack-ui"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: update-*
-          merge-multiple: true
-          path: dist/update
-      - name: Check both targets are packed
+          name: release-macos-universal
+          path: release-macos-universal
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-windows-x86_64
+          path: release-windows-x86_64
+      - name: Push the release
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          chmod +x dist/lunepack-tools/lunepack
-          for t in macos-universal windows-x86_64; do
-            [ -f "dist/update/$VERSION/$t.manifest.json" ] || { echo "$t is not packed for $VERSION" >&2; exit 1; }
-          done
-      - name: Install rclone
-        shell: bash
-        run: |
-          set -euo pipefail
-          [ "$(uname -m)" = arm64 ] || { echo "this runner is not arm64" >&2; exit 1; }
-          d="$RUNNER_TEMP/rclone"
-          mkdir -p "$d"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$d/rclone.zip" "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-osx-arm64.zip"
-          echo "$RCLONE_SHA256_OSX_ARM64  $d/rclone.zip" | shasum -a 256 -c -
-          unzip -q "$d/rclone.zip" -d "$d"
-          echo "$d/rclone-v${RCLONE_VERSION}-osx-arm64" >> "$GITHUB_PATH"
-      - name: Publish
-        shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          LUNEPACK: dist/lunepack-tools/lunepack
           LUNEPACK_RELEASE_KEY: ${{ secrets.LUNEPACK_RELEASE_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: bash scripts/publish-update.sh publish "$VERSION"
+          R2_PRIVATE_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_PRIVATE_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          lp=dist/lunepack-tools/lunepack
+          "$lp" publish push --config release/lunepack.toml \
+            --release-dir release-macos-universal --release-dir release-windows-x86_64 \
+            --version "$VERSION" --sign release --dry-run
+          "$lp" publish push --config release/lunepack.toml \
+            --release-dir release-macos-universal --release-dir release-windows-x86_64 \
+            --version "$VERSION" --sign release
 
-  # No secrets here. A separate job so a failed upload to GitHub can be re-run alone: `publish`
+  # No secrets here. A separate job so a failed upload to GitHub can be re-run alone: `push`
   # refuses a version that is already in the feed.
   release:
     if: github.event_name == 'push'
-    needs: [publish, pack-macos, pack-windows]
+    needs: [push, pack-macos, pack-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
