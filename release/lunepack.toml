@@ -1,14 +1,11 @@
 # Whipspot's lunepack configuration: public keys and signer locations only, never a key.
-# Read by scripts/publish-update.sh; operator steps in release/README.md.
+# Read by the lunepack CLI (`pack`, `setup` and `publish ...`) in .github/workflows/release.yml
+# and refresh.yml; operator steps in release/README.md.
 #
 # The app id, the root key and the feed below are compiled into every installed copy's
 # lunepack-update.json: changing any of them strands existing installs.
 
 app_id = "dev.izzat.whipspot"
-
-# Where the publisher state file lives while a publish runs. publish-update.sh fetches it from the
-# private bucket into release/work/ and saves it back only after a publish succeeded.
-state = "work/lunepack-state.json"
 
 [root]
 version = 1
@@ -28,11 +25,9 @@ feed = "https://updates.izzat.dev/whipspot/"
 channel = "stable"
 
 [install]
-# The Windows layout. A macOS pack uses a copy of this file that publish-update.sh writes beside
-# it with entry = "Contents/MacOS/Whipspot" and icon = "Contents/Resources/whipspot-256.png"
-# (lunepack.toml has one entry and one icon for every target). The icon must be a file of the packed
-# tree: scripts/package-macos.sh puts it in the bundle, `publish-update.sh pack` adds it to a tree
-# that lacks it. Made by scripts/make-icons.sh from the SVG masters.
+# The Windows layout; [install.macos] below overrides entry and icon for the macOS targets. The
+# icon must be a file of the packed tree: scripts/package-macos.sh puts it in the bundle and
+# release.yml copies it into the Windows tree. Made by scripts/make-icons.sh from the SVG masters.
 entry = "whipspot.exe"
 icon = "whipspot-256.png"
 name = "Whipspot"
@@ -40,9 +35,32 @@ publisher = "Whipspot"
 comment = "A desktop music player"
 categories = ["AudioVideo", "Audio", "Player"]
 
+[install.macos]
+entry = "Contents/MacOS/Whipspot"
+icon = "Contents/Resources/whipspot-256.png"
+
 # Inputs of the installers' stamping (not part of any signed document), relative to this file.
 [windows]
 icon = "../assets/icon/whipspot.ico"
 
 [macos]
 icon = "../assets/icon/whipspot.icns"
+
+# `lunepack publish` (fetch, push, refresh, drop): names of environment variables, never values.
+# release.yml and refresh.yml map their environment's secrets onto these names; the public
+# bucket is what the feed URL above serves, the private one holds the publisher state.
+[publish]
+prefix = "whipspot"
+store = "r2"
+account_id_env = "R2_ACCOUNT_ID"
+access_key_env = "R2_ACCESS_KEY_ID"
+secret_key_env = "R2_SECRET_ACCESS_KEY"
+private_access_key_env = "R2_PRIVATE_ACCESS_KEY_ID"
+private_secret_key_env = "R2_PRIVATE_SECRET_ACCESS_KEY"
+public_bucket = "izzat-updates"
+private_bucket = "izzat-updates-publisher"
+keep = 10
+deltas = 1
+feed_days = 90
+channels = ["stable"]
+require_targets = ["macos-universal", "windows-x86_64"]
