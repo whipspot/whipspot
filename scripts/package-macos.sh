@@ -1,12 +1,12 @@
 #!/bin/bash
 # Builds dist/Whipspot.app (release, universal arm64 + x86_64 when both targets are installed).
 # Ad-hoc signed only: no Developer ID, no notarisation. The app is distributed by lunepack
-# (scripts/publish-update.sh), not zipped here.
+# (packed by .github/workflows/release.yml), not zipped here.
 # Usage: bash scripts/package-macos.sh [--arch arm64|x86_64|universal] [--unsealed]
 #   --unsealed  leave the bundle without a seal (no Contents/_CodeSignature; only the main
 #               executable carries its own ad-hoc signature, made before it enters the bundle,
 #               since codesign on a path inside a bundle seals the whole bundle) for
-#               `publish-update.sh pack`: lunepack pack refuses a sealed bundle that lacks the
+#               `lunepack pack`: it refuses a sealed bundle that lacks the
 #               runtime it would add.
 set -euo pipefail
 cd "$(dirname "$0")/.."
