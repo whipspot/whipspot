@@ -135,6 +135,7 @@ jobs:
           name: tools-macos
           path: dist/lunepack-tools
           if-no-files-found: error
+          retention-days: 7
 
   tools-windows:
     runs-on: windows-latest
@@ -204,6 +205,7 @@ jobs:
           name: tools-windows
           path: dist/lunepack-tools
           if-no-files-found: error
+          retention-days: 7
 
   # Builds the app. cargo runs here, so there is no secret and no environment in this job. No build
   # cache either: ci.yml writes main's caches from jobs that also compile dev-dependencies, test
@@ -230,6 +232,7 @@ jobs:
           name: app-macos
           path: dist/Whipspot-app.tar
           if-no-files-found: error
+          retention-days: 7
 
   build-windows:
     needs: [version]
@@ -254,6 +257,7 @@ jobs:
           name: app-windows
           path: dist/input
           if-no-files-found: error
+          retention-days: 7
 
   # Packs the macOS build and makes the .dmg. Compiles nothing: the lunepack CLI, runtime and UI
   # built by tools-macos run here, after their hashes are checked. The release key is in the one
@@ -337,11 +341,13 @@ jobs:
           name: release-macos-universal
           path: release-dir
           if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installer-macos
           path: dist/*.dmg
           if-no-files-found: error
+          retention-days: 7
 
   pack-windows:
     if: github.event_name == 'push'
@@ -413,11 +419,13 @@ jobs:
           name: release-windows-x86_64
           path: release-dir
           if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installer-windows
           path: dist/*-setup.exe
           if-no-files-found: error
+          retention-days: 7
 
   # Adds the version to the stable feed, drops all but the 10 newest, uploads, deletes the dropped
   # folders and saves the publisher state (all inside `lunepack publish push`, after a dry run).

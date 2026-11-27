@@ -74,3 +74,4 @@ jobs:
         with:
           name: coverage-summary
           path: coverage-summary.txt
+          retention-days: 7

@@ -96,6 +96,7 @@ jobs:
           name: tools-linux
           path: dist/lunepack-tools
           if-no-files-found: error
+          retention-days: 7
 
   # A by-hand run from the wrong ref would otherwise end green with refresh and drop both skipped:
   # a drop must start from a v* tag and a refresh from main. No secret, no environment.
